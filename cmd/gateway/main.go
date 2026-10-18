@@ -30,6 +30,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/secrets-bridge/gateway/internal/connectors"
+	"github.com/secrets-bridge/gateway/internal/connectors/rollout"
 	"github.com/secrets-bridge/gateway/internal/identity"
 	"github.com/secrets-bridge/gateway/internal/local"
 	"github.com/secrets-bridge/gateway/internal/observability"
@@ -76,10 +77,16 @@ func (s standbyLoop) Run(ctx context.Context) error {
 	return nil
 }
 
-// connectorFactories lists the connector kinds this build can run.
-// Connectors are added kind by kind; until then a connectors file that
-// names a kind is refused at boot.
-func connectorFactories() connectors.Factories { return connectors.Factories{} }
+// connectorFactories lists the connector kinds this build can run. A
+// connectors file that names any other kind is refused at boot.
+func connectorFactories(cfg Config, getenv func(string) (string, bool)) connectors.Factories {
+	return connectors.Factories{
+		connectors.KindRollout: rollout.Factory(rollout.Options{
+			InsecureTransport: cfg.InsecureTransport,
+			Getenv:            getenv,
+		}),
+	}
+}
 
 func main() {
 	if err := run(os.Args[1:], os.LookupEnv); err != nil {
@@ -144,7 +151,7 @@ func setup(cfg Config, getenv func(string) (string, bool), logger *slog.Logger, 
 	}
 	logger.Info("identity loaded", "source", string(src), "gateway_id", id.GatewayID)
 
-	registry, err := connectors.LoadFile(cfg.ConnectorsFile, connectorFactories())
+	registry, err := connectors.LoadFile(cfg.ConnectorsFile, connectorFactories(cfg, getenv))
 	if err != nil {
 		return nil, err
 	}

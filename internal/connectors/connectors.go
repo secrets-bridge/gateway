@@ -68,7 +68,7 @@ const (
 	// OutcomeVerified: the connector linked the observation to the change
 	// by identity or by an ordering it can prove. ArgoCD may never report
 	// this: Healthy or Synced alone is not proof that a secret change
-	// rolled out.
+	// rolled out. Rollout may not either: its link is time order only.
 	OutcomeVerified Outcome = "verified"
 	// OutcomeObserved: the expected state was seen, but the link to the
 	// change is not proven.
@@ -107,15 +107,24 @@ func ValidName(s string) bool { return namePattern.MatchString(s) }
 // Target names what to observe. It holds only a local target id that
 // the connector resolves through its own local settings, and the stage
 // requested. It never carries coordinates.
+//
+// NotBefore is the change marker the observation is measured against:
+// evidence must be strictly later than it to count as following the
+// change. The control plane derives it from the recorded write time
+// plus its clock-skew allowance (or from an earlier stage's evidence,
+// such as a sync time). It is a time, not a coordinate. Zero means the
+// task carried no change marker, and a connector must not claim a link
+// to the change.
 type Target struct {
-	ID    string
-	Stage Stage
+	ID        string
+	Stage     Stage
+	NotBefore time.Time
 }
 
 // Observation is the metadata-only result of one Observe call. It has no
 // free-form fields: no maps, no raw API responses, no messages, and no
-// secret values or hashes of values. Typed per-kind facts are added
-// alongside each connector.
+// secret values or hashes of values. Typed per-kind facts sit in a
+// fixed struct per kind; a kind may only fill its own.
 type Observation struct {
 	Connector  string
 	Kind       Kind
@@ -124,6 +133,8 @@ type Observation struct {
 	Outcome    Outcome
 	Reason     string // optional machine code, reasonPattern
 	ObservedAt time.Time
+	Caveats    CaveatSet
+	Rollout    RolloutFacts // KindRollout only
 }
 
 // Connector is a read-only integration bound in local configuration.
@@ -258,8 +269,15 @@ func checkObservation(c Connector, t Target, o Observation) error {
 		return fmt.Errorf("%w: reason must be a machine code", ErrInvalidObservation)
 	case o.ObservedAt.IsZero():
 		return fmt.Errorf("%w: observed_at is missing", ErrInvalidObservation)
-	case c.Kind() == KindArgoCD && o.Outcome == OutcomeVerified:
+	case !o.Caveats.valid():
+		return fmt.Errorf("%w: unknown caveat", ErrInvalidObservation)
+	case o.Outcome == OutcomeVerified && (c.Kind() == KindArgoCD || c.Kind() == KindRollout):
+		// ArgoCD Healthy is context, never proof. A rollout is linked to
+		// the change by time order only; no pod template marker ties it
+		// to a provider version, so it can be observed but not verified.
 		return ErrVerifiedNotAllowed
+	case o.Rollout.Present && c.Kind() != KindRollout:
+		return fmt.Errorf("%w: rollout facts from a %s connector", ErrInvalidObservation, c.Kind())
 	}
-	return nil
+	return o.Rollout.check()
 }

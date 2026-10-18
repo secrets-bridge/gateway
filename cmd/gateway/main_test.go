@@ -184,6 +184,10 @@ func TestSetup_Refusals(t *testing.T) {
 	if err := os.WriteFile(esoFile, []byte(`[{"name":"eso-main","kind":"eso","settings":{"namespaces":["tenant-a-uat"]}}]`), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	rolloutFile := filepath.Join(dir, "rollout.json")
+	if err := os.WriteFile(rolloutFile, []byte(`[{"name":"rollout-main","kind":"rollout","settings":{"namespaces":["tenant-a-uat"]}}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	looseID := filepath.Join(dir, "identity.json")
 	if err := os.WriteFile(looseID, []byte(`{"gateway_id":"gw","gateway_secret":"`+testSecret+`"}`), 0o600); err != nil {
 		t.Fatal(err)
@@ -203,6 +207,7 @@ func TestSetup_Refusals(t *testing.T) {
 		{"no identity", func(f *bootFixture) { f.env = envMap(nil); f.cfg.IdentityFile = "" }, "no credential"},
 		{"loose identity file", func(f *bootFixture) { f.env = envMap(nil); f.cfg.IdentityFile = looseID }, "owner-only"},
 		{"connector kind not in this build", func(f *bootFixture) { f.cfg.ConnectorsFile = esoFile }, "not supported by this build"},
+		{"rollout outside a cluster without a server", func(f *bootFixture) { f.cfg.ConnectorsFile = rolloutFile }, "not running in a cluster"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

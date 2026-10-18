@@ -13,7 +13,7 @@
 
 **Optional, outbound-only observation plane for [Secrets Bridge](https://github.com/secrets-bridge).** A Gateway runs inside a customer security boundary, reads local integrations (External Secrets Operator, Kubernetes rollout state, ArgoCD) without changing anything, and reports metadata-only evidence that an approved secret change actually reached the workloads.
 
-> **Status: design phase.** The architecture decision record is still under review, and a draft implementation is in progress on pull requests that stay in draft until it is approved. The current code boots, loads its identity and locally bound connectors, and serves loopback health and metrics. It does not call the control plane or observe anything yet.
+> **Status: design phase.** The architecture decision record is still under review, and a draft implementation is in progress on pull requests that stay in draft until it is approved. The current code boots, loads its identity and locally bound connectors, and serves loopback health and metrics. It can read Deployment rollout status through a bound rollout connector, but it does not call the control plane yet, so nothing triggers an observation.
 
 ## How it fits
 
@@ -39,13 +39,17 @@ Control Plane (api, worker, Postgres)
 | Path | Purpose |
 |---|---|
 | `cmd/gateway` | Entry point: env and flag config, TLS transport to the control plane, boot and graceful shutdown. The control-plane loop plugs in behind one interface; this build makes no control-plane calls and stays not ready |
-| `internal/connectors` | Connector interface, the registry of locally bound connectors, and the loader for the connectors file. No connector kinds are implemented yet |
+| `internal/connectors` | Connector interface, the registry of locally bound connectors, and the loader for the connectors file. The registry checks every result. Facts are typed, reason and caveat codes come from fixed sets, and the rollout and ArgoCD kinds can never report `verified` |
+| `internal/connectors/rollout` | Rollout connector. Reads one `apps/v1` Deployment and the ReplicaSets it owns, and reports whether a new ReplicaSet became available after the change marker. It does not read pods, logs, events or Secrets |
+| `internal/kube` | Minimal Kubernetes REST client on `net/http`. It uses the in-cluster service account or an explicit server, CA and token file, and re-reads the token file when it rotates. Built on `internal/readonly`, so only GET leaves the process and Secrets paths are refused |
+| `internal/safetext` | Strips control characters and caps the length of strings copied from a cluster, so they cannot forge log lines |
 | `internal/readonly` | HTTP transport for connector clients. It refuses every method except GET and denies Kubernetes Secret paths before a request leaves the process |
 | `internal/identity` | Loads the gateway id and secret from env vars or an owner-only JSON file. Read-only, with no enrollment and no keypair |
 | `internal/local` | Loopback-only `/healthz`, `/readyz` and `/metrics` server |
 | `internal/observability` | JSON structured logger |
+| `deploy/rbac-example.yaml` | Example Role and ClusterRole for the rollout connector: `get` on deployments and `list` on replicasets only. A test fails on any secrets resource, wildcard or write verb |
 
-Planned next: the control-plane client (`internal/client`) and the ESO, rollout and ArgoCD connectors.
+Planned next: the control-plane client (`internal/client`) and the ArgoCD connector. This build has no ESO connector.
 
 ## Configuration
 
@@ -63,14 +67,26 @@ Planned next: the control-plane client (`internal/client`) and the ESO, rollout 
 
 Each variable also has a flag; run `gateway -h` for the list.
 
-The connectors file is a JSON array. Each entry has a `name` (a DNS label that the control plane binds to), a `kind` (`eso`, `rollout` or `argocd`) and kind-specific `settings`. The loader refuses unknown kinds, duplicate names and unknown fields, and its errors never repeat settings content. This build implements no connector kinds yet, so it refuses any entry at boot as not supported. The shape will look like this:
+The connectors file is a JSON array. Each entry has a `name` (a DNS label that the control plane binds to), a `kind` (`eso`, `rollout` or `argocd`) and kind-specific `settings`. The loader refuses unknown kinds, duplicate names and unknown fields, and its errors never repeat settings content. This build implements the `rollout` kind only and refuses any other kind at boot as not supported.
 
 ```json
 [
-  {"name": "eso-main", "kind": "eso", "settings": {}},
-  {"name": "argocd-main", "kind": "argocd", "settings": {}}
+  {
+    "name": "rollout-main",
+    "kind": "rollout",
+    "settings": {
+      "namespaces": ["tenant-a-uat"],
+      "targets": [
+        {"id": "payments-api", "namespace": "tenant-a-uat", "deployment": "payments-api"}
+      ]
+    }
+  }
 ]
 ```
+
+The control plane only names a connector and a target id. The namespace and Deployment name stay in this file. A target outside `namespaces` is never read and reports `unverifiable`. Without a `kubernetes` block the connector uses the pod's service account. To reach another cluster, add `"kubernetes": {"server": "https://k8s.example.com:6443", "ca_file": "/etc/gateway/k8s-ca.crt", "token_file": "/etc/gateway/k8s-token"}`. The server must use `https://` unless `SB_INSECURE_TRANSPORT=true`.
+
+A rollout result is `observed` only when the Deployment's current ReplicaSet was created strictly after the change marker and is fully available. It is never `verified`, because nothing in the Deployment ties a rollout to a provider version. With no new ReplicaSet and no Reloader or checksum annotation, the result is `unverifiable` with caveat `reload_mechanism_unknown`, since nothing will restart the pods.
 
 ## Development
 

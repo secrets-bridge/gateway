@@ -114,16 +114,19 @@ type Target struct {
 
 // Observation is the metadata-only result of one Observe call. It has no
 // free-form fields: no maps, no raw API responses, no messages, and no
-// secret values or hashes of values. Typed per-kind facts are added
-// alongside each connector.
+// secret values or hashes of values. Typed per-kind facts are value
+// structs whose string fields are checked against fixed enums.
 type Observation struct {
 	Connector  string
 	Kind       Kind
 	TargetID   string
 	Stage      Stage
 	Outcome    Outcome
-	Reason     string // optional machine code, reasonPattern
+	Reason     string // optional machine code, reasonPattern; the error code when Outcome is error
+	Caveats    CaveatSet
 	ObservedAt time.Time
+	// ArgoCD holds the ArgoCD context facts. Only KindArgoCD may set it.
+	ArgoCD ArgoCDFacts
 }
 
 // Connector is a read-only integration bound in local configuration.
@@ -244,8 +247,17 @@ func (r *Registry) errorObservation(c Connector, t Target) Observation {
 		TargetID:   t.ID,
 		Stage:      t.Stage,
 		Outcome:    OutcomeError,
+		Caveats:    requiredCaveats(c.Kind()),
 		ObservedAt: r.now().UTC(),
 	}
+}
+
+// requiredCaveats are the caveats every observation of kind k carries.
+func requiredCaveats(k Kind) CaveatSet {
+	if k == KindArgoCD {
+		return CaveatSet(0).With(CaveatArgoCDHealthNotProof)
+	}
+	return 0
 }
 
 func checkObservation(c Connector, t Target, o Observation) error {
@@ -260,6 +272,14 @@ func checkObservation(c Connector, t Target, o Observation) error {
 		return fmt.Errorf("%w: observed_at is missing", ErrInvalidObservation)
 	case c.Kind() == KindArgoCD && o.Outcome == OutcomeVerified:
 		return ErrVerifiedNotAllowed
+	case !o.Caveats.valid():
+		return fmt.Errorf("%w: unknown caveat", ErrInvalidObservation)
+	case !o.Caveats.HasAll(requiredCaveats(c.Kind())):
+		return fmt.Errorf("%w: required caveat is missing", ErrInvalidObservation)
+	case c.Kind() != KindArgoCD && !o.ArgoCD.IsZero():
+		return fmt.Errorf("%w: ArgoCD facts on a %s observation", ErrInvalidObservation, c.Kind())
+	case !o.ArgoCD.valid():
+		return fmt.Errorf("%w: ArgoCD facts outside the allowed values", ErrInvalidObservation)
 	}
 	return nil
 }

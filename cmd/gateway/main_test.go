@@ -184,6 +184,10 @@ func TestSetup_Refusals(t *testing.T) {
 	if err := os.WriteFile(esoFile, []byte(`[{"name":"eso-main","kind":"eso","settings":{"namespaces":["tenant-a-uat"]}}]`), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	badArgo := filepath.Join(dir, "argocd-bad.json")
+	if err := os.WriteFile(badArgo, []byte(`[{"name":"argocd-main","kind":"argocd","settings":{"base_url":"https://argocd.example.com/?auth=tenant-a-uat","token_file":"/etc/token","allowed_projects":["tenant-a"],"applications":[{"id":"payments","name":"payments-api"}]}}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	looseID := filepath.Join(dir, "identity.json")
 	if err := os.WriteFile(looseID, []byte(`{"gateway_id":"gw","gateway_secret":"`+testSecret+`"}`), 0o600); err != nil {
 		t.Fatal(err)
@@ -203,6 +207,7 @@ func TestSetup_Refusals(t *testing.T) {
 		{"no identity", func(f *bootFixture) { f.env = envMap(nil); f.cfg.IdentityFile = "" }, "no credential"},
 		{"loose identity file", func(f *bootFixture) { f.env = envMap(nil); f.cfg.IdentityFile = looseID }, "owner-only"},
 		{"connector kind not in this build", func(f *bootFixture) { f.cfg.ConnectorsFile = esoFile }, "not supported by this build"},
+		{"invalid argocd settings", func(f *bootFixture) { f.cfg.ConnectorsFile = badArgo }, "base_url"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -241,4 +246,34 @@ func waitFor(t *testing.T, cond func() bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("condition not met within 5s")
+}
+
+func TestSetup_BindsArgoCDConnectorWithoutCallingIt(t *testing.T) {
+	var argoHits atomic.Int32
+	argo := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { argoHits.Add(1) }))
+	t.Cleanup(argo.Close)
+	dir := t.TempDir()
+	file := filepath.Join(dir, "connectors.json")
+	body := `[{"name":"argocd-main","kind":"argocd","settings":{"base_url":"` + argo.URL + `","token_file":"` + filepath.Join(dir, "token") +
+		`","allowed_projects":["tenant-a"],"applications":[{"id":"payments","name":"payments-api"}]}}]`
+	if err := os.WriteFile(file, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	f := newFixture(t)
+	f.cfg.ConnectorsFile = file
+	var deps loopDeps
+	orig := newLoop
+	newLoop = func(d loopDeps) cpLoop { deps = d; return standbyLoop{logger: d.Logger, probes: d.Probes} }
+	t.Cleanup(func() { newLoop = orig })
+
+	if _, err := f.setup(); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	if got := deps.Registry.Names(); len(got) != 1 || got[0] != "argocd-main" {
+		t.Fatalf("bound connectors = %v", got)
+	}
+	if argoHits.Load() != 0 {
+		t.Fatal("ArgoCD was called during boot")
+	}
 }

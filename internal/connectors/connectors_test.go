@@ -22,11 +22,11 @@ func (f *fakeConnector) Observe(_ context.Context, t Target) (Observation, error
 		return f.obs(t)
 	}
 	st, _ := StageFor(f.kind)
-	return Observation{Connector: f.name, Kind: f.kind, TargetID: t.ID, Stage: st, Outcome: OutcomeObserved, ObservedAt: time.Now()}, nil
+	return Observation{Connector: f.name, Kind: f.kind, TargetID: t.ID, Stage: st, Outcome: OutcomeObserved, Caveats: requiredCaveats(f.kind), ObservedAt: time.Now()}, nil
 }
 
 func goodObs(c *fakeConnector, t Target, o Outcome) Observation {
-	return Observation{Connector: c.name, Kind: c.kind, TargetID: t.ID, Stage: t.Stage, Outcome: o, ObservedAt: time.Now()}
+	return Observation{Connector: c.name, Kind: c.kind, TargetID: t.ID, Stage: t.Stage, Outcome: o, Caveats: requiredCaveats(c.kind), ObservedAt: time.Now()}
 }
 
 func TestNewRegistry(t *testing.T) {
@@ -148,6 +148,42 @@ func TestRegistry_ObserveChecksContract(t *testing.T) {
 			}, ErrInvalidObservation, OutcomeError, true},
 		{"connector error becomes error outcome", eso, "eso-main", esoTarget,
 			func(Target) (Observation, error) { return Observation{}, errors.New("boom") }, nil, OutcomeError, true},
+		{"argocd without health caveat replaced", argo, "argocd-main", argoTarget,
+			func(t Target) (Observation, error) {
+				o := goodObs(argo, t, OutcomeObserved)
+				o.Caveats = 0
+				return o, nil
+			}, ErrInvalidObservation, OutcomeError, true},
+		{"undefined caveat bit replaced", eso, "eso-main", esoTarget,
+			func(t Target) (Observation, error) {
+				o := goodObs(eso, t, OutcomeObserved)
+				o.Caveats = 1 << 31
+				return o, nil
+			}, ErrInvalidObservation, OutcomeError, true},
+		{"argocd facts on eso replaced", eso, "eso-main", esoTarget,
+			func(t Target) (Observation, error) {
+				o := goodObs(eso, t, OutcomeObserved)
+				o.ArgoCD = ArgoCDFacts{SyncStatus: "Synced", HealthStatus: "Healthy"}
+				return o, nil
+			}, ErrInvalidObservation, OutcomeError, true},
+		{"argocd facts pass", argo, "argocd-main", argoTarget,
+			func(t Target) (Observation, error) {
+				o := goodObs(argo, t, OutcomeObserved)
+				o.ArgoCD = ArgoCDFacts{SyncStatus: "Synced", HealthStatus: "Healthy", SyncRevision: "4f2a9c1", OperationPhase: "Succeeded"}
+				return o, nil
+			}, nil, OutcomeObserved, true},
+		{"argocd free text in facts replaced", argo, "argocd-main", argoTarget,
+			func(t Target) (Observation, error) {
+				o := goodObs(argo, t, OutcomeNotObserved)
+				o.ArgoCD = ArgoCDFacts{SyncStatus: "Synced", HealthStatus: "Degraded: readiness probe failed"}
+				return o, nil
+			}, ErrInvalidObservation, OutcomeError, true},
+		{"argocd revision with spaces replaced", argo, "argocd-main", argoTarget,
+			func(t Target) (Observation, error) {
+				o := goodObs(argo, t, OutcomeObserved)
+				o.ArgoCD = ArgoCDFacts{SyncStatus: "Synced", HealthStatus: "Healthy", SyncRevision: "main password=x"}
+				return o, nil
+			}, ErrInvalidObservation, OutcomeError, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -186,7 +222,9 @@ func TestRegistry_ObserveChecksContract(t *testing.T) {
 // tests rather than a review.
 func TestResultTypesCarryNoFreeFormOrValueFields(t *testing.T) {
 	banned := []string{"value", "hash", "secret", "data", "raw", "extra", "message", "token", "password", "url", "namespace"}
-	for _, typ := range []reflect.Type{reflect.TypeFor[Observation](), reflect.TypeFor[Target]()} {
+	timeType := reflect.TypeFor[time.Time]()
+	var walk func(typ reflect.Type)
+	walk = func(typ reflect.Type) {
 		for i := range typ.NumField() {
 			f := typ.Field(i)
 			lower := strings.ToLower(f.Name)
@@ -198,8 +236,47 @@ func TestResultTypesCarryNoFreeFormOrValueFields(t *testing.T) {
 			switch f.Type.Kind() {
 			case reflect.Map, reflect.Interface, reflect.Slice, reflect.Array, reflect.Pointer, reflect.Func, reflect.Chan:
 				t.Errorf("%s.%s: kind %s can carry free-form data", typ.Name(), f.Name, f.Type.Kind())
+			case reflect.Struct:
+				if f.Type != timeType {
+					walk(f.Type)
+				}
 			}
 		}
+	}
+	for _, typ := range []reflect.Type{reflect.TypeFor[Observation](), reflect.TypeFor[Target]()} {
+		walk(typ)
+	}
+}
+
+func TestRegistry_ErrorObservationKeepsRequiredCaveat(t *testing.T) {
+	argo := &fakeConnector{name: "argocd-main", kind: KindArgoCD, obs: func(Target) (Observation, error) {
+		return Observation{}, errors.New("boom")
+	}}
+	r, err := NewRegistry(argo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := r.Observe(context.Background(), "argocd-main", Target{ID: "payments-api", Stage: StageArgoCDContext})
+	if got.Outcome != OutcomeError || !got.Caveats.Has(CaveatArgoCDHealthNotProof) {
+		t.Fatalf("error observation = %+v", got)
+	}
+}
+
+func TestCaveatSet(t *testing.T) {
+	s := CaveatSet(0).With(CaveatArgoCDMultipleSources).With(CaveatArgoCDHealthNotProof).With(Caveat(200))
+	if got := s.Codes(); !reflect.DeepEqual(got, []string{"argocd_health_not_proof", "argocd_app_has_multiple_sources"}) {
+		t.Fatalf("Codes = %v", got)
+	}
+	if s.Len() != 2 || !s.valid() || s.Has(CaveatArgoCDOperationUnrelated) || s.Has(Caveat(200)) {
+		t.Fatalf("set = %b", s)
+	}
+	for c := Caveat(0); c < caveatCount; c++ {
+		if !reasonPattern.MatchString(c.String()) {
+			t.Errorf("caveat %d code %q is not a machine code", c, c.String())
+		}
+	}
+	if Caveat(200).String() != "" {
+		t.Fatal("undefined caveat has a code")
 	}
 }
 

@@ -30,6 +30,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/secrets-bridge/gateway/internal/connectors"
+	"github.com/secrets-bridge/gateway/internal/connectors/argocd"
 	"github.com/secrets-bridge/gateway/internal/identity"
 	"github.com/secrets-bridge/gateway/internal/local"
 	"github.com/secrets-bridge/gateway/internal/observability"
@@ -77,9 +78,13 @@ func (s standbyLoop) Run(ctx context.Context) error {
 }
 
 // connectorFactories lists the connector kinds this build can run.
-// Connectors are added kind by kind; until then a connectors file that
-// names a kind is refused at boot.
-func connectorFactories() connectors.Factories { return connectors.Factories{} }
+// Connectors are added kind by kind; a connectors file that names a kind
+// not listed here is refused at boot.
+func connectorFactories(cfg Config) connectors.Factories {
+	return connectors.Factories{
+		connectors.KindArgoCD: argocd.NewFactory(argocd.Options{AllowInsecureHTTP: cfg.InsecureTransport}),
+	}
+}
 
 func main() {
 	if err := run(os.Args[1:], os.LookupEnv); err != nil {
@@ -144,7 +149,7 @@ func setup(cfg Config, getenv func(string) (string, bool), logger *slog.Logger, 
 	}
 	logger.Info("identity loaded", "source", string(src), "gateway_id", id.GatewayID)
 
-	registry, err := connectors.LoadFile(cfg.ConnectorsFile, connectorFactories())
+	registry, err := connectors.LoadFile(cfg.ConnectorsFile, connectorFactories(cfg))
 	if err != nil {
 		return nil, err
 	}

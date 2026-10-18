@@ -25,6 +25,14 @@ func TestParseConfig_Defaults(t *testing.T) {
 		LocalAddr:     "127.0.0.1:8091",
 		LogLevel:      "info",
 		ShutdownGrace: defaultShutdownGrace,
+
+		HeartbeatInterval: 30 * time.Second,
+		ClaimInterval:     5 * time.Second,
+		ClaimIdleMax:      30 * time.Second,
+		ClaimConcurrency:  1,
+		LeaseMargin:       3 * time.Second,
+		PassTimeout:       30 * time.Second,
+		UnreachableAfter:  2 * time.Minute,
 	}
 	if cfg != want {
 		t.Fatalf("cfg = %+v\nwant  %+v", cfg, want)
@@ -42,6 +50,14 @@ func TestParseConfig_EnvAndFlags(t *testing.T) {
 		"SB_GATEWAY_CONNECTORS_FILE": "/etc/connectors.json",
 		"SB_LOG_LEVEL":               "debug",
 		"SB_GATEWAY_SHUTDOWN_GRACE":  "5s",
+
+		"SB_GATEWAY_HEARTBEAT_INTERVAL":   "20s",
+		"SB_GATEWAY_CLAIM_INTERVAL":       "2s",
+		"SB_GATEWAY_CLAIM_IDLE_MAX":       "20s",
+		"SB_GATEWAY_CLAIM_CONCURRENCY":    "3",
+		"SB_GATEWAY_LEASE_MARGIN":         "4s",
+		"SB_GATEWAY_PASS_TIMEOUT":         "25s",
+		"SB_GATEWAY_CP_UNREACHABLE_AFTER": "90s",
 	})
 	cfg, err := parseConfig([]string{"--cp-endpoint", "https://cp2.example.com", "--local-addr", "[::1]:9001"}, env, io.Discard)
 	if err != nil {
@@ -54,6 +70,11 @@ func TestParseConfig_EnvAndFlags(t *testing.T) {
 		cfg.IdentityFile != "/run/id.json" || cfg.ConnectorsFile != "/etc/connectors.json" ||
 		cfg.LogLevel != "debug" || cfg.ShutdownGrace != 5*time.Second {
 		t.Fatalf("env not applied: %+v", cfg)
+	}
+	if cfg.HeartbeatInterval != 20*time.Second || cfg.ClaimInterval != 2*time.Second || cfg.ClaimIdleMax != 20*time.Second ||
+		cfg.ClaimConcurrency != 3 || cfg.LeaseMargin != 4*time.Second || cfg.PassTimeout != 25*time.Second ||
+		cfg.UnreachableAfter != 90*time.Second {
+		t.Fatalf("loop env not applied: %+v", cfg)
 	}
 }
 
@@ -69,6 +90,11 @@ func TestParseConfig_Errors(t *testing.T) {
 		{"bad duration", map[string]string{"SB_CP_ENDPOINT": "https://cp.example.com", "SB_GATEWAY_SHUTDOWN_GRACE": "soon"}, nil, "SB_GATEWAY_SHUTDOWN_GRACE"},
 		{"zero grace", map[string]string{"SB_CP_ENDPOINT": "https://cp.example.com"}, []string{"--shutdown-grace", "0s"}, "positive"},
 		{"unknown flag", map[string]string{"SB_CP_ENDPOINT": "https://cp.example.com"}, []string{"--target-url", "https://x.example.com"}, "flag provided but not defined"},
+		{"bad int", map[string]string{"SB_CP_ENDPOINT": "https://cp.example.com", "SB_GATEWAY_CLAIM_CONCURRENCY": "two"}, nil, "SB_GATEWAY_CLAIM_CONCURRENCY"},
+		{"concurrency zero", map[string]string{"SB_CP_ENDPOINT": "https://cp.example.com", "SB_GATEWAY_CLAIM_CONCURRENCY": "0"}, nil, "between 1"},
+		{"concurrency too high", map[string]string{"SB_CP_ENDPOINT": "https://cp.example.com"}, []string{"--claim-concurrency", "100"}, "between 1"},
+		{"zero lease margin", map[string]string{"SB_CP_ENDPOINT": "https://cp.example.com", "SB_GATEWAY_LEASE_MARGIN": "0s"}, nil, "SB_GATEWAY_LEASE_MARGIN"},
+		{"idle max below interval", map[string]string{"SB_CP_ENDPOINT": "https://cp.example.com", "SB_GATEWAY_CLAIM_INTERVAL": "10s", "SB_GATEWAY_CLAIM_IDLE_MAX": "5s"}, nil, "SB_GATEWAY_CLAIM_IDLE_MAX"},
 		{"positional args", map[string]string{"SB_CP_ENDPOINT": "https://cp.example.com"}, []string{"extra"}, "unexpected arguments"},
 	}
 	for _, tc := range cases {

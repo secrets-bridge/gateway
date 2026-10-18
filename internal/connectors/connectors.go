@@ -16,6 +16,8 @@ import (
 	"regexp"
 	"sort"
 	"time"
+
+	"github.com/secrets-bridge/gateway/internal/contract"
 )
 
 // Kind is a connector type.
@@ -124,6 +126,11 @@ type Observation struct {
 	Outcome    Outcome
 	Reason     string // optional machine code, reasonPattern
 	ObservedAt time.Time
+	// Evidence is the typed detail for the result: the resource read,
+	// its per-stage facts, linkage, confidence and caveats, all closed
+	// types. A non-error outcome without Evidence cannot be reported and
+	// is sent as an error stage with error_code internal.
+	Evidence *contract.StageEvidence
 }
 
 // Connector is a read-only integration bound in local configuration.

@@ -13,7 +13,7 @@
 
 **Optional, outbound-only observation plane for [Secrets Bridge](https://github.com/secrets-bridge).** A Gateway runs inside a customer security boundary, reads local integrations (External Secrets Operator, Kubernetes rollout state, ArgoCD) without changing anything, and reports metadata-only evidence that an approved secret change actually reached the workloads.
 
-> **Status: design phase.** The architecture decision record is still under review, and a draft implementation is in progress on pull requests that stay in draft until it is approved. The current code boots, loads its identity and locally bound connectors, and serves loopback health and metrics. It does not call the control plane or observe anything yet.
+> **Status: design phase.** The architecture decision record is still under review, and a draft implementation is in progress on pull requests that stay in draft until it is approved. The current code boots, loads its identity and locally bound connectors, serves loopback health and metrics, heartbeats to the control plane and claims observation tasks. No connector kinds exist yet, so it refuses every task with `unknown_connector` and observes nothing.
 
 ## How it fits
 
@@ -38,14 +38,17 @@ Control Plane (api, worker, Postgres)
 
 | Path | Purpose |
 |---|---|
-| `cmd/gateway` | Entry point: env and flag config, TLS transport to the control plane, boot and graceful shutdown. The control-plane loop plugs in behind one interface; this build makes no control-plane calls and stays not ready |
+| `cmd/gateway` | Entry point: env and flag config, TLS transport to the control plane, boot and graceful shutdown |
+| `internal/client` | Typed client for the gateway endpoints of the control plane (enroll, heartbeat, catalog, claim, lease, release, result). It refuses any other method or path, never follows redirects, caps every response body and never copies response text into errors |
+| `internal/contract` | Go structs for the v1 ObservationTask and EvidenceResult, with validation that matches the JSON schemas vendored under `internal/contract/testdata` |
+| `internal/loop` | Heartbeat loop and claim loop: jittered polling with idle backoff, bounded concurrency, one pass per lease that ends before the lease runs out, `attempt_id` echoed on every call, and refusal of any task that names a connector not bound locally |
 | `internal/connectors` | Connector interface, the registry of locally bound connectors, and the loader for the connectors file. No connector kinds are implemented yet |
 | `internal/readonly` | HTTP transport for connector clients. It refuses every method except GET and denies Kubernetes Secret paths before a request leaves the process |
 | `internal/identity` | Loads the gateway id and secret from env vars or an owner-only JSON file. Read-only, with no enrollment and no keypair |
 | `internal/local` | Loopback-only `/healthz`, `/readyz` and `/metrics` server |
 | `internal/observability` | JSON structured logger |
 
-Planned next: the control-plane client (`internal/client`) and the ESO, rollout and ArgoCD connectors.
+Planned next: the ESO, rollout and ArgoCD connectors, the catalog upload, and `enroll` and `healthcheck` subcommands.
 
 ## Configuration
 
@@ -54,11 +57,18 @@ Planned next: the control-plane client (`internal/client`) and the ESO, rollout 
 | `SB_CP_ENDPOINT` | required | `https://` only, unless `SB_INSECURE_TRANSPORT=true` (development only) |
 | `SB_CP_CA_FILE` | empty | PEM bundle that replaces the system roots |
 | `SB_CP_TLS_SERVER_NAME` | empty | TLS server name override |
-| `SB_GATEWAY_ID`, `SB_GATEWAY_SECRET` | empty | Credential pair. When unset, `SB_GATEWAY_IDENTITY_FILE` is read |
+| `SB_GATEWAY_ID`, `SB_GATEWAY_SECRET` | empty | Credential pair. The id is the UUID the control plane issued. When unset, `SB_GATEWAY_IDENTITY_FILE` is read |
 | `SB_GATEWAY_IDENTITY_FILE` | `/etc/secrets-bridge/gateway/identity.json` | `{"gateway_id": "...", "gateway_secret": "..."}`, mode 0600 or 0400. Looser modes are refused |
 | `SB_GATEWAY_LOCAL_ADDR` | `127.0.0.1:8091` | Must be a loopback address |
 | `SB_GATEWAY_CONNECTORS_FILE` | empty | JSON list of bound connectors, see below. Empty binds none |
-| `SB_GATEWAY_SHUTDOWN_GRACE` | `15s` | Graceful shutdown deadline |
+| `SB_GATEWAY_SHUTDOWN_GRACE` | `15s` | Graceful shutdown deadline. Half of it is spent waiting for in-flight passes, then unfinished tasks are released |
+| `SB_GATEWAY_HEARTBEAT_INTERVAL` | `30s` | Used until the control plane suggests an interval |
+| `SB_GATEWAY_CLAIM_INTERVAL` | `5s` | Base claim interval, jittered between half and one and a half times |
+| `SB_GATEWAY_CLAIM_IDLE_MAX` | `30s` | Longest claim interval after empty polls |
+| `SB_GATEWAY_CLAIM_CONCURRENCY` | `1` | Observation passes in flight per replica, 1 to 16 |
+| `SB_GATEWAY_LEASE_MARGIN` | `3s` | A pass stops this long before the lease expires, so the result is sent while the lease is live |
+| `SB_GATEWAY_PASS_TIMEOUT` | `30s` | Upper bound for one pass |
+| `SB_GATEWAY_CP_UNREACHABLE_AFTER` | `2m` | The Gateway turns not ready when no heartbeat has been accepted for this long |
 | `SB_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
 
 Each variable also has a flag; run `gateway -h` for the list.

@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/secrets-bridge/gateway/internal/contract"
 )
 
 type fakeConnector struct {
@@ -194,6 +196,11 @@ func TestResultTypesCarryNoFreeFormOrValueFields(t *testing.T) {
 				if strings.Contains(lower, b) {
 					t.Errorf("%s.%s: field name contains %q", typ.Name(), f.Name, b)
 				}
+			}
+			// Evidence is the one pointer allowed: it points at the closed
+			// contract type, whose own shape test walks every field.
+			if f.Name == "Evidence" && f.Type == reflect.TypeFor[*contract.StageEvidence]() {
+				continue
 			}
 			switch f.Type.Kind() {
 			case reflect.Map, reflect.Interface, reflect.Slice, reflect.Array, reflect.Pointer, reflect.Func, reflect.Chan:

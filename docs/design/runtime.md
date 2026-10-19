@@ -31,7 +31,7 @@ gateway/
     config/            local connectors and targets file, validated at boot, catalog digest
     connectors/
       connector.go     interfaces and registry
-      eso/             ExternalSecret reader, API version discovery
+      eso/             ExternalSecret reader, v1 with v1beta1 fallback
       rollout/         Deployment and ReplicaSet reader, raw read and projected decode
       argocd/          GET-only, path-allowlisted ArgoCD client
     evidence/          typed result structs, schema version, size guard
@@ -124,7 +124,7 @@ type Connector interface {
 
 ### 3.3 ESO connector
 
-API version: discovered at boot from `GET /apis/external-secrets.io` (readable through `system:discovery`, no extra RBAC). Prefer `v1`, fall back to `v1beta1`. If neither is served, every `eso_sync` stage reports `error` with `api_version_not_served` and the heartbeat connector status is `degraded`. Recent ESO releases serve `v1` and are removing `v1beta1` (verify for the supported range).
+API version: there is no discovery call at boot, and `GET /apis/external-secrets.io` is not in the allowlist. Each read asks for the object in `v1` first. When the API server answers that the group version is not served (a 404 without a `NotFound` Status), the same read retries in `v1beta1`. The connector remembers the version that last answered and tries it first on the next read. If neither version is served, the `eso_sync` stage reports `error` with `api_version_not_served`. Recent ESO releases serve `v1` and are removing `v1beta1` (verify for the supported range).
 
 Read: `GET /apis/external-secrets.io/<version>/namespaces/{ns}/externalsecrets/{name}` with the dynamic client. `ClusterExternalSecret` is out of MVP.
 
@@ -236,12 +236,16 @@ The MVP renders namespaced Roles only (ADR 0001 section 11). There is no `rbac.s
 
 For each allowed namespace, each Kubernetes connector:
 
-1. Sends `SelfSubjectAccessReview` (`authorization.k8s.io/v1`) for `get`, `list` and `watch` on core `secrets`. Any `allowed: true` is over-privilege.
-2. Sends `SelfSubjectRulesReview`. A rule that covers `secrets` (directly or through `*`) is over-privilege. If `status.incomplete` is true, the SSAR answers decide; if an SSAR call fails, the check fails closed.
+1. Sends `SelfSubjectRulesReview`. A rule that grants any verb on `secrets` or a `secrets` subresource (directly or through `*`) is over-privilege.
+2. Sends `SelfSubjectAccessReview` (`authorization.k8s.io/v1`) on core `secrets` for `get`, `list` and `watch`. If the rules review has `status.incomplete: true` (for example with a webhook authorizer), it sends one for every verb instead: `get`, `list`, `watch`, `create`, `update`, `patch`, `delete`, `deletecollection` and `*`. Any `allowed: true` is over-privilege. If any of these calls fails, the check fails closed.
 3. Sends `SelfSubjectAccessReview` for the required verbs on `externalsecrets`, `deployments` and `replicasets`, and refuses readiness if any is missing.
 4. Logs a warning if the rules review shows any write verb on those resources.
 
 On over-privilege the Gateway refuses to start and logs the reason. There is no override (ADR 0001 section 11); the fix belongs in the customer's RBAC.
+
+A check that cannot prove the absence of Secrets access also refuses the start. This covers a failed review call of steps 1 and 2, including a 401 on the pod's service account token and an unreadable token file. The pod then restart-loops by design, with the reason in the log, until the credential or RBAC is fixed. This is the opposite of a 401 from the control plane, which stops claiming and keeps the process up and not ready (section 4), because a Gateway that cannot prove its Kubernetes permissions must not run at all.
+
+The check runs again while the Gateway runs. A connector whose last check failed is checked before every heartbeat. Every connector, including those that passed, is checked again every 5 minutes (`PrivilegeRecheckInterval` in the loop). If a `secrets` grant was added after start, the replica turns not ready, stops claiming, sends an `over_privileged` heartbeat, logs the reason and exits; the next start refuses as above. A recheck that cannot prove the absence of Secrets access leaves that connector degraded and the replica not ready until a later check passes.
 
 Creating these review objects is the only non-GET call the Gateway makes to the Kubernetes API. The read-only transport allows `POST` to exactly these two paths and refuses every other non-GET request. They persist nothing.
 
@@ -487,7 +491,7 @@ tolerations: []
 affinity: {}
 ```
 
-The ESO API version is not a value; it is discovered at boot (section 3.3).
+The ESO API version is not a value; each read tries `v1` and falls back to `v1beta1` (section 3.3).
 
 ### 11.4 Render-time guards
 

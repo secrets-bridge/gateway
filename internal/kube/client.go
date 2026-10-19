@@ -134,7 +134,7 @@ func newClient(base *url.URL, inner http.RoundTripper, tokens *tokenSource, cfg 
 		maxBody = DefaultMaxBodyBytes
 	}
 	auth := &bearerTransport{next: inner, tokens: tokens, scheme: base.Scheme, host: base.Host}
-	hc, err := readonly.NewClient(auth, readonly.KubernetesPolicy(cfg.GET, cfg.Query), timeout)
+	hc, err := readonly.NewClient(auth, readonly.KubernetesPolicy(base.String(), cfg.GET, cfg.Query), timeout)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
@@ -279,7 +279,7 @@ func transportError(ctx context.Context, err error) error {
 		readonly.ErrMethodNotAllowed, readonly.ErrPathDenied, readonly.ErrPathNotAllowed,
 		readonly.ErrNonCanonicalPath, readonly.ErrOpaqueURL, readonly.ErrUserinfo,
 		readonly.ErrHostOverride, readonly.ErrQueryNotAllowed, readonly.ErrUpgradeRefused,
-		readonly.ErrStreamSubresource, readonly.ErrBodyNotJSON,
+		readonly.ErrStreamSubresource, readonly.ErrBodyNotJSON, readonly.ErrOriginNotAllowed,
 	} {
 		if errors.Is(err, sentinel) {
 			return fmt.Errorf("%w: %w", ErrRefused, sentinel)

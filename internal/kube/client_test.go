@@ -414,12 +414,32 @@ func TestTokenOnlyGoesToConfiguredServer(t *testing.T) {
 	if resp != nil {
 		_ = resp.Body.Close()
 	}
-	if !errors.Is(err, ErrForeignHost) {
-		t.Fatalf("err = %v, want ErrForeignHost", err)
+	// The read-only transport refuses the other origin first.
+	if !errors.Is(err, readonly.ErrOriginNotAllowed) {
+		t.Fatalf("err = %v, want readonly.ErrOriginNotAllowed", err)
 	}
 	if other.hits.Load() != 0 || f.hits.Load() != 0 {
 		t.Fatal("a request left the process")
 	}
+
+	// The bearer transport is a second wall: it attaches the token only
+	// for the configured server, even if it were reached directly.
+	var inner countingRoundTripper
+	bt := &bearerTransport{next: &inner, scheme: "https", host: "k8s.example.com"}
+	req := httptest.NewRequest(http.MethodGet, "https://other.example.com/apis/apps/v1/namespaces/a/deployments/web", nil)
+	if _, err := bt.RoundTrip(req); !errors.Is(err, ErrForeignHost) {
+		t.Fatalf("bearer transport err = %v, want ErrForeignHost", err)
+	}
+	if inner.n != 0 {
+		t.Fatal("bearer transport forwarded a request to another host")
+	}
+}
+
+type countingRoundTripper struct{ n int }
+
+func (c *countingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	c.n++
+	return nil, errors.New("not reached")
 }
 
 func TestStatusErrorsAndCodes(t *testing.T) {

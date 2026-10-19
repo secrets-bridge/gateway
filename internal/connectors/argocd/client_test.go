@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/secrets-bridge/gateway/internal/readonly"
 )
 
 const testToken = "test-token-canary-0123456789"
@@ -599,5 +601,32 @@ func assertNoLeak(t *testing.T, err error, baseURL string) {
 	host := strings.TrimPrefix(strings.TrimPrefix(baseURL, "https://"), "http://")
 	if strings.Contains(msg, testToken) || strings.Contains(msg, host) {
 		t.Fatalf("error leaks the token or the endpoint: %v", err)
+	}
+}
+
+// The transport is pinned to the base URL's scheme and host: even a
+// request built outside do() cannot carry the token to another server.
+func TestTransport_PinnedToBaseOrigin(t *testing.T) {
+	var hits, otherHits atomic.Int32
+	c, _ := newTestClient(t, func(http.ResponseWriter, *http.Request) { hits.Add(1) })
+	other := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { otherHits.Add(1) }))
+	t.Cleanup(other.Close)
+	req, err := http.NewRequest(http.MethodGet, other.URL+"/api/v1/applications/app", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	resp, err := c.hc.Do(req)
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	if !errors.Is(err, readonly.ErrOriginNotAllowed) {
+		t.Fatalf("err = %v, want readonly.ErrOriginNotAllowed", err)
+	}
+	if !isReadonlyRefusal(err) {
+		t.Fatal("origin refusal is not classified as a read-only refusal")
+	}
+	if hits.Load() != 0 || otherHits.Load() != 0 {
+		t.Fatal("a request left the process")
 	}
 }

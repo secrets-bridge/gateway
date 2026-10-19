@@ -125,18 +125,20 @@ func New(cfg Config) (*Client, error) {
 	// Redirects are refused by readonly.NewClient: following one would
 	// re-send the bearer token to wherever Location points, including an
 	// http:// downgrade or another host. do() reports ErrRedirectRefused.
-	hc, err := readonly.NewClient(next, policyFor(base.Path), timeout)
+	hc, err := readonly.NewClient(next, policyFor(base), timeout)
 	if err != nil {
 		return nil, errors.New("argocd: base URL path cannot form a request allowlist")
 	}
 	return &Client{base: base, token: cfg.Token, hc: hc, tlsCfg: next.TLSClientConfig}, nil
 }
 
-// policyFor is the read-only transport policy for a base path.
-func policyFor(basePath string) readonly.Policy {
+// policyFor is the read-only transport policy for a base URL: pinned to
+// its scheme and host, with GET allowed to the two paths under its path.
+func policyFor(base *url.URL) readonly.Policy {
 	return readonly.Policy{
-		GET:   []string{basePath + applicationsPath + "/*", basePath + userInfoPath},
-		Query: []string{AppNamespaceQueryKey},
+		Origin: (&url.URL{Scheme: base.Scheme, Host: base.Host}).String(),
+		GET:    []string{base.Path + applicationsPath + "/*", base.Path + userInfoPath},
+		Query:  []string{AppNamespaceQueryKey},
 	}
 }
 
@@ -409,7 +411,7 @@ var readonlyRefusals = []error{
 	readonly.ErrMethodNotAllowed, readonly.ErrPathDenied, readonly.ErrPathNotAllowed,
 	readonly.ErrNonCanonicalPath, readonly.ErrOpaqueURL, readonly.ErrUserinfo,
 	readonly.ErrHostOverride, readonly.ErrQueryNotAllowed, readonly.ErrUpgradeRefused,
-	readonly.ErrStreamSubresource, readonly.ErrBodyNotJSON,
+	readonly.ErrStreamSubresource, readonly.ErrBodyNotJSON, readonly.ErrOriginNotAllowed,
 }
 
 func isReadonlyRefusal(err error) bool {

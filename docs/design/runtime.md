@@ -310,6 +310,7 @@ A fleet-wide budget hint from the CP (per-connector qps divided by active replic
 ## 7. Health, metrics and logging
 
 - `/healthz` (process up) and `/readyz` (identity loaded, first heartbeat accepted, catalog accepted, all connector self-checks passed, CP reachable within `cp.unreachableReadinessAfter`), `/metrics`, on `127.0.0.1:8091`.
+- The claim loop checks the same state before every claim, not only once at start: a heartbeat accepted within `cp.unreachableReadinessAfter`, the current catalog accepted, and every connector verified. While any of them is false it claims nothing and logs the reason once; a pass already in flight finishes and posts its result. Readiness alone would not stop the poller, because the Gateway is not behind a Service.
 - Probes: `exec: ["/gateway", "healthcheck"]`, which works in `distroless/static` with no shell.
 - Metrics scraping: `metrics.exposeOnPodIP: false` by default. When true, the chart binds `0.0.0.0:8091` and the NetworkPolicy allows ingress on that port only from `metrics.allowFrom`. This is the one documented exception to loopback-only, and it is opt-in.
 - Metric names, with no namespace, object, application or request names as labels:
@@ -346,7 +347,7 @@ Both are reported in `clock`. The CP applies `skew = margin + |cp_offset_ms| + |
 - Ownership is per task through `attempt_id` and the lease. A replica that dies leaves a lease that expires after 60s; another replica claims with a new `attempt_id`; a late result from the dead attempt gets 409.
 - Duplicate work is possible and harmless: reads are idempotent, and the CP accepts one result per `attempt_id`.
 - Each replica reads the local configuration at boot and holds it in memory. A ConfigMap change rolls the pods through a checksum annotation.
-- When the CP is unreachable, replicas keep heartbeating with backoff, turn not ready after `cp.unreachableReadinessAfter` (default 2m), and do not buffer evidence.
+- When the CP is unreachable, replicas keep heartbeating with backoff, turn not ready and stop claiming after `cp.unreachableReadinessAfter` (default 2m), and do not buffer evidence.
 - PodDisruptionBudget `minAvailable: 1` when `replicaCount >= 2`. Topology spread is opt-in.
 - HPA is supported, not default. Scaling on CPU would mostly scale idle pollers; queue depth per Gateway is a CP metric and would need an external metrics adapter. Out of MVP.
 

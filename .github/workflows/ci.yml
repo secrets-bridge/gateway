@@ -81,100 +81,46 @@ jobs:
             exit 1
           fi
 
-  # The Gateway is stateless and MUST NOT carry a DB, Redis/KV or ORM
-  # driver in its dependency graph. Same deny-list as the agent: matched
-  # as a case-insensitive SUBSTRING so a vanity path or fork mirror can't
-  # slip a driver past the grep.
-  no-db-or-redis:
-    name: no-db-or-redis
+  # Repository guards (internal/guard): no DB, Redis, KV or ORM driver
+  # and no client-go in go.mod (require and replace, both sides) or
+  # go.sum; no import of a platform module (api, worker, agent,
+  # controller) or database/sql; no http.Transport outside
+  # internal/readonly and internal/client and no default client or proxy
+  # from the environment anywhere; no Kubernetes Secrets path literal in
+  # non-test code. The guards parse Go source, so string concatenation
+  # and path.Join are covered. The second step checks the resolved module
+  # graph, which also lists modules pulled in through a local replace.
+  guards:
+    name: guards
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - name: check go.sum for forbidden drivers
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: guard tests
+        run: go test -count=1 -v ./internal/guard/
+      - name: resolved module graph
         run: |
           set -e
+          graph="$(go list -m all)"
           FORBIDDEN_PATTERNS=(
-            # SQL drivers
-            "github.com/jackc/pgx"
-            "github.com/lib/pq"
-            "github.com/go-sql-driver/mysql"
-            "go-mssqldb"
-            "clickhouse-go"
-            # SQLite (embedded SQL)
-            "modernc.org/sqlite"
-            "mattn/go-sqlite3"
-            "glebarez/sqlite"
-            # Embedded KV
-            "etcd-io/bbolt"
-            "go.etcd.io/bbolt"
-            # NoSQL
-            "go.mongodb.org/mongo-driver"
-            # Redis / Valkey / KV clients
-            "github.com/redis/go-redis"
-            "github.com/go-redis/redis"
-            "github.com/gomodule/redigo"
-            "rueidis"
-            "valkey-go"
-            "mediocregopher/radix"
-            "go.etcd.io/etcd"
-            # ORMs
-            "gorm.io"
-            "uptrace/bun"
+            "jackc/pgx" "jackc/pgconn" "lib/pq" "go-pg" "go-sql-driver/mysql" "go-mssqldb"
+            "clickhouse-go" "sqlite" "bbolt" "boltdb" "badger" "goleveldb" "pebble" "mongo"
+            "redis" "redigo" "rueidis" "valkey" "mediocregopher/radix" "go.etcd.io/etcd"
+            "gorm" "uptrace/bun" "entgo.io" "xorm"
+            "k8s.io/client-go" "sigs.k8s.io/controller-runtime"
+            "github.com/secrets-bridge/api" "github.com/secrets-bridge/worker"
+            "github.com/secrets-bridge/agent" "github.com/secrets-bridge/controller"
           )
           status=0
           for pat in "${FORBIDDEN_PATTERNS[@]}"; do
-            if grep -q -i -F -- "${pat}" go.sum; then
-              echo "::error file=go.sum::forbidden dependency matched: ${pat}"
-              echo "the gateway must not depend on a DB, Redis/KV, or ORM driver"
+            if printf '%s\n' "$graph" | grep -q -i -F -- "${pat}"; then
+              echo "::error::forbidden module in the resolved graph: ${pat}"
               status=1
             fi
           done
           exit $status
-
-  # Kubernetes and ArgoCD are read with stdlib net/http on top of
-  # internal/readonly, so every request passes the GET-only transport.
-  # client-go would bring its own transports and write verbs. The Gateway
-  # also never depends on the Agent module.
-  no-client-go:
-    name: no-client-go
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          persist-credentials: false
-      - name: check go.mod and go.sum for forbidden modules
-        run: |
-          set -e
-          status=0
-          for pat in "k8s.io/client-go" "github.com/secrets-bridge/agent"; do
-            for f in go.mod go.sum; do
-              if [ -f "$f" ] && grep -q -i -F -- "${pat}" "$f"; then
-                echo "::error file=${f}::forbidden module matched: ${pat}"
-                status=1
-              fi
-            done
-          done
-          exit $status
-
-  # The Gateway never reads Kubernetes Secrets: a GET on a Secret returns
-  # its data. No non-test Go file may contain a Secrets API path. The
-  # runtime guard is internal/readonly.DenyKubernetesSecrets, which matches
-  # path segments and so does not trip this check.
-  no-secrets-path:
-    name: no-secrets-path
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          persist-credentials: false
-      - name: grep non-test Go files for Secrets API paths
-        run: |
-          set -e
-          hits="$(grep -rnE --include='*.go' --exclude='*_test.go' '/secrets([/"`?{%]|$)|CoreV1\(\)\.Secrets\(' . || true)"
-          if [ -n "$hits" ]; then
-            echo "$hits"
-            echo "::error::a non-test Go file references a Kubernetes Secrets API path"
-            exit 1
-          fi

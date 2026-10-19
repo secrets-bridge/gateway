@@ -258,6 +258,37 @@ func TestValidateEndpoint_ErrorOmitsUserinfo(t *testing.T) {
 	}
 }
 
+// url.Parse's inner error can quote part of a password: for
+// "https://gw:pa/ss@cp.example.com" it is `invalid port ":pa"`. No piece
+// of the raw endpoint may appear in the error.
+func TestValidateEndpoint_ParseErrorQuotesNothing(t *testing.T) {
+	for _, raw := range []string{
+		"https://gw:pa/ss@cp.example.com",
+		"https://gw:p%zzass@cp.example.com",
+		"https://gw:secretpart@[::1",
+	} {
+		_, err := validateEndpoint(raw, false)
+		if err == nil {
+			t.Fatalf("%q accepted", raw)
+		}
+		for _, piece := range []string{"pa", "ss", "secretpart", "zz", "gw"} {
+			if strings.Contains(strings.TrimPrefix(err.Error(), "SB_CP_ENDPOINT"), piece) {
+				t.Fatalf("%q: error %q quotes %q", raw, err, piece)
+			}
+		}
+	}
+}
+
+func TestValidateEndpoint_RefusesUserinfo(t *testing.T) {
+	_, err := validateEndpoint("https://user:s3cr3t-pass@cp.example.com", false)
+	if err == nil {
+		t.Fatal("userinfo accepted")
+	}
+	if strings.Contains(err.Error(), "s3cr3t") {
+		t.Fatalf("error carries the credential: %v", err)
+	}
+}
+
 func TestRedactEndpoint(t *testing.T) {
 	cases := map[string]string{
 		"https://cp.example.com":                           "https://cp.example.com",

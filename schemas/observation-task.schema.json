@@ -1,0 +1,249 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://secrets-bridge.io/schemas/gateway/v1/observation-task.schema.json",
+  "title": "ObservationTask",
+  "description": "One leased observation pass, returned by the control plane in the 200 response of POST /api/v1/gateways/{id}/tasks/claim. It carries identifiers only. It never carries a URL, namespace, object name, credential, header, command or secret value. The Gateway resolves each connector_id and target_id against its own local configuration and refuses anything it does not recognise.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "task_id",
+    "attempt_id",
+    "attempt_count",
+    "lease_expires_at",
+    "deadline_at",
+    "request_id",
+    "correlation_id",
+    "gateway_scope",
+    "connector_refs",
+    "expected_change"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "gateway.observation-task/v1"
+    },
+    "task_id": {
+      "$ref": "#/$defs/uuid",
+      "description": "Stable id of the observation task (observation_tasks.id). One task per (request, binding). Survives re-claims."
+    },
+    "attempt_id": {
+      "$ref": "#/$defs/uuid",
+      "description": "Fencing token (observation_tasks.current_attempt_id). A new value is minted on every claim. Only the current attempt_id may renew, release or submit a result, and only while its lease is live."
+    },
+    "attempt_count": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100000,
+      "description": "Number of claims handed out for this task, including this one (observation_tasks.attempt_count)."
+    },
+    "lease_expires_at": {
+      "$ref": "#/$defs/timestamp",
+      "description": "Control-plane clock. After this instant the attempt can no longer renew or submit, and another replica may claim the task with a new attempt_id."
+    },
+    "deadline_at": {
+      "$ref": "#/$defs/timestamp",
+      "description": "Control-plane clock. After this instant the control plane closes the task as timed_out. A lease never extends past the deadline."
+    },
+    "request_id": {
+      "$ref": "#/$defs/uuid",
+      "description": "The secret change request this observation belongs to (access_requests.id)."
+    },
+    "correlation_id": {
+      "$ref": "#/$defs/uuid",
+      "description": "sync_jobs.correlation_id of the job that executed the change, for audit joins."
+    },
+    "skew_margin_seconds": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 600,
+      "description": "Base clock-skew margin the control plane will apply. The Gateway uses it to propose stage outcomes. The control plane recomputes outcomes with the measured offsets reported in the result."
+    },
+    "gateway_scope": {
+      "$ref": "#/$defs/gatewayScope"
+    },
+    "connector_refs": {
+      "type": "array",
+      "description": "One entry per expected stage. At most one entry per stage; the control plane enforces that, the Gateway refuses duplicates with schema_violation.",
+      "minItems": 1,
+      "maxItems": 3,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/connectorRef"
+      }
+    },
+    "expected_change": {
+      "$ref": "#/$defs/expectedChange"
+    },
+    "rollout_baseline": {
+      "description": "Optional. Copied by the control plane from the earliest accepted pass of this task in which eso_sync was observed. Lets a stateless Gateway detect a rollout that reused an older ReplicaSet (revision annotation bumped after that pass). Null or absent until such a pass exists.",
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/rolloutBaseline"
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "maxLength": 40
+    },
+    "localId": {
+      "type": "string",
+      "description": "An identifier defined in the Gateway's local configuration, advertised through PUT /catalog and bound by an admin in the control plane. Lowercase DNS-label style, so it cannot hold a URL, path, namespace separator or credential.",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    },
+    "gatewayScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "gateway_id"
+      ],
+      "properties": {
+        "gateway_id": {
+          "$ref": "#/$defs/uuid",
+          "description": "Logical Gateway the task is routed to. Must equal the {id} in the request path and the authenticated Gateway."
+        },
+        "environment_id": {
+          "$ref": "#/$defs/uuid",
+          "description": "The environment of the binding that produced this task (gateway_connector_bindings.environment_id). Informational for the Gateway."
+        }
+      }
+    },
+    "connectorRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "connector_id",
+        "target_id",
+        "stage"
+      ],
+      "properties": {
+        "connector_id": {
+          "$ref": "#/$defs/localId",
+          "description": "Local connector name bound to this Gateway, for example eso-main, rollout-main or argocd-main (gateway_connectors.name)."
+        },
+        "target_id": {
+          "$ref": "#/$defs/localId",
+          "description": "Target inside that connector, for example payments-api. The Gateway maps it to a namespace and object name from its own configuration."
+        },
+        "stage": {
+          "$ref": "#/$defs/stage"
+        }
+      }
+    },
+    "stage": {
+      "type": "string",
+      "enum": [
+        "eso_sync",
+        "workload_rollout",
+        "argocd_context"
+      ]
+    },
+    "expectedChange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider_type",
+        "secret_ref",
+        "provider_version_id",
+        "version_source",
+        "executed_at"
+      ],
+      "properties": {
+        "provider_type": {
+          "type": "string",
+          "enum": [
+            "aws-sm",
+            "vault"
+          ],
+          "description": "Values match storage.ProviderConnectionType. Only providers with a core implementation are listed for v1."
+        },
+        "secret_ref": {
+          "$ref": "#/$defs/secretRef"
+        },
+        "provider_version_id": {
+          "description": "Provider-assigned version id the agent recorded on write: the AWS Secrets Manager VersionId, or the Vault KV v2 version number as a decimal string. Null when the agent did not report one, or reported an empty id (Vault KV v1). Never a hash of the value.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9-]{1,64}$"
+            }
+          ]
+        },
+        "provider_version_at": {
+          "description": "Creation time of that version as reported by the agent. For AWS Secrets Manager this is the agent clock at write time; for Vault it is the server created_time when present. Informational; ordering uses executed_at.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/timestamp"
+            }
+          ]
+        },
+        "version_source": {
+          "type": "string",
+          "enum": [
+            "agent_reported",
+            "none"
+          ],
+          "description": "Where provider_version_id came from. none means provider_version_id is null and the task verdict cannot be above partially_observed."
+        },
+        "executed_at": {
+          "$ref": "#/$defs/timestamp",
+          "description": "Control-plane clock time at which the control plane recorded the job as succeeded. Lower bound for ordering. Evidence observed at or before executed_at plus skew cannot relate to this change."
+        }
+      }
+    },
+    "secretRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "provider_connection_id": {
+          "$ref": "#/$defs/uuid",
+          "description": "Provider connection of the written secret when the control plane knows it (always for cross-team requests; for patch requests only when the request resolves to one). Informational for the Gateway."
+        },
+        "name": {
+          "type": "string",
+          "description": "Provider-side secret name or KV path. Used only to compare with ExternalSecret remoteRef.key inside the Gateway. It is never dialled. No scheme separators allowed.",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^(?!.*://)[A-Za-z0-9/_+=.@-]+$"
+        }
+      }
+    },
+    "rolloutBaseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "deployment_revision",
+        "observed_at"
+      ],
+      "properties": {
+        "deployment_revision": {
+          "type": "string",
+          "pattern": "^[0-9]{1,12}$",
+          "description": "deployment.kubernetes.io/revision reported in that earlier pass."
+        },
+        "observed_at": {
+          "$ref": "#/$defs/timestamp"
+        }
+      }
+    }
+  }
+}

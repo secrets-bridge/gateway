@@ -5,19 +5,27 @@
 //   - Outbound only. The one listener is the loopback /healthz, /readyz
 //     and /metrics server; a non-loopback address is refused at boot.
 //   - Read-only. Connector HTTP clients are built on internal/readonly,
-//     which refuses every method except GET and denies Kubernetes Secret
-//     paths.
+//     which allows GET only (plus POST to the two Kubernetes self-review
+//     paths) and denies Kubernetes Secret paths.
 //   - Bound connectors only. Connectors come from the local connectors
 //     file and are referred to by name; nothing in a task can add one.
+//   - Over-privileged connectors refuse the boot: a credential that can
+//     read Kubernetes Secrets stops the Gateway, with no override.
+//   - A control plane that refuses the identity (401) stops claiming
+//     and leaves the process up and not ready; it does not exit.
 //   - No database, Redis or Agent dependency; CI checks go.sum.
+//   - The only writes go to the gateway endpoints of the control plane
+//     (internal/client refuses any other method or path).
 //
-// This build wires configuration, identity, the connector registry and
-// the loopback server. The control-plane loop is the cpLoop seam below;
-// the build ships standbyLoop, which makes no control-plane calls.
+// This build wires configuration, identity, the connector registry, the
+// loopback server and the control-plane loop (internal/loop): heartbeat,
+// claim, one bounded pass over the locally bound connectors a task
+// names, and the evidence result.
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -26,13 +34,17 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/secrets-bridge/gateway/internal/client"
 	"github.com/secrets-bridge/gateway/internal/connectors"
 	"github.com/secrets-bridge/gateway/internal/connectors/argocd"
+	"github.com/secrets-bridge/gateway/internal/contract"
 	"github.com/secrets-bridge/gateway/internal/identity"
 	"github.com/secrets-bridge/gateway/internal/local"
+	"github.com/secrets-bridge/gateway/internal/loop"
 	"github.com/secrets-bridge/gateway/internal/observability"
 )
 
@@ -46,45 +58,82 @@ type cpLoop interface {
 	Run(ctx context.Context) error
 }
 
-// loopDeps is everything a control-plane loop may use. The endpoint and
-// HTTP client are validated at boot even though standbyLoop does not use
-// them, so a bad endpoint or CA file fails the boot now.
+// loopDeps is everything a control-plane loop may use. The endpoint,
+// HTTP client and CP client are built and validated at boot, so a bad
+// endpoint, CA file or gateway id fails the boot.
 type loopDeps struct {
 	Endpoint   *url.URL
 	HTTPClient *http.Client
+	CP         *client.Client
 	Identity   identity.Identity
 	Registry   *connectors.Registry
 	Probes     *local.Probes
 	Logger     *slog.Logger
+	Registerer prometheus.Registerer
+	Config     Config
+	ReplicaID  string
+	Version    string
 }
 
-// newLoop builds the control-plane loop. A later change replaces it with
-// the claim loop.
-var newLoop = func(d loopDeps) cpLoop { return standbyLoop{logger: d.Logger, probes: d.Probes} }
-
-// standbyLoop makes no network calls. It keeps the Gateway not ready,
-// because a Gateway that cannot claim tasks must not report ready, and
-// waits for shutdown.
-type standbyLoop struct {
-	logger *slog.Logger
-	probes *local.Probes
+// newLoop builds the control-plane loop. Tests replace it.
+var newLoop = func(d loopDeps) cpLoop {
+	grace := d.Config.ShutdownGrace
+	l, err := loop.New(loop.Config{
+		CP:                d.CP,
+		Connectors:        d.Registry,
+		Ready:             d.Probes,
+		Logger:            d.Logger,
+		Metrics:           loop.NewMetrics(d.Registerer),
+		GatewayID:         d.Identity.GatewayID,
+		ReplicaID:         d.ReplicaID,
+		GatewayVersion:    d.Version,
+		HeartbeatInterval: d.Config.HeartbeatInterval,
+		ClaimInterval:     d.Config.ClaimInterval,
+		ClaimIdleMax:      d.Config.ClaimIdleMax,
+		Concurrency:       d.Config.ClaimConcurrency,
+		LeaseMargin:       d.Config.LeaseMargin,
+		PassTimeout:       d.Config.PassTimeout,
+		UnreachableAfter:  d.Config.UnreachableAfter,
+		// Shutdown: wait half the grace for passes, then release what is
+		// left; every call stays inside the remaining grace.
+		DrainTimeout: grace / 2,
+		CallTimeout:  min(loop.DefaultCallTimeout, max(grace/4, 100*time.Millisecond)),
+	})
+	if err != nil {
+		return failedLoop{err: err}
+	}
+	return l
 }
 
-func (s standbyLoop) Run(ctx context.Context) error {
-	s.probes.SetReady(false)
-	s.logger.Warn("control-plane loop is not part of this build; the gateway stays not ready and observes nothing")
-	<-ctx.Done()
-	return nil
+// failedLoop reports a loop construction error from Run.
+type failedLoop struct{ err error }
+
+func (f failedLoop) Run(context.Context) error { return f.err }
+
+// gatewayVersion is buildVersion when it is a semantic version, and a
+// development placeholder otherwise, because the contract requires one.
+func gatewayVersion() string {
+	if contract.ValidGatewayVersion(buildVersion) {
+		return buildVersion
+	}
+	return "0.0.0-dev"
 }
 
 // connectorFactories lists the connector kinds this build can run.
 // Connectors are added kind by kind; a connectors file that names a kind
-// not listed here is refused at boot.
-func connectorFactories(cfg Config) connectors.Factories {
+// not listed here is refused at boot. A variable so tests can bind fakes.
+var connectorFactories = func(cfg Config) connectors.Factories {
 	return connectors.Factories{
 		connectors.KindArgoCD: argocd.NewFactory(argocd.Options{AllowInsecureHTTP: cfg.InsecureTransport}),
 	}
 }
+
+// selfCheckTimeout bounds each connector self-check at boot.
+const selfCheckTimeout = 10 * time.Second
+
+// maxCatalogBytes is the E3 body cap (runtime design 6.5). A local
+// configuration whose catalog does not fit refuses to start.
+const maxCatalogBytes = 64 << 10
 
 func main() {
 	if err := run(os.Args[1:], os.LookupEnv); err != nil {
@@ -158,21 +207,56 @@ func setup(cfg Config, getenv func(string) (string, bool), logger *slog.Logger, 
 	}
 	logger.Info("connectors bound", "count", registry.Len(), "names", registry.Names())
 
+	// Self-checks (runtime design 5.3). Over-privilege refuses the boot,
+	// with no override (ADR 0001 section 11). Any other failure leaves
+	// the replica not ready and is retried before each heartbeat.
+	if err := registry.Check(context.Background(), selfCheckTimeout); err != nil {
+		if errors.Is(err, connectors.ErrOverPrivileged) {
+			return nil, fmt.Errorf("refusing to start: %w; remove every verb on secrets (and any write) from the gateway's RBAC", err)
+		}
+		return nil, err
+	}
+	for _, h := range registry.Health() {
+		if h.Status != connectors.HealthOK {
+			logger.Warn("connector self-check did not pass; not ready until it does", "connector_id", h.Connector, "status", string(h.Status))
+		}
+	}
+	if b, err := json.Marshal(loop.CatalogFor(registry)); err != nil || len(b) > maxCatalogBytes {
+		return nil, fmt.Errorf("connectors: the catalog of bound connectors and targets does not fit in %d bytes", maxCatalogBytes)
+	}
+
+	version := gatewayVersion()
+	cp, err := client.New(endpoint, httpClient, id, version)
+	if err != nil {
+		return nil, err
+	}
+	replicaID, err := loop.NewReplicaID()
+	if err != nil {
+		return nil, err
+	}
+	logger.Info("replica identity", "replica_id", replicaID, "gateway_version", version)
+
 	probes := local.NewProbes()
 	srv, err := local.NewServer(cfg.LocalAddr, probes, gatherer)
 	if err != nil {
 		return nil, err
 	}
 
-	loop := newLoop(loopDeps{
+	registerer, _ := gatherer.(prometheus.Registerer)
+	cpl := newLoop(loopDeps{
 		Endpoint:   endpoint,
 		HTTPClient: httpClient,
+		CP:         cp,
 		Identity:   id,
 		Registry:   registry,
 		Probes:     probes,
 		Logger:     logger,
+		Registerer: registerer,
+		Config:     cfg,
+		ReplicaID:  replicaID,
+		Version:    version,
 	})
-	return &app{cfg: cfg, logger: logger, local: srv, loop: loop}, nil
+	return &app{cfg: cfg, logger: logger, local: srv, loop: cpl}, nil
 }
 
 // serve starts the loopback server and the loop, and shuts both down

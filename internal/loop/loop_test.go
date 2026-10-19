@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -95,6 +96,10 @@ func TestLoop_Refusals(t *testing.T) {
 		{"stage the connector kind cannot observe", taskOpts{refs: []contract.ConnectorRef{
 			{ConnectorID: "argocd-main", TargetID: "payments-api", Stage: contract.StageESOSync},
 		}}, contract.RefusalStageNotSupported},
+		{"target not configured in the connector", taskOpts{refs: []contract.ConnectorRef{
+			{ConnectorID: "eso-main", TargetID: "payments-api", Stage: contract.StageESOSync},
+			{ConnectorID: "rollout-main", TargetID: "kube-system-coredns", Stage: contract.StageWorkloadRollout},
+		}}, contract.RefusalUnboundTarget},
 		{"another gateway's task", taskOpts{scope: "2f2e3d4c-5b6a-4978-8695-a4b3c2d1e0f9"}, contract.RefusalScopeMismatch},
 		{"deadline passed", taskOpts{deadline: -time.Second}, contract.RefusalDeadlinePassed},
 		{"url smuggled into the task", taskOpts{mutate: func(m map[string]any) {
@@ -346,9 +351,17 @@ func TestLoop_StageConversion(t *testing.T) {
 		errorCode string
 		linkage   string
 	}{
+		{"connector-claimed observed is time_ordered without a pin", func(tg connectors.Target) (connectors.Observation, error) {
+			return goodObs("eso-main", connectors.KindESO, tg, connectors.OutcomeObserved), nil
+		}, "observed", "", "time_ordered"},
+		{"a pin with no provider version in the task is not version_pinned", func(tg connectors.Target) (connectors.Observation, error) {
+			o := goodObs("eso-main", connectors.KindESO, tg, connectors.OutcomeObserved)
+			o.Evidence.Facts.(*contract.ESOFacts).RemoteVersionPin = "matches_expected"
+			return o, nil
+		}, "observed", "", "time_ordered"},
 		{"no evidence detail is an internal error", func(tg connectors.Target) (connectors.Observation, error) {
 			o := goodObs("eso-main", connectors.KindESO, tg, connectors.OutcomeObserved)
-			o.Evidence = nil
+			o.Evidence = contract.StageEvidence{}
 			return o, nil
 		}, "error", "internal", "none"},
 		{"evidence that breaks the contract is an internal error", func(tg connectors.Target) (connectors.Observation, error) {
@@ -361,12 +374,14 @@ func TestLoop_StageConversion(t *testing.T) {
 		}, "error", "internal", "none"},
 		{"connector error code is kept", func(tg connectors.Target) (connectors.Observation, error) {
 			o := goodObs("eso-main", connectors.KindESO, tg, connectors.OutcomeError)
-			o.Evidence = &contract.StageEvidence{ErrorCode: contract.ErrorConnectorForbidden}
+			o.Evidence = contract.StageEvidence{ErrorCode: contract.ErrorConnectorForbidden}
 			return o, nil
 		}, "error", "connector_forbidden", "none"},
+		{"connector error code survives a bare error return", func(connectors.Target) (connectors.Observation, error) {
+			return connectors.Observation{Evidence: contract.StageEvidence{ErrorCode: contract.ErrorConnectorUnauthorized}}, errLeaky
+		}, "error", "connector_unauthorized", "none"},
 		{"unverifiable passes through", func(tg connectors.Target) (connectors.Observation, error) {
 			o := goodObs("eso-main", connectors.KindESO, tg, connectors.OutcomeUnverifiable)
-			o.Evidence.Linkage = contract.LinkageNone
 			o.Evidence.Caveats = []contract.Caveat{contract.CaveatRemoteRefMismatch}
 			return o, nil
 		}, "unverifiable", "", "none"},
@@ -447,36 +462,80 @@ func TestLoop_BoundedConcurrency(t *testing.T) {
 	}
 }
 
-func TestLoop_FatalResponses(t *testing.T) {
+// TestLoop_RefusedByControlPlane: a 401 on any call, or an unsupported
+// contract version, stops claiming and keeps readiness false, but the
+// loop keeps running until it is cancelled, so the process stays up
+// (runtime design 4). Run then returns nil.
+func TestLoop_RefusedByControlPlane(t *testing.T) {
 	cases := []struct {
 		name  string
 		setup func(cp *fakeCP)
-		want  error
 	}{
-		{"heartbeat 401", func(cp *fakeCP) { cp.hbReply = []reply{{status: 401}} }, client.ErrUnauthorized},
-		{"claim 401", func(cp *fakeCP) { cp.claimReply = []reply{{status: 401}} }, client.ErrUnauthorized},
+		{"heartbeat 401", func(cp *fakeCP) { cp.hbReply = []reply{{status: 401}} }},
+		{"catalog 401", func(cp *fakeCP) { cp.catReply = []reply{{status: 401}} }},
+		{"claim 401", func(cp *fakeCP) { cp.claimReply = []reply{{status: 401}} }},
+		{"result 401", func(cp *fakeCP) {
+			cp.resReply = []reply{{status: 401}}
+			cp.claims = append(cp.claims, taskBody(cp.t, taskOpts{n: 1}))
+		}},
 		{"claim contract version", func(cp *fakeCP) {
 			cp.claimReply = []reply{{status: 409, code: "contract_version_unsupported"}}
-		}, client.ErrContractVersionUnsupported},
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t, nil)
 			tc.setup(h.cp)
 			h.start()
+			waitFor(t, "halt", h.loop.Halted)
+			before := h.cp.snapshot()
+			time.Sleep(150 * time.Millisecond)
 			select {
 			case err := <-h.done:
-				h.done <- err
-				if !errors.Is(err, tc.want) {
-					t.Fatalf("Run err = %v, want %v", err, tc.want)
-				}
-			case <-time.After(5 * time.Second):
-				t.Fatal("loop did not stop on a fatal response")
+				t.Fatalf("Run returned %v; the process must stay up", err)
+			default:
 			}
 			if h.ready.ready.Load() {
-				t.Fatal("ready after a fatal response")
+				t.Fatal("ready after the control plane refused the gateway")
+			}
+			after := h.cp.snapshot()
+			if after.claimCalls != before.claimCalls || len(after.heartbeats) != len(before.heartbeats) {
+				t.Fatalf("calls continued after the refusal: claims %d -> %d, heartbeats %d -> %d",
+					before.claimCalls, after.claimCalls, len(before.heartbeats), len(after.heartbeats))
+			}
+			if err := h.stop(); err != nil {
+				t.Fatalf("Run err = %v, want nil after cancel", err)
 			}
 		})
+	}
+}
+
+// TestLoop_OverPrivilegedStops: a connector whose self-check finds an
+// over-privileged credential stops the Gateway, after one heartbeat that
+// reports over_privileged. There is no setting that keeps it running.
+func TestLoop_OverPrivilegedStops(t *testing.T) {
+	over := okConn("rollout-main", connectors.KindRollout)
+	over.check = func() error { return fmt.Errorf("can get secrets: %w", connectors.ErrOverPrivileged) }
+	h := newHarness(t, nil, okConn("eso-main", connectors.KindESO), over)
+	h.start()
+	select {
+	case err := <-h.done:
+		h.done <- err
+		if !errors.Is(err, connectors.ErrOverPrivileged) {
+			t.Fatalf("Run err = %v, want ErrOverPrivileged", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("loop kept running with an over-privileged connector")
+	}
+	if h.ready.ready.Load() {
+		t.Fatal("ready with an over-privileged connector")
+	}
+	snap := h.cp.snapshot()
+	if snap.claimCalls != 0 {
+		t.Fatalf("claimed %d times", snap.claimCalls)
+	}
+	if len(snap.heartbeats) == 0 || snap.heartbeats[len(snap.heartbeats)-1]["status"] != "over_privileged" {
+		t.Fatalf("heartbeats = %v", snap.heartbeats)
 	}
 }
 

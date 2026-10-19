@@ -12,6 +12,7 @@ type Metrics struct {
 	claims     *prometheus.CounterVec
 	results    *prometheus.CounterVec
 	heartbeats *prometheus.CounterVec
+	catalogs   *prometheus.CounterVec
 	inFlight   prometheus.Gauge
 }
 
@@ -32,6 +33,10 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "sb_gateway_heartbeats_total",
 			Help: "Heartbeat calls by outcome (ok, unauthorized, error).",
 		}, []string{"outcome"}),
+		catalogs: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sb_gateway_catalog_uploads_total",
+			Help: "Catalog uploads by outcome (ok, error).",
+		}, []string{"outcome"}),
 		inFlight: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "sb_gateway_tasks_inflight",
 			Help: "Observation passes in flight on this replica.",
@@ -41,6 +46,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.claims = register(reg, m.claims)
 		m.results = register(reg, m.results)
 		m.heartbeats = register(reg, m.heartbeats)
+		m.catalogs = register(reg, m.catalogs)
 		m.inFlight = register(reg, m.inFlight)
 	}
 	return m
@@ -61,3 +67,4 @@ func register[C prometheus.Collector](reg prometheus.Registerer, c C) C {
 func (m *Metrics) claim(outcome string)     { m.claims.WithLabelValues(outcome).Inc() }
 func (m *Metrics) result(outcome string)    { m.results.WithLabelValues(outcome).Inc() }
 func (m *Metrics) heartbeat(outcome string) { m.heartbeats.WithLabelValues(outcome).Inc() }
+func (m *Metrics) catalog(outcome string)   { m.catalogs.WithLabelValues(outcome).Inc() }

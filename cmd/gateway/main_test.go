@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -19,6 +21,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/secrets-bridge/gateway/internal/connectors"
 	"github.com/secrets-bridge/gateway/internal/observability"
 )
 
@@ -48,6 +51,7 @@ type bootFixture struct {
 	cpCalls  []string // "METHOD path"
 	badAuth  int
 	statuses []string // heartbeat status values
+	hbStatus int      // when set, heartbeats answer with this status
 }
 
 func (f *bootFixture) calls() ([]string, int, []string) {
@@ -75,7 +79,13 @@ func newFixture(t *testing.T) *bootFixture {
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			f.statuses = append(f.statuses, body.Status)
-			_, _ = io.WriteString(w, `{"status":"ok","next_heartbeat_seconds":30,"claim_poll_seconds":5,"contract_version":"1"}`)
+			if f.hbStatus != 0 {
+				w.WriteHeader(f.hbStatus)
+				return
+			}
+			_, _ = io.WriteString(w, `{"status":"ok","next_heartbeat_seconds":30,"claim_poll_seconds":5,"contract_version":"1","catalog_version":"c1"}`)
+		case "/api/v1/gateways/" + testGatewayID + "/catalog":
+			_, _ = io.WriteString(w, `{"accepted":0,"targets_stale":0,"catalog_version":"c1"}`)
 		case "/api/v1/gateways/" + testGatewayID + "/tasks/claim":
 			w.WriteHeader(http.StatusNoContent)
 		default:
@@ -155,9 +165,12 @@ func TestServe_LoopHeartbeatsAndClaims(t *testing.T) {
 		t.Fatalf("%d control-plane calls without the gateway secret", badAuth)
 	}
 	for _, c := range calls {
-		if !strings.HasPrefix(c, "POST /api/v1/gateways/"+testGatewayID+"/") {
+		if !strings.HasPrefix(c, "POST /api/v1/gateways/"+testGatewayID+"/") && c != "PUT /api/v1/gateways/"+testGatewayID+"/catalog" {
 			t.Fatalf("unexpected control-plane call %q", c)
 		}
+	}
+	if !slices.Contains(calls, "PUT /api/v1/gateways/"+testGatewayID+"/catalog") {
+		t.Fatalf("no catalog upload in %v", calls)
 	}
 	if len(statuses) < 2 || statuses[0] != "ok" || statuses[len(statuses)-1] != "shutting_down" {
 		t.Fatalf("heartbeat statuses = %v", statuses)
@@ -230,6 +243,96 @@ func TestServe_LoopErrorStopsGateway(t *testing.T) {
 	}
 	if err := a.serve(context.Background()); err == nil || !strings.Contains(err.Error(), "control-plane loop") {
 		t.Fatalf("serve err = %v", err)
+	}
+}
+
+// TestServe_UnauthorizedStaysUp: a 401 from the control plane keeps the
+// process up and not ready, with the reason in the logs. It does not
+// exit, so the pod does not restart-loop (runtime design 4).
+func TestServe_UnauthorizedStaysUp(t *testing.T) {
+	f := newFixture(t)
+	f.hbStatus = http.StatusUnauthorized
+	a, err := f.setup()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.serve(ctx) }()
+	base := "http://" + f.cfg.LocalAddr
+	status := func(path string) int {
+		resp, err := http.Get(base + path)
+		if err != nil {
+			return 0
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+	waitFor(t, func() bool { return status("/healthz") == http.StatusOK })
+	waitFor(t, func() bool { _, _, st := f.calls(); return len(st) >= 1 })
+	time.Sleep(300 * time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("serve returned after a 401: %v", err)
+	default:
+	}
+	if status("/healthz") != http.StatusOK || status("/readyz") == http.StatusOK {
+		t.Fatalf("healthz %d readyz %d, want up and not ready", status("/healthz"), status("/readyz"))
+	}
+	calls, _, _ := f.calls()
+	if slices.Contains(calls, "POST /api/v1/gateways/"+testGatewayID+"/tasks/claim") {
+		t.Fatal("claimed after a 401")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serve err = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not return after cancel")
+	}
+	if !strings.Contains(f.logs.String(), "unauthorized") {
+		t.Fatal("reason not logged")
+	}
+}
+
+// overPrivConn is a connector whose self-check reports over-privilege.
+type overPrivConn struct{ name string }
+
+func (c overPrivConn) Name() string                   { return c.name }
+func (overPrivConn) Kind() connectors.Kind            { return connectors.KindRollout }
+func (overPrivConn) Targets() []connectors.TargetInfo { return nil }
+func (overPrivConn) Check(context.Context) error {
+	return fmt.Errorf("selfsubjectaccessreview allows get secrets: %w", connectors.ErrOverPrivileged)
+}
+func (overPrivConn) Observe(context.Context, connectors.Target) (connectors.Observation, error) {
+	return connectors.Observation{}, errors.New("not reached")
+}
+
+// TestSetup_OverPrivilegedRefusesBoot: a connector whose credential can
+// read Kubernetes Secrets refuses the boot. No setting overrides it.
+func TestSetup_OverPrivilegedRefusesBoot(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "connectors.json")
+	if err := os.WriteFile(file, []byte(`[{"name":"rollout-main","kind":"rollout"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	orig := connectorFactories
+	connectorFactories = func() connectors.Factories {
+		return connectors.Factories{connectors.KindRollout: func(name string, _ json.RawMessage) (connectors.Connector, error) {
+			return overPrivConn{name: name}, nil
+		}}
+	}
+	t.Cleanup(func() { connectorFactories = orig })
+	f := newFixture(t)
+	f.cfg.ConnectorsFile = file
+	_, err := f.setup()
+	if !errors.Is(err, connectors.ErrOverPrivileged) || !strings.Contains(err.Error(), "refusing to start") {
+		t.Fatalf("setup err = %v, want an over-privilege refusal", err)
+	}
+	if f.cpHits.Load() != 0 {
+		t.Fatal("control plane was called before the refusal")
 	}
 }
 

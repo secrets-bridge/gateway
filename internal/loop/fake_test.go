@@ -55,10 +55,13 @@ type fakeCP struct {
 	hbReply    []reply
 	leaseReply []reply
 	resReply   []reply
+	catReply   []reply
+	catVersion string        // the stored catalog version heartbeats return
 	cpSkew     time.Duration // CP clock minus real clock, for the Date header
 	noDate     bool          // omit the Date header (offset unknown)
 
 	heartbeats []map[string]any
+	catalogs   []map[string]any
 	results    [][]byte
 	resultAt   []time.Time
 	renews     []map[string]any
@@ -127,7 +130,18 @@ func (f *fakeCP) serve(w http.ResponseWriter, r *http.Request) {
 			write(w, rp)
 			return
 		}
-		_, _ = io.WriteString(w, `{"status":"ok","next_heartbeat_seconds":30,"claim_poll_seconds":5,"contract_version":"1"}`)
+		_, _ = fmt.Fprintf(w, `{"status":"ok","next_heartbeat_seconds":30,"claim_poll_seconds":5,"contract_version":"1","catalog_version":%q}`, f.catVersion)
+	case rest == "catalog":
+		if r.Method != http.MethodPut {
+			f.badPath = append(f.badPath, r.Method+" "+r.URL.Path)
+		}
+		f.catalogs = append(f.catalogs, m)
+		if rp, ok := pop(&f.catReply); ok && rp.status != 0 {
+			write(w, rp)
+			return
+		}
+		f.catVersion = fmt.Sprintf("cat-v%d", len(f.catalogs))
+		_, _ = fmt.Fprintf(w, `{"accepted":1,"targets_stale":0,"catalog_version":%q}`, f.catVersion)
 	case rest == "tasks/claim":
 		f.claimCalls++
 		if rp, ok := pop(&f.claimReply); ok && rp.status != 0 {
@@ -176,6 +190,7 @@ func (f *fakeCP) snapshot() fakeCP {
 	defer f.mu.Unlock()
 	return fakeCP{
 		heartbeats: append([]map[string]any(nil), f.heartbeats...),
+		catalogs:   append([]map[string]any(nil), f.catalogs...),
 		results:    append([][]byte(nil), f.results...),
 		resultAt:   append([]time.Time(nil), f.resultAt...),
 		renews:     append([]map[string]any(nil), f.renews...),
@@ -253,46 +268,76 @@ func taskBody(t *testing.T, o taskOpts) []byte {
 	return b
 }
 
-// fakeConn is a connector whose Observe is scripted.
+// fakeConn is a connector whose Observe and Check are scripted. Its one
+// target is payments-api unless targets is set.
 type fakeConn struct {
-	name  string
-	kind  connectors.Kind
-	calls atomic.Int32
-	obs   func(ctx context.Context, t connectors.Target) (connectors.Observation, error)
+	name    string
+	kind    connectors.Kind
+	calls   atomic.Int32
+	obs     func(ctx context.Context, t connectors.Target) (connectors.Observation, error)
+	targets []connectors.TargetInfo
+	check   func() error
+
+	mu   sync.Mutex
+	seen []connectors.Target
 }
 
 func (c *fakeConn) Name() string          { return c.name }
 func (c *fakeConn) Kind() connectors.Kind { return c.kind }
+func (c *fakeConn) Targets() []connectors.TargetInfo {
+	if c.targets != nil {
+		return c.targets
+	}
+	return []connectors.TargetInfo{{ID: "payments-api", Namespace: "payments", Name: "payments-api"}}
+}
+func (c *fakeConn) Check(context.Context) error {
+	if c.check != nil {
+		return c.check()
+	}
+	return nil
+}
 func (c *fakeConn) Observe(ctx context.Context, t connectors.Target) (connectors.Observation, error) {
 	c.calls.Add(1)
+	c.mu.Lock()
+	c.seen = append(c.seen, t)
+	c.mu.Unlock()
 	return c.obs(ctx, t)
+}
+
+func (c *fakeConn) targetsSeen() []connectors.Target {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]connectors.Target(nil), c.seen...)
 }
 
 func i64(n int64) *int64 { return &n }
 
-// goodObs returns a valid observation with evidence for the kind.
+// goodObs returns a valid observation with evidence for the kind whose
+// facts support its outcome: the ESO refresh is now (after the write
+// plus skew) and the newest ReplicaSet is a second after the bound the
+// loop passed in.
 func goodObs(name string, kind connectors.Kind, t connectors.Target, out connectors.Outcome) connectors.Observation {
 	now := time.Now().UTC()
 	o := connectors.Observation{Connector: name, Kind: kind, TargetID: t.ID, Stage: t.Stage, Outcome: out, ObservedAt: now}
 	switch kind {
 	case connectors.KindESO:
-		o.Evidence = &contract.StageEvidence{
+		o.Evidence = contract.StageEvidence{
 			Resource:   &contract.Resource{APIVersion: "external-secrets.io/v1", Kind: "ExternalSecret", Namespace: "payments", Name: "payments-env"},
-			Facts:      &contract.ESOFacts{ReadyStatus: "True", ReadyReason: "SecretSynced", RefreshTime: &now, RemoteRefMatch: "match", RemoteVersionPin: "none"},
+			Facts:      &contract.ESOFacts{ReadyStatus: "True", ReadyReason: "SecretSynced", RefreshTime: &now, RemoteRefMatch: "match", RemoteVersionPin: "none", TargetSecretName: "payments-env"},
 			Confidence: contract.ConfidenceMedium,
-			Linkage:    contract.LinkageTimeOrdered,
-			Caveats:    []contract.Caveat{contract.CaveatTemporalInferenceOnly},
+			Caveats:    []contract.Caveat{},
 		}
 	case connectors.KindRollout:
-		o.Evidence = &contract.StageEvidence{
-			Resource:   &contract.Resource{APIVersion: "apps/v1", Kind: "Deployment", Namespace: "payments", Name: "api"},
-			Facts:      &contract.RolloutFacts{Generation: 2, ObservedGeneration: 2, SpecReplicas: 3, UpdatedReplicas: i64(3), AvailableReplicas: i64(3)},
+		created := t.NotBefore.Add(time.Second)
+		o.Evidence = contract.StageEvidence{
+			Resource: &contract.Resource{APIVersion: "apps/v1", Kind: "Deployment", Namespace: "payments", Name: "api"},
+			Facts: &contract.RolloutFacts{Generation: 2, ObservedGeneration: 2, SpecReplicas: 3, Replicas: i64(3), UpdatedReplicas: i64(3), AvailableReplicas: i64(3),
+				NewestReplicaSetCreatedAt: &created, RolloutTrigger: "replicaset_created_after_change", DeploymentRevision: "4"},
 			Confidence: contract.ConfidenceMedium,
-			Linkage:    contract.LinkageTimeOrdered,
 			Caveats:    []contract.Caveat{},
 		}
 	case connectors.KindArgoCD:
-		o.Evidence = &contract.StageEvidence{
+		o.Evidence = contract.StageEvidence{
 			Resource:   &contract.Resource{APIVersion: "argoproj.io/v1alpha1", Kind: "Application", Namespace: "argocd", Name: "payments-api"},
 			Facts:      &contract.ArgoCDFacts{SyncStatus: "Synced", HealthStatus: "Healthy"},
 			Confidence: contract.ConfidenceLow,

@@ -430,14 +430,35 @@ func (r *Resource) validate(rules stageRules) error {
 	return nil
 }
 
-// StageEvidence is the typed, metadata-only detail a connector attaches
-// to one observation. The loop turns it, with the connector's outcome,
-// into a StageObservation and validates the result.
+// StageEvidence is the evidence model every connector returns: the
+// typed, metadata-only detail of one observation. It is the only shape
+// in which a connector reports what it read, so the ESO, rollout and
+// ArgoCD connectors share one model and one set of enums.
+//
+// There is no linkage field. Linkage is a claim about how the
+// observation is tied to the change, and the Gateway derives it from
+// the facts and the task (a pinned version needs remote_version_pin =
+// matches_expected and a provider version in the task), never from a
+// connector's say-so.
+//
+// For an error outcome only ErrorCode is used. For any other outcome
+// Resource and Facts are required.
 type StageEvidence struct {
 	Resource   *Resource
 	Facts      Facts
 	Confidence Confidence
-	Linkage    Linkage
 	Caveats    []Caveat
 	ErrorCode  ErrorCode
 }
+
+// Valid reports whether o is a v1 stage outcome.
+func (o Outcome) Valid() bool { return oneOf(o, allOutcomes...) }
+
+// Outcomes lists every v1 stage outcome, in schema order.
+func Outcomes() []Outcome { return append([]Outcome(nil), allOutcomes...) }
+
+// Valid reports whether c is a v1 caveat.
+func (c Caveat) Valid() bool { return oneOf(c, allCaveats...) }
+
+// Valid reports whether e is a v1 error code.
+func (e ErrorCode) Valid() bool { return oneOf(e, allErrorCodes...) }

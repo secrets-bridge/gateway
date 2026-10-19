@@ -5,10 +5,14 @@
 //   - Outbound only. The one listener is the loopback /healthz, /readyz
 //     and /metrics server; a non-loopback address is refused at boot.
 //   - Read-only. Connector HTTP clients are built on internal/readonly,
-//     which refuses every method except GET and denies Kubernetes Secret
-//     paths.
+//     which allows GET only (plus POST to the two Kubernetes self-review
+//     paths) and denies Kubernetes Secret paths.
 //   - Bound connectors only. Connectors come from the local connectors
 //     file and are referred to by name; nothing in a task can add one.
+//   - Over-privileged connectors refuse the boot: a credential that can
+//     read Kubernetes Secrets stops the Gateway, with no override.
+//   - A control plane that refuses the identity (401) stops claiming
+//     and leaves the process up and not ready; it does not exit.
 //   - No database, Redis or Agent dependency; CI checks go.sum.
 //   - The only writes go to the gateway endpoints of the control plane
 //     (internal/client refuses any other method or path).
@@ -21,6 +25,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -115,8 +120,15 @@ func gatewayVersion() string {
 
 // connectorFactories lists the connector kinds this build can run.
 // Connectors are added kind by kind; until then a connectors file that
-// names a kind is refused at boot.
-func connectorFactories() connectors.Factories { return connectors.Factories{} }
+// names a kind is refused at boot. A variable so tests can bind fakes.
+var connectorFactories = func() connectors.Factories { return connectors.Factories{} }
+
+// selfCheckTimeout bounds each connector self-check at boot.
+const selfCheckTimeout = 10 * time.Second
+
+// maxCatalogBytes is the E3 body cap (runtime design 6.5). A local
+// configuration whose catalog does not fit refuses to start.
+const maxCatalogBytes = 64 << 10
 
 func main() {
 	if err := run(os.Args[1:], os.LookupEnv); err != nil {
@@ -189,6 +201,24 @@ func setup(cfg Config, getenv func(string) (string, bool), logger *slog.Logger, 
 		logger.Warn("no connectors bound; set SB_GATEWAY_CONNECTORS_FILE")
 	}
 	logger.Info("connectors bound", "count", registry.Len(), "names", registry.Names())
+
+	// Self-checks (runtime design 5.3). Over-privilege refuses the boot,
+	// with no override (ADR 0001 section 11). Any other failure leaves
+	// the replica not ready and is retried before each heartbeat.
+	if err := registry.Check(context.Background(), selfCheckTimeout); err != nil {
+		if errors.Is(err, connectors.ErrOverPrivileged) {
+			return nil, fmt.Errorf("refusing to start: %w; remove every verb on secrets (and any write) from the gateway's RBAC", err)
+		}
+		return nil, err
+	}
+	for _, h := range registry.Health() {
+		if h.Status != connectors.HealthOK {
+			logger.Warn("connector self-check did not pass; not ready until it does", "connector_id", h.Connector, "status", string(h.Status))
+		}
+	}
+	if b, err := json.Marshal(loop.CatalogFor(registry)); err != nil || len(b) > maxCatalogBytes {
+		return nil, fmt.Errorf("connectors: the catalog of bound connectors and targets does not fit in %d bytes", maxCatalogBytes)
+	}
 
 	version := gatewayVersion()
 	cp, err := client.New(endpoint, httpClient, id, version)

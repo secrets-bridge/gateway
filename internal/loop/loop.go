@@ -37,6 +37,7 @@ import (
 // ControlPlane is the part of *client.Client the loop uses.
 type ControlPlane interface {
 	Heartbeat(ctx context.Context, req client.HeartbeatRequest) (*client.HeartbeatResponse, error)
+	PutCatalog(ctx context.Context, cat client.Catalog) (*client.CatalogResponse, error)
 	Claim(ctx context.Context, replicaID string) (*client.ClaimResult, error)
 	RenewLease(ctx context.Context, taskID string, req client.LeaseRequest) (time.Time, error)
 	Release(ctx context.Context, taskID string, req client.ReleaseRequest) error
@@ -46,7 +47,11 @@ type ControlPlane interface {
 // Connectors is the part of *connectors.Registry the loop uses.
 type Connectors interface {
 	Lookup(name string) (connectors.Connector, error)
+	HasTarget(name, targetID string) bool
 	Observe(ctx context.Context, name string, target connectors.Target) (connectors.Observation, error)
+	Catalog() []connectors.CatalogEntry
+	Health() []connectors.Health
+	Recheck(ctx context.Context, timeout time.Duration) error
 }
 
 // Readiness is the readiness gate (*local.Probes).
@@ -127,10 +132,22 @@ type Loop struct {
 	fatalOnce sync.Once
 	fatal     chan error
 
-	firstHeartbeat chan struct{}
-	firstOnce      sync.Once
-	lastHeartbeat  atomic.Int64 // unix nanos of the last accepted heartbeat
-	startedAt      time.Time
+	// halted is closed when the control plane refuses this Gateway (401,
+	// or an unsupported contract version). Claiming stops, readiness
+	// stays false, and the process stays up so operators see why.
+	haltOnce   sync.Once
+	halted     chan struct{}
+	haltReason atomic.Value // string
+
+	claimGate     chan struct{} // closed once a heartbeat and the catalog are accepted
+	claimGateOnce sync.Once
+	lastHeartbeat atomic.Int64 // unix nanos of the last accepted heartbeat
+	startedAt     time.Time
+
+	// Written by the heartbeat goroutine; read by heartbeat requests.
+	catalogVersion  atomic.Value // string, as the control plane returned it
+	catalogAccepted atomic.Bool
+	heartbeatFresh  atomic.Bool
 }
 
 // ErrInvalidConfig is returned by New.
@@ -186,12 +203,13 @@ func New(cfg Config) (*Loop, error) {
 		cfg.Jitter = uniformJitter
 	}
 	return &Loop{
-		cfg:            cfg,
-		log:            cfg.Logger,
-		m:              cfg.Metrics,
-		sem:            make(chan struct{}, cfg.Concurrency),
-		fatal:          make(chan error, 1),
-		firstHeartbeat: make(chan struct{}),
+		cfg:       cfg,
+		log:       cfg.Logger,
+		m:         cfg.Metrics,
+		sem:       make(chan struct{}, cfg.Concurrency),
+		fatal:     make(chan error, 1),
+		halted:    make(chan struct{}),
+		claimGate: make(chan struct{}),
 	}, nil
 }
 
@@ -202,10 +220,19 @@ func uniformJitter(d time.Duration, low, high float64) time.Duration {
 }
 
 // Run starts the heartbeat and claim loops and blocks until ctx is
-// cancelled or the control plane rejects the identity or the contract
-// version. On return, readiness is false, claiming has stopped, the last
-// heartbeat says shutting_down, and in-flight passes have finished or
-// been released.
+// cancelled. On return, readiness is false, claiming has stopped, the
+// last heartbeat says shutting_down, and in-flight passes have finished
+// or been released.
+//
+// When the control plane refuses this Gateway (401 on any call, or 409
+// contract_version_unsupported), Run does not return: it stops claiming,
+// keeps readiness false and waits for ctx, so the pod stays up with the
+// reason in its logs instead of restart-looping (runtime design 4).
+//
+// Run returns early with an error wrapping connectors.ErrOverPrivileged
+// when a connector self-check finds an over-privileged credential: the
+// Gateway refuses to run with one, with no override (ADR 0001 section
+// 11).
 func (l *Loop) Run(ctx context.Context) error {
 	l.cfg.Ready.SetReady(false)
 	l.startedAt = l.cfg.Now()
@@ -222,11 +249,21 @@ func (l *Loop) Run(ctx context.Context) error {
 	go func() { defer loops.Done(); l.claimLoop(runCtx, workCtx) }()
 
 	var fatal error
+	halted := false
 	select {
 	case <-ctx.Done():
 		l.log.Info("control-plane loop stopping")
 	case fatal = <-l.fatal:
 		l.log.Error("control-plane loop stopping", "error", fatal)
+	case <-l.halted:
+		halted = true
+		l.log.Error("control plane refused this gateway; claiming stopped, staying up and not ready until restarted",
+			"reason", l.reason())
+		stopRun()
+		loops.Wait()
+		l.cfg.Ready.SetReady(false)
+		<-ctx.Done()
+		l.log.Info("control-plane loop stopping")
 	}
 	l.cfg.Ready.SetReady(false)
 	stopRun()
@@ -234,9 +271,12 @@ func (l *Loop) Run(ctx context.Context) error {
 	// A heartbeat that was in flight may have set ready again.
 	l.cfg.Ready.SetReady(false)
 
-	if fatal != nil {
+	switch {
+	case fatal != nil:
 		cancelWork()
-	} else {
+	case halted && l.reason() == haltUnauthorized:
+		// The control plane no longer accepts this identity.
+	default:
 		l.shutdownHeartbeat()
 	}
 
@@ -252,9 +292,41 @@ func (l *Loop) Run(ctx context.Context) error {
 	return fatal
 }
 
+// Halt reasons.
+const (
+	haltUnauthorized    = "unauthorized"
+	haltContractVersion = "contract_version_unsupported"
+)
+
 func (l *Loop) fail(err error) {
 	l.fatalOnce.Do(func() { l.fatal <- err })
 }
+
+// halt stops claiming for good and keeps the process up and not ready.
+func (l *Loop) halt(reason string) {
+	l.haltOnce.Do(func() {
+		l.haltReason.Store(reason)
+		l.cfg.Ready.SetReady(false)
+		close(l.halted)
+	})
+}
+
+func (l *Loop) isHalted() bool {
+	select {
+	case <-l.halted:
+		return true
+	default:
+		return false
+	}
+}
+
+func (l *Loop) reason() string {
+	r, _ := l.haltReason.Load().(string)
+	return r
+}
+
+// Halted reports whether the control plane has refused this Gateway.
+func (l *Loop) Halted() bool { return l.isHalted() }
 
 func sleepCtx(ctx context.Context, d time.Duration) bool {
 	if d <= 0 {
@@ -271,42 +343,137 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 }
 
 func (l *Loop) heartbeatRequest(status string) client.HeartbeatRequest {
+	health := l.cfg.Connectors.Health()
+	hs := make([]client.ConnectorHealth, 0, len(health))
+	for _, h := range health {
+		hs = append(hs, client.ConnectorHealth{ConnectorID: h.Connector, Kind: string(h.Kind), Status: string(h.Status)})
+	}
 	return client.HeartbeatRequest{
 		ReplicaID:        l.cfg.ReplicaID,
 		GatewayVersion:   l.cfg.GatewayVersion,
 		ContractVersions: []string{contract.ContractVersion},
 		Status:           status,
 		InFlight:         int(l.inFlight.Load()),
+		CatalogVersion:   l.catVersion(),
+		Connectors:       hs,
 	}
+}
+
+// connectorsHealthy reports whether every connector's last self-check
+// passed.
+func (l *Loop) connectorsHealthy() bool {
+	for _, h := range l.cfg.Connectors.Health() {
+		if h.Status != connectors.HealthOK {
+			return false
+		}
+	}
+	return true
+}
+
+// updateReady sets readiness from its parts (runtime design 7): a
+// heartbeat accepted recently, the catalog accepted, every connector
+// self-check passed, and the control plane not refusing this Gateway.
+func (l *Loop) updateReady() {
+	l.cfg.Ready.SetReady(l.heartbeatFresh.Load() && l.catalogAccepted.Load() && l.connectorsHealthy() && !l.isHalted())
+}
+
+// CatalogFor builds the E3 body from the bound connectors: ids, kinds,
+// display names and intervals. No URLs and no credentials.
+func CatalogFor(c Connectors) client.Catalog {
+	entries := c.Catalog()
+	cat := client.Catalog{Connectors: make([]client.CatalogConnector, 0, len(entries))}
+	for _, e := range entries {
+		cc := client.CatalogConnector{ConnectorID: e.Connector, Kind: string(e.Kind), Targets: make([]client.CatalogTarget, 0, len(e.Targets))}
+		for _, t := range e.Targets {
+			cc.Targets = append(cc.Targets, client.CatalogTarget{
+				TargetID: t.ID, Namespace: t.Namespace, Name: t.Name,
+				RefreshIntervalSeconds: t.RefreshIntervalSeconds, ProgressDeadlineSeconds: t.ProgressDeadlineSeconds,
+			})
+		}
+		cat.Connectors = append(cat.Connectors, cc)
+	}
+	return cat
+}
+
+// uploadCatalog sends E3 and records the control plane's catalog
+// version, which later heartbeats echo.
+func (l *Loop) uploadCatalog(ctx context.Context) error {
+	callCtx, cancel := context.WithTimeout(ctx, l.cfg.CallTimeout)
+	defer cancel()
+	resp, err := l.cfg.CP.PutCatalog(callCtx, CatalogFor(l.cfg.Connectors))
+	if err != nil {
+		l.m.catalog("error")
+		return err
+	}
+	l.m.catalog("ok")
+	l.catalogVersion.Store(resp.CatalogVersion)
+	if !l.catalogAccepted.Swap(true) {
+		l.log.Info("catalog accepted", "connectors", len(l.cfg.Connectors.Catalog()))
+	}
+	return nil
+}
+
+func (l *Loop) catVersion() string {
+	v, _ := l.catalogVersion.Load().(string)
+	return v
 }
 
 func (l *Loop) heartbeatLoop(ctx context.Context) {
 	interval := l.cfg.HeartbeatInterval
 	backoff := time.Second
 	for {
+		// Self-checks that did not pass are retried before each
+		// heartbeat, so the reported health is current.
+		if err := l.cfg.Connectors.Recheck(ctx, l.cfg.CallTimeout); errors.Is(err, connectors.ErrOverPrivileged) {
+			l.reportOverPrivileged()
+			l.fail(err)
+			return
+		}
+		status := client.ReplicaOK
+		if !l.connectorsHealthy() {
+			status = client.ReplicaDegraded
+		}
 		callCtx, cancel := context.WithTimeout(ctx, l.cfg.CallTimeout)
-		resp, err := l.cfg.CP.Heartbeat(callCtx, l.heartbeatRequest(client.ReplicaOK))
+		resp, err := l.cfg.CP.Heartbeat(callCtx, l.heartbeatRequest(status))
 		cancel()
 		var wait time.Duration
 		switch {
 		case err == nil:
 			l.m.heartbeat("ok")
 			l.lastHeartbeat.Store(l.cfg.Now().UnixNano())
-			l.cfg.Ready.SetReady(true)
-			l.firstOnce.Do(func() {
-				close(l.firstHeartbeat)
-				l.log.Info("heartbeat accepted; claiming tasks")
-			})
+			l.heartbeatFresh.Store(true)
 			if s := resp.NextHeartbeatSeconds; s > 0 {
 				interval = time.Duration(min(max(s, minHeartbeatSeconds), maxHeartbeatSeconds)) * time.Second
 			}
-			backoff = time.Second
 			wait = l.cfg.Jitter(interval, 0.9, 1.1)
+			if !l.catalogAccepted.Load() || resp.CatalogVersion != l.catVersion() {
+				if cerr := l.uploadCatalog(ctx); cerr != nil {
+					if errors.Is(cerr, client.ErrUnauthorized) {
+						l.halt(haltUnauthorized)
+						return
+					}
+					l.log.Warn("catalog upload failed", "error", cerr)
+					l.catalogAccepted.Store(false)
+					wait = l.cfg.Jitter(min(backoff, interval), 0.9, 1.1)
+					backoff = min(backoff*2, maxBackoff)
+				} else {
+					backoff = time.Second
+				}
+			} else {
+				backoff = time.Second
+			}
+			l.updateReady()
+			if l.catalogAccepted.Load() {
+				l.claimGateOnce.Do(func() {
+					close(l.claimGate)
+					l.log.Info("heartbeat and catalog accepted; claiming tasks")
+				})
+			}
 		case ctx.Err() != nil:
 			return
 		case errors.Is(err, client.ErrUnauthorized):
 			l.m.heartbeat("unauthorized")
-			l.fail(fmt.Errorf("heartbeat: %w", err))
+			l.halt(haltUnauthorized)
 			return
 		default:
 			l.m.heartbeat("error")
@@ -324,6 +491,16 @@ func (l *Loop) heartbeatLoop(ctx context.Context) {
 	}
 }
 
+// reportOverPrivileged tells the control plane, best effort, before the
+// Gateway stops.
+func (l *Loop) reportOverPrivileged() {
+	ctx, cancel := context.WithTimeout(context.Background(), l.cfg.CallTimeout)
+	defer cancel()
+	if _, err := l.cfg.CP.Heartbeat(ctx, l.heartbeatRequest(client.ReplicaOverPriv)); err != nil {
+		l.log.Info("over_privileged heartbeat not delivered", "error", err)
+	}
+}
+
 func (l *Loop) checkUnreachable() {
 	last := l.lastHeartbeat.Load()
 	since := l.startedAt
@@ -331,7 +508,8 @@ func (l *Loop) checkUnreachable() {
 		since = time.Unix(0, last)
 	}
 	if l.cfg.Now().Sub(since) >= l.cfg.UnreachableAfter {
-		l.cfg.Ready.SetReady(false)
+		l.heartbeatFresh.Store(false)
+		l.updateReady()
 	}
 }
 
@@ -347,7 +525,7 @@ func (l *Loop) claimLoop(runCtx, workCtx context.Context) {
 	select {
 	case <-runCtx.Done():
 		return
-	case <-l.firstHeartbeat:
+	case <-l.claimGate:
 	}
 	base := l.cfg.ClaimInterval
 	interval := base
@@ -369,9 +547,13 @@ func (l *Loop) claimLoop(runCtx, workCtx context.Context) {
 		switch {
 		case err != nil && runCtx.Err() != nil:
 			return
-		case errors.Is(err, client.ErrUnauthorized), errors.Is(err, client.ErrContractVersionUnsupported):
+		case errors.Is(err, client.ErrUnauthorized):
 			l.m.claim("unauthorized")
-			l.fail(fmt.Errorf("claim: %w", err))
+			l.halt(haltUnauthorized)
+			return
+		case errors.Is(err, client.ErrContractVersionUnsupported):
+			l.m.claim("unauthorized")
+			l.halt(haltContractVersion)
 			return
 		case errors.Is(err, client.ErrRateLimited), errors.Is(err, client.ErrUnavailable):
 			l.m.claim("throttled")
@@ -412,6 +594,10 @@ type attempt struct {
 	leaseOffset time.Duration // offset used to read CP times, rounded to the safe side
 	lease       time.Time     // lease_expires_at on the local clock
 	started     time.Time
+	// apiOffset is Gateway clock minus API server clock, the largest
+	// measured in this pass, when apiOffsetKnown.
+	apiOffset      time.Duration
+	apiOffsetKnown bool
 }
 
 func (l *Loop) handle(workCtx context.Context, res *client.ClaimResult) {
@@ -467,7 +653,8 @@ func (l *Loop) handle(workCtx context.Context, res *client.ClaimResult) {
 
 // precheck refuses a task before any connector call. Each connector_ref
 // must name a connector bound in local configuration, by name, whose
-// kind observes the requested stage.
+// kind observes the requested stage, and a target id configured in that
+// connector.
 func (l *Loop) precheck(t *contract.ObservationTask, offset time.Duration, now time.Time) contract.RefusalReason {
 	if t.GatewayScope.GatewayID != l.cfg.GatewayID {
 		return contract.RefusalScopeMismatch
@@ -482,8 +669,14 @@ func (l *Loop) precheck(t *contract.ObservationTask, offset time.Duration, now t
 			// the local configuration is reported.
 			return contract.RefusalUnknownConnector
 		}
-		if stage, _ := connectors.StageFor(c.Kind()); string(stage) != string(ref.Stage) {
+		if stage, _ := connectors.StageFor(c.Kind()); stage != ref.Stage {
 			return contract.RefusalStageNotSupported
+		}
+		if !l.cfg.Connectors.HasTarget(ref.ConnectorID, ref.TargetID) {
+			// The target id is not configured in that connector. Refused
+			// before any read; nothing about the local targets is
+			// reported.
+			return contract.RefusalUnboundTarget
 		}
 	}
 	return ""
@@ -503,6 +696,7 @@ func (l *Loop) passEnd(a *attempt) (end time.Time, leaseBound bool) {
 func (l *Loop) observe(workCtx context.Context, a *attempt, t *contract.ObservationTask, log *slog.Logger) ([]contract.StageObservation, contract.AttemptStatus, bool) {
 	refs := slices.Clone(t.ConnectorRefs)
 	slices.SortStableFunc(refs, func(x, y contract.ConnectorRef) int { return x.Stage.Order() - y.Stage.Order() })
+	marker := newPassMarker(t, a.offset)
 
 	end, leaseBound := l.passEnd(a)
 	renewed := false
@@ -529,7 +723,8 @@ func (l *Loop) observe(workCtx context.Context, a *attempt, t *contract.Observat
 			}
 		}
 		refCtx, cancel := context.WithDeadline(workCtx, end)
-		obs, err := l.cfg.Connectors.Observe(refCtx, ref.ConnectorID, connectors.Target{ID: ref.TargetID, Stage: connectors.Stage(ref.Stage)})
+		tg := marker.target(ref)
+		obs, err := l.cfg.Connectors.Observe(refCtx, ref.ConnectorID, tg)
 		timedOut := errors.Is(refCtx.Err(), context.DeadlineExceeded)
 		cancel()
 		if workCtx.Err() != nil {
@@ -537,7 +732,14 @@ func (l *Loop) observe(workCtx context.Context, a *attempt, t *contract.Observat
 			l.release(a, client.ReleaseShutdown, log)
 			return nil, "", false
 		}
-		stages = append(stages, l.toStage(ref, obs, err, timedOut, log))
+		st := l.toStage(ref, tg, obs, err, timedOut, log)
+		if ref.Stage == contract.StageESOSync {
+			marker.noteESO(st)
+		}
+		if obs.APIServerOffsetKnown && (!a.apiOffsetKnown || absDuration(obs.APIServerOffset) > absDuration(a.apiOffset)) {
+			a.apiOffset, a.apiOffsetKnown = obs.APIServerOffset, true
+		}
+		stages = append(stages, st)
 	}
 	if len(stages) == 0 {
 		log.Warn("no stage fit in the lease; releasing the task")
@@ -587,9 +789,13 @@ func (l *Loop) result(a *attempt, status contract.AttemptStatus, reason contract
 	if finished.Before(started) {
 		finished = started
 	}
-	offsetMS := a.offset.Milliseconds()
 	const limit = int64(86400000)
-	offsetMS = min(max(offsetMS, -limit), limit)
+	clamp := func(d time.Duration) int64 { return min(max(d.Milliseconds(), -limit), limit) }
+	clock := contract.Clock{CPOffsetMS: clamp(a.offset)}
+	if a.apiOffsetKnown {
+		ms := clamp(a.apiOffset)
+		clock.APIServerOffsetMS = &ms
+	}
 	return &contract.EvidenceResult{
 		SchemaVersion:  contract.ResultSchemaVersion,
 		TaskID:         a.taskID,
@@ -602,7 +808,7 @@ func (l *Loop) result(a *attempt, status contract.AttemptStatus, reason contract
 		AttemptStatus:  status,
 		RefusalReason:  reason,
 		Stages:         stages,
-		Clock:          contract.Clock{CPOffsetMS: offsetMS},
+		Clock:          clock,
 	}
 }
 
@@ -639,7 +845,7 @@ func (l *Loop) submit(workCtx context.Context, a *attempt, res *contract.Evidenc
 			return
 		case errors.Is(err, client.ErrUnauthorized):
 			l.m.result("error")
-			l.fail(fmt.Errorf("result: %w", err))
+			l.halt(haltUnauthorized)
 			return
 		case !retryable(err) || try >= len(l.cfg.ResultRetry) || workCtx.Err() != nil:
 			l.m.result("rejected")
@@ -667,84 +873,4 @@ func retryable(err error) bool {
 	}
 	return !errors.Is(err, client.ErrRequestTooLarge) && !errors.Is(err, client.ErrInvalidArgument) &&
 		!errors.Is(err, contract.ErrSchemaViolation) && !errors.Is(err, client.ErrCallNotAllowed)
-}
-
-// toStage turns a connector observation into a contract stage. Anything
-// the contract cannot carry honestly becomes an error stage with a
-// closed error code; connector error text is never copied.
-func (l *Loop) toStage(ref contract.ConnectorRef, obs connectors.Observation, err error, timedOut bool, log *slog.Logger) contract.StageObservation {
-	observedAt := obs.ObservedAt.UTC()
-	if obs.ObservedAt.IsZero() {
-		observedAt = l.cfg.Now().UTC()
-	}
-	base := contract.StageObservation{
-		Stage:      ref.Stage,
-		Source:     contract.Source{ConnectorID: ref.ConnectorID, TargetID: ref.TargetID, API: contract.APIFor(ref.Stage)},
-		ObservedAt: observedAt,
-		Caveats:    []contract.Caveat{},
-		Linkage:    contract.LinkageNone,
-	}
-	if ref.Stage == contract.StageArgoCDContext {
-		// Every ArgoCD stage, errors included, says health is not proof.
-		base.Caveats = []contract.Caveat{contract.CaveatArgoCDHealthNotProof}
-	}
-	errorStage := func(code contract.ErrorCode) contract.StageObservation {
-		s := base
-		s.Outcome, s.Confidence, s.ErrorCode = contract.OutcomeError, contract.ConfidenceNone, code
-		return s
-	}
-	ev := obs.Evidence
-	stageLog := log.With("connector_id", ref.ConnectorID, "target_id", ref.TargetID, "stage", string(ref.Stage))
-
-	if err != nil || obs.Outcome == connectors.OutcomeError {
-		code := contract.ErrorInternal
-		switch {
-		case ev != nil && ev.ErrorCode != "":
-			code = ev.ErrorCode
-		case timedOut || errors.Is(err, context.DeadlineExceeded):
-			code = contract.ErrorConnectorTimeout
-		}
-		s := errorStage(code)
-		if s.Validate() != nil {
-			s = errorStage(contract.ErrorInternal)
-		}
-		stageLog.Info("stage observed", "outcome", string(s.Outcome), "error_code", string(s.ErrorCode))
-		return s
-	}
-	if ev == nil {
-		stageLog.Warn("connector returned no evidence detail; reporting an internal error")
-		return errorStage(contract.ErrorInternal)
-	}
-
-	s := base
-	s.Resource, s.Facts, s.Confidence = ev.Resource, ev.Facts, ev.Confidence
-	if ev.Caveats != nil {
-		s.Caveats = slices.Clone(ev.Caveats)
-	}
-	if ev.Linkage != "" {
-		s.Linkage = ev.Linkage
-	}
-	if s.Confidence == "" {
-		s.Confidence = contract.ConfidenceNone
-	}
-	switch obs.Outcome {
-	case connectors.OutcomeObserved:
-		s.Outcome = contract.OutcomeObserved
-	case connectors.OutcomeNotObserved:
-		s.Outcome = contract.OutcomeNotObserved
-	case connectors.OutcomeUnverifiable:
-		s.Outcome = contract.OutcomeUnverifiable
-	default:
-		return errorStage(contract.ErrorInternal)
-	}
-	if ref.Stage == contract.StageArgoCDContext && !slices.Contains(s.Caveats, contract.CaveatArgoCDHealthNotProof) {
-		s.Caveats = append(s.Caveats, contract.CaveatArgoCDHealthNotProof)
-	}
-	if verr := s.Validate(); verr != nil {
-		// verr names a field and a rule, never a value.
-		stageLog.Warn("connector evidence breaks the contract; reporting an internal error", "error", verr)
-		return errorStage(contract.ErrorInternal)
-	}
-	stageLog.Info("stage observed", "outcome", string(s.Outcome), "linkage", string(s.Linkage))
-	return s
 }

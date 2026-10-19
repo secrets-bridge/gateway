@@ -895,3 +895,137 @@ func TestLoop_NoHeartbeatAfterHalt(t *testing.T) {
 			before.claimCalls, after.claimCalls, len(before.heartbeats), len(after.heartbeats))
 	}
 }
+
+// failReplies is n identical error replies, enough to keep a call failing
+// for the length of a test at the harness's 5ms ticks.
+func failReplies(status, n int) []reply {
+	rs := make([]reply, n)
+	for i := range rs {
+		rs[i] = reply{status: status}
+	}
+	return rs
+}
+
+// staleCatalog makes the next heartbeat ask for a catalog upload and
+// fails every upload until restoreCatalog.
+func staleCatalog(h *harness) {
+	h.cp.mu.Lock()
+	h.cp.catVersion = "cat-changed-by-cp"
+	h.cp.catReply = failReplies(503, 5000)
+	h.cp.mu.Unlock()
+}
+
+func restoreCatalog(h *harness) {
+	h.cp.mu.Lock()
+	h.cp.catReply = nil
+	h.cp.mu.Unlock()
+}
+
+// assertClaimingPaused queues task n while the replica is not ready and
+// checks that no claim is made for it: at most one claim already in
+// flight when readiness dropped, and no pass run.
+func assertClaimingPaused(t *testing.T, h *harness, n int, why string) int {
+	t.Helper()
+	time.Sleep(50 * time.Millisecond) // let a claim that was in flight land
+	before := h.cp.snapshot()
+	h.cp.push(taskBody(t, taskOpts{n: n}))
+	time.Sleep(300 * time.Millisecond)
+	after := h.cp.snapshot()
+	if after.claimCalls > before.claimCalls+1 {
+		t.Fatalf("claiming continued with %s: %d -> %d claim calls", why, before.claimCalls, after.claimCalls)
+	}
+	if len(after.results) != len(before.results) {
+		t.Fatalf("a task was run with %s: %d -> %d results", why, len(before.results), len(after.results))
+	}
+	if !strings.Contains(h.logs.String(), why+"; claiming paused") {
+		t.Fatalf("pause for %q not logged", why)
+	}
+	return after.claimCalls
+}
+
+// gateway#9: once claiming has started, a catalog the control plane no
+// longer has stops new claims until an upload is accepted again.
+// Readiness drops too, but readiness alone does not stop the poller.
+func TestLoop_StaleCatalogStopsClaims(t *testing.T) {
+	h := newHarness(t, nil, okConn("eso-main", connectors.KindESO))
+	h.start()
+	waitFor(t, "ready and claiming", func() bool { return h.ready.ready.Load() && h.cp.snapshot().claimCalls > 2 })
+
+	staleCatalog(h)
+	waitFor(t, "not ready after the catalog upload fails", func() bool { return !h.ready.ready.Load() })
+	paused := assertClaimingPaused(t, h, 1, "the connector catalog is not accepted")
+
+	restoreCatalog(h)
+	waitFor(t, "ready again after the catalog is accepted", h.ready.ready.Load)
+	res := decodeResult(t, h.waitResults(1)[0])
+	if res["attempt_status"] != "completed" {
+		t.Fatalf("result after resume = %v", res)
+	}
+	if h.cp.snapshot().claimCalls <= paused {
+		t.Fatal("claiming did not resume")
+	}
+	if !strings.Contains(h.logs.String(), "claiming resumed") {
+		t.Fatal("resume not logged")
+	}
+}
+
+// gateway#9: heartbeats refused for longer than UnreachableAfter stop new
+// claims even though the claim endpoint still answers, and a heartbeat
+// accepted again resumes them.
+func TestLoop_StaleHeartbeatStopsClaims(t *testing.T) {
+	h := newHarness(t, func(c *Config) { c.UnreachableAfter = 100 * time.Millisecond }, okConn("eso-main", connectors.KindESO))
+	h.start()
+	waitFor(t, "ready and claiming", func() bool { return h.ready.ready.Load() && h.cp.snapshot().claimCalls > 2 })
+
+	h.cp.mu.Lock()
+	h.cp.hbReply = failReplies(503, 5000)
+	h.cp.mu.Unlock()
+	waitFor(t, "not ready after heartbeats fail past UnreachableAfter", func() bool { return !h.ready.ready.Load() })
+	paused := assertClaimingPaused(t, h, 1, "no heartbeat accepted by the control plane recently")
+
+	h.cp.mu.Lock()
+	h.cp.hbReply = nil
+	h.cp.mu.Unlock()
+	waitFor(t, "ready again after a heartbeat is accepted", h.ready.ready.Load)
+	res := decodeResult(t, h.waitResults(1)[0])
+	if res["attempt_status"] != "completed" {
+		t.Fatalf("result after resume = %v", res)
+	}
+	if h.cp.snapshot().claimCalls <= paused {
+		t.Fatal("claiming did not resume")
+	}
+}
+
+// gateway#9: pausing claims does not touch a pass already running. It
+// finishes and its result is posted as completed, not failed.
+func TestLoop_InFlightPassFinishesWhileClaimingPaused(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	c := &fakeConn{name: "eso-main", kind: connectors.KindESO, obs: func(ctx context.Context, tg connectors.Target) (connectors.Observation, error) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return goodObs("eso-main", connectors.KindESO, tg, connectors.OutcomeObserved), nil
+	}}
+	h := newHarness(t, nil, c)
+	h.cp.push(taskBody(t, taskOpts{n: 1}))
+	h.start()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the pass did not start")
+	}
+	staleCatalog(h)
+	waitFor(t, "not ready while the pass runs", func() bool { return !h.ready.ready.Load() })
+	close(release)
+	res := decodeResult(t, h.waitResults(1)[0])
+	if res["attempt_status"] != "completed" {
+		t.Fatalf("in-flight pass result = %v, want completed", res)
+	}
+	restoreCatalog(h)
+}

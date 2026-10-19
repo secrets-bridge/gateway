@@ -156,7 +156,7 @@ type Loop struct {
 	// reports true, none of them is in flight and none starts.
 	cpMu sync.RWMutex
 
-	claimGate     chan struct{} // closed once a heartbeat and the catalog are accepted
+	claimGate     chan struct{} // closed once a heartbeat and the catalog are accepted; wakes claimLoop at start, claimBlocker decides each claim
 	claimGateOnce sync.Once
 	lastHeartbeat atomic.Int64 // unix nanos of the last accepted heartbeat
 	startedAt     time.Time
@@ -414,6 +414,24 @@ func (l *Loop) updateReady() {
 	l.cfg.Ready.SetReady(l.heartbeatFresh.Load() && l.catalogAccepted.Load() && l.connectorsHealthy() && !l.isHalted())
 }
 
+// claimBlocker says why no task may be claimed now, or "" when one may.
+// It is checked before every claim, not once (gateway#9): a heartbeat
+// accepted within UnreachableAfter, the current catalog accepted, and
+// every connector's self-check proven. Readiness alone does not stop a
+// background poller in a pod that is not behind a Service. A halt is
+// not listed here: unlessHalted refuses the claim and claimLoop returns.
+func (l *Loop) claimBlocker() string {
+	switch {
+	case !l.heartbeatFresh.Load():
+		return "no heartbeat accepted by the control plane recently"
+	case !l.catalogAccepted.Load():
+		return "the connector catalog is not accepted"
+	case !l.cfg.Connectors.Verified():
+		return "a connector self-check has not proven the credential cannot read secrets"
+	}
+	return ""
+}
+
 // CatalogFor builds the E3 body from the bound connectors: ids, kinds,
 // display names and intervals. No URLs and no credentials.
 func CatalogFor(c Connectors) client.Catalog {
@@ -595,26 +613,26 @@ func (l *Loop) claimLoop(runCtx, workCtx context.Context) {
 	}
 	base := l.cfg.ClaimInterval
 	interval := base
-	paused := false
+	pausedFor := ""
 	for {
 		if !sleepCtx(runCtx, l.cfg.Jitter(interval, 0.5, 1.5)) {
 			return
 		}
-		// Fail closed: while a recheck has not proven that every
-		// connector's credential cannot read Secrets, claim nothing. Not
-		// ready alone does not stop work in a pod that is not behind a
-		// Service. Claiming resumes after a passing recheck.
-		if !l.cfg.Connectors.Verified() {
-			if !paused {
-				paused = true
-				l.log.Warn("a connector self-check has not proven the credential cannot read secrets; claiming paused")
+		// Fail closed: claim nothing while the heartbeat is stale, the
+		// catalog is not accepted or a connector is unverified. A pass
+		// already in flight finishes. Claiming resumes, at the normal
+		// interval, once every part holds again.
+		if reason := l.claimBlocker(); reason != "" {
+			if reason != pausedFor {
+				pausedFor = reason
+				l.log.Warn(reason+"; claiming paused", "reason", reason)
 			}
 			interval = base
 			continue
 		}
-		if paused {
-			paused = false
-			l.log.Info("connector self-checks passed; claiming resumed")
+		if pausedFor != "" {
+			l.log.Info("claiming resumed", "paused_for", pausedFor)
+			pausedFor = ""
 		}
 		select {
 		case l.sem <- struct{}{}:

@@ -90,7 +90,7 @@ func SelfCheck(ctx context.Context, rv Reviewer, namespaces []string, required [
 		// An incomplete list cannot prove the absence of a grant, so
 		// every verb is then asked about directly.
 		verbs := secretReadVerbs
-		if rules.Incomplete {
+		if *rules.Incomplete {
 			verbs = secretAllVerbs
 		}
 		for _, verb := range verbs {
@@ -117,9 +117,14 @@ func SelfCheck(ctx context.Context, rv Reviewer, namespaces []string, required [
 	return rep, nil
 }
 
+// errReviewIncomplete: a 2xx review answer without the status field the
+// check needs. An API server always sends it, so a body without it (from
+// a broken proxy, say) is treated as a failed call, never as a "no".
+var errReviewIncomplete = errors.New("kube: review answer has no status")
+
 type ssarResponse struct {
-	Status struct {
-		Allowed bool `json:"allowed"`
+	Status *struct {
+		Allowed *bool `json:"allowed"`
 	} `json:"status"`
 }
 
@@ -140,7 +145,10 @@ func accessReview(ctx context.Context, rv Reviewer, ns string, a Access) (bool, 
 	if _, err := rv.Create(ctx, readonly.SelfSubjectAccessReviewPath, body, &out); err != nil {
 		return false, err
 	}
-	return out.Status.Allowed, nil
+	if out.Status == nil || out.Status.Allowed == nil {
+		return false, errReviewIncomplete
+	}
+	return *out.Status.Allowed, nil
 }
 
 type resourceRule struct {
@@ -151,7 +159,7 @@ type resourceRule struct {
 
 type rulesStatus struct {
 	ResourceRules []resourceRule `json:"resourceRules"`
-	Incomplete    bool           `json:"incomplete"`
+	Incomplete    *bool          `json:"incomplete"`
 }
 
 func rulesReview(ctx context.Context, rv Reviewer, ns string) (rulesStatus, error) {
@@ -161,12 +169,15 @@ func rulesReview(ctx context.Context, rv Reviewer, ns string) (rulesStatus, erro
 		"spec":       map[string]string{"namespace": ns},
 	}
 	var out struct {
-		Status rulesStatus `json:"status"`
+		Status *rulesStatus `json:"status"`
 	}
 	if _, err := rv.Create(ctx, readonly.SelfSubjectRulesReviewPath, body, &out); err != nil {
 		return rulesStatus{}, err
 	}
-	return out.Status, nil
+	if out.Status == nil || out.Status.Incomplete == nil {
+		return rulesStatus{}, errReviewIncomplete
+	}
+	return *out.Status, nil
 }
 
 func coversCore(groups []string) bool { return coversGroup(groups, "") }
@@ -230,6 +241,9 @@ func reviewCause(err error) error {
 	var se *kube.StatusError
 	if errors.As(err, &se) {
 		return se
+	}
+	if errors.Is(err, errReviewIncomplete) {
+		return errReviewIncomplete
 	}
 	switch kube.ErrorCode(err) {
 	case "connector_timeout":

@@ -264,6 +264,62 @@ func TestSelfCheckIncompleteRulesAsksEveryVerb(t *testing.T) {
 	}
 }
 
+// TestSelfCheckReviewWithoutStatus: a 2xx review answer that lacks the
+// field the check decides on is a failed call, never a "not allowed". An
+// API server always sends status.allowed and status.incomplete, so a body
+// without them (a broken proxy, say) must keep the check fail closed.
+func TestSelfCheckReviewWithoutStatus(t *testing.T) {
+	ssar := []struct {
+		name string
+		body any
+	}{
+		{"empty object", map[string]any{}},
+		{"null status", map[string]any{"kind": "SelfSubjectAccessReview", "status": nil}},
+		{"status without allowed", map[string]any{"kind": "SelfSubjectAccessReview", "status": map[string]any{"reason": "x"}}},
+		{"null allowed", map[string]any{"status": map[string]any{"allowed": nil}}},
+	}
+	for _, tc := range ssar {
+		t.Run("access review "+tc.name, func(t *testing.T) {
+			s := kubetest.New(t)
+			s.AccessBody = func(kubetest.Review) any { return tc.body }
+			if _, err := run(t, s); !errors.Is(err, connectors.ErrPrivilegeUnproven) {
+				t.Fatalf("err = %v, want ErrPrivilegeUnproven", err)
+			}
+		})
+		t.Run("required access review "+tc.name, func(t *testing.T) {
+			// The secrets reviews answer; only the required ones are
+			// broken. The check still fails, as a readiness failure.
+			s := kubetest.New(t)
+			s.AccessBody = func(r kubetest.Review) any {
+				if r.Resource == readonly.SecretsResource {
+					return map[string]any{"status": map[string]any{"allowed": false}}
+				}
+				return tc.body
+			}
+			if _, err := run(t, s); err == nil {
+				t.Fatal("self-check passed with a required review that did not answer")
+			}
+		})
+	}
+	ssrr := []struct {
+		name string
+		body any
+	}{
+		{"empty object", map[string]any{}},
+		{"null status", map[string]any{"kind": "SelfSubjectRulesReview", "status": nil}},
+		{"status without incomplete", map[string]any{"status": map[string]any{"resourceRules": []any{}}}},
+	}
+	for _, tc := range ssrr {
+		t.Run("rules review "+tc.name, func(t *testing.T) {
+			s := kubetest.New(t)
+			s.RulesBody = func(string) any { return tc.body }
+			if _, err := run(t, s); !errors.Is(err, connectors.ErrPrivilegeUnproven) {
+				t.Fatalf("err = %v, want ErrPrivilegeUnproven", err)
+			}
+		})
+	}
+}
+
 func TestSelfCheckReportsWriteVerbs(t *testing.T) {
 	s := kubetest.New(t)
 	s.Rules = rules(rule([]string{"apps"}, []string{"deployments"}, []string{"get", "patch"}))

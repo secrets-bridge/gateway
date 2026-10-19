@@ -42,6 +42,10 @@ type Server struct {
 	// Rules answers a SelfSubjectRulesReview for a namespace with a
 	// status code and the status object.
 	Rules func(ns string) (int, any)
+	// AccessBody and RulesBody, when set, replace the whole 201 body of
+	// a review answer, so a test can send one without a status field.
+	AccessBody func(Review) any
+	RulesBody  func(ns string) any
 	// Now is the server clock for the Date header.
 	Now func() time.Time
 }
@@ -104,6 +108,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	s.reqs = append(s.reqs, r.Method+" "+r.URL.RequestURI())
 	h := s.routes[r.URL.Path]
 	access, rules, now := s.Access, s.Rules, s.Now
+	accessBody, rulesBody := s.AccessBody, s.RulesBody
 	s.mu.Unlock()
 
 	w.Header().Set("Date", now().UTC().Format(http.TimeFormat))
@@ -125,6 +130,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = json.NewDecoder(r.Body).Decode(&in)
 		ra := in.Spec.ResourceAttributes
+		if accessBody != nil {
+			write(201, accessBody(Review{Namespace: ra.Namespace, Verb: ra.Verb, Group: ra.Group, Resource: ra.Resource}))
+			return
+		}
 		allowed, code := access(Review{Namespace: ra.Namespace, Verb: ra.Verb, Group: ra.Group, Resource: ra.Resource})
 		if code != 0 {
 			write(code, map[string]any{"kind": "Status", "reason": "InternalError"})
@@ -138,6 +147,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 			} `json:"spec"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&in)
+		if rulesBody != nil {
+			write(201, rulesBody(in.Spec.Namespace))
+			return
+		}
 		code, st := rules(in.Spec.Namespace)
 		if code != 200 && code != 201 {
 			write(code, map[string]any{"kind": "Status", "reason": "InternalError"})

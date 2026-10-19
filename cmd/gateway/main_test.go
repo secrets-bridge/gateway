@@ -201,7 +201,7 @@ func TestSetup_Refusals(t *testing.T) {
 		{"non-loopback listener", func(f *bootFixture) { f.cfg.LocalAddr = "0.0.0.0:8091" }, "loopback"},
 		{"missing CA file", func(f *bootFixture) { f.cfg.CAFile = filepath.Join(dir, "absent.pem") }, "CA file"},
 		{"no identity", func(f *bootFixture) { f.env = envMap(nil); f.cfg.IdentityFile = "" }, "no credential"},
-		{"loose identity file", func(f *bootFixture) { f.env = envMap(nil); f.cfg.IdentityFile = looseID }, "owner-only"},
+		{"loose identity file", func(f *bootFixture) { f.env = envMap(nil); f.cfg.IdentityFile = looseID }, "not be readable by other users"},
 		{"connector kind not in this build", func(f *bootFixture) { f.cfg.ConnectorsFile = esoFile }, "not supported by this build"},
 	}
 	for _, tc := range cases {

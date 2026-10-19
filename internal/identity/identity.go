@@ -10,7 +10,8 @@
 //  1. Env vars: SB_GATEWAY_ID + SB_GATEWAY_SECRET.
 //  2. File: JSON {"gateway_id": "...", "gateway_secret": "..."} at
 //     SB_GATEWAY_IDENTITY_FILE. The file must be a regular file with no
-//     group or other permission bits (0600 or 0400).
+//     "other" permission bits and no group write or execute bit: 0400,
+//     0600, or 0440 and 0640 as a Secret volume with fsGroup produces.
 package identity
 
 import (
@@ -33,10 +34,32 @@ const (
 // a few hundred bytes.
 const maxFileSize = 64 << 10
 
-// Identity is the Gateway's credential pair.
+// redacted replaces the secret wherever an Identity is formatted,
+// marshalled or logged.
+const redacted = "[redacted]"
+
+// Identity is the Gateway's credential pair. The secret has no JSON
+// name, and every formatting path (fmt verbs, encoding/json, slog)
+// redacts it, so a struct that embeds an Identity cannot print it.
 type Identity struct {
 	GatewayID     string `json:"gateway_id"`
+	GatewaySecret string `json:"-"`
+}
+
+// fileIdentity is the on-disk shape, used for decoding only.
+type fileIdentity struct {
+	GatewayID     string `json:"gateway_id"`
 	GatewaySecret string `json:"gateway_secret"`
+}
+
+// MarshalJSON emits the id and a redacted secret. It lets the JSON slog
+// handler and json.Marshal handle a struct that holds an Identity
+// without leaking the secret.
+func (id Identity) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		GatewayID     string `json:"gateway_id"`
+		GatewaySecret string `json:"gateway_secret"`
+	}{id.GatewayID, redacted})
 }
 
 // String never prints the secret.
@@ -94,25 +117,28 @@ func Load(getenv func(string) (string, bool), filePath string) (Identity, Source
 	}
 	defer zero(data)
 
-	var id Identity
+	var fi fileIdentity
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&id); err != nil {
+	if err := dec.Decode(&fi); err != nil {
 		// Do not wrap the decoder error: its message can quote part of
 		// the input, and the input holds the secret.
 		return Identity{}, "", fmt.Errorf("identity: %q is not a valid identity JSON object", filePath)
 	}
-	if id.GatewayID == "" || id.GatewaySecret == "" {
+	if dec.More() {
+		return Identity{}, "", fmt.Errorf("identity: %q holds more than one JSON value", filePath)
+	}
+	if fi.GatewayID == "" || fi.GatewaySecret == "" {
 		return Identity{}, "", fmt.Errorf("identity: %q is missing gateway_id or gateway_secret", filePath)
 	}
-	return id, SourceFile, nil
+	return Identity(fi), SourceFile, nil
 }
 
 // readCredentialFile checks the mode on the open descriptor, then reads
-// at most maxFileSize bytes. Any group or other permission bit is
-// refused: the Gateway only reads this file and never fixes its mode.
-// On Kubernetes, mount the Secret with defaultMode 0400 and do not set
-// fsGroup for the Gateway pod, because fsGroup adds group bits.
+// at most maxFileSize bytes. Any "other" bit and any group write or
+// execute bit is refused; group read is allowed, because a Secret volume
+// with fsGroup set gives the file group read (0440 with defaultMode
+// 0400). The Gateway only reads this file and never fixes its mode.
 func readCredentialFile(path string) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -130,8 +156,8 @@ func readCredentialFile(path string) ([]byte, error) {
 	if !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("identity: %q is not a regular file", path)
 	}
-	if perm := info.Mode().Perm(); perm&0o077 != 0 {
-		return nil, fmt.Errorf("identity: %q has mode %#o; the credential file must be owner-only (0600 or 0400). Fix the mode and rotate the gateway secret if other users could read it", path, perm)
+	if perm := info.Mode().Perm(); perm&forbiddenModeBits != 0 {
+		return nil, fmt.Errorf("identity: %q has mode %#o; the credential file must not be readable by other users or writable by its group (use 0400, 0600 or 0440). Fix the mode and rotate the gateway secret if other users could read it", path, perm)
 	}
 
 	data, err := io.ReadAll(io.LimitReader(f, maxFileSize+1))
@@ -145,6 +171,9 @@ func readCredentialFile(path string) ([]byte, error) {
 	}
 	return data, nil
 }
+
+// forbiddenModeBits are group write and execute and every "other" bit.
+const forbiddenModeBits = 0o037
 
 func zero(b []byte) {
 	for i := range b {

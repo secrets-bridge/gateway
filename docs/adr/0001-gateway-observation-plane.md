@@ -1,8 +1,8 @@
 # ADR 0001: Gateway as an outbound-only observation plane
 
-- Status: Proposed
-- Date: 2026-10-18
-- Scope: the Gateway component, its wire contract with the control plane, the control plane changes it needs, and its runtime and packaging. Nothing in this ADR is implemented.
+- Status: Accepted
+- Date: 2026-10-18, accepted 2026-10-19 (owner and security reviewer, see section 11 and #5)
+- Scope: the Gateway component, its wire contract with the control plane, the control plane changes it needs, and its runtime and packaging. Implementation is in progress on draft pull requests.
 - Detailed design:
   - [Control plane changes](../design/control-plane.md)
   - [Gateway runtime and packaging](../design/runtime.md)
@@ -139,7 +139,7 @@ A task is **final** when every expected stage has a terminal outcome. Expected s
 | `unverified` | Final with no Gateway stage observed; or any stage `failed` (reason `failure_observed`, and the UI shows the failed stage in the failure colour); or the task was cancelled (`superseded_by_later_write`, `source_changed`, `connector_missing`) or went `dead` (`gateway_errors`). |
 | `timed_out` | `deadline_at` passed before the task was final. The UI shows what was observed, for example "timed out after ESO sync observed; rollout not observed". Never shown as a failed deployment. |
 
-There is no `failed` verdict. A stage can be `failed`; the verdict is then `unverified` with reason `failure_observed`. Whether a `failed` verdict should exist is open question 3.
+There is no `failed` verdict. A stage can be `failed`; the verdict is then `unverified` with reason `failure_observed`. Decided in section 11: no `failed` verdict.
 
 **Request rollup.** A request can have several tasks (one per binding, for example two clusters). The request state is `pending` while any task is `pending`; then `verified` only if every task is `verified`; `partially_observed` if any task is `verified` or `partially_observed`; `timed_out` only if every task is `timed_out`; otherwise `unverified`. A request with no binding shows "no observation configured", which is not a failure.
 
@@ -154,7 +154,7 @@ There is no `failed` verdict. A stage can be `failed`; the verdict is then `unve
 | In-flight tasks per Gateway | `gateways.max_inflight_tasks`, default 20 |
 | Result body cap | 64 KiB |
 | Default skew margin | 5s |
-| Default deadline | `min(24h, max(binding.observation_timeout_s, refresh_interval + progress_deadline + 5m))`, where the two intervals come from the catalog for the bound targets. Default `observation_timeout_s` is 1800 (open question 4). |
+| Default deadline | `min(24h, max(binding.observation_timeout_s, refresh_interval + progress_deadline + 5m))`, where the two intervals come from the catalog for the bound targets. Default `observation_timeout_s` is 1800. Confirmed in section 11. |
 
 ## 3. Architecture
 
@@ -244,7 +244,7 @@ Full details: [control-plane.md, section 4](../design/control-plane.md#4-wire-co
 Rules:
 
 - **Auth**: `X-Gateway-Secret` on E2 to E7, SHA-256 at rest, constant-time compare, generic 401. A task that belongs to another Gateway returns 404, the same as an unknown task.
-- **Targets**: the customer defines connectors and targets in Helm values. The Gateway advertises ids (and, pending open question 2, namespace and name for display) through E3. An admin approves and binds them. A task carries only `{connector_id, target_id, stage}` triples. No namespace, object name, URL or credential field exists in the task schema, and every object in both schemas is closed.
+- **Targets**: the customer defines connectors and targets in Helm values. The Gateway advertises ids (and namespace and name, for display only; section 11) through E3. An admin approves and binds them. A task carries only `{connector_id, target_id, stage}` triples. No namespace, object name, URL or credential field exists in the task schema, and every object in both schemas is closed.
 - **Fencing**: every claim mints a new `attempt_id`. A result is accepted only for the current attempt while `lease_expires_at` is in the future. A late result for the current attempt after lease expiry gets 409 `lease_expired`, even if nobody re-claimed. A result for an older attempt gets 409 `attempt_superseded`.
 - **Idempotency**: key `(task_id, attempt_id)`. The CP stores a SHA-256 digest of the canonical JSON (RFC 8785) of the accepted body. The replay lookup runs before the current-attempt check, so a retry after a lost 200 gets 200 `duplicate`, and a different body under the same attempt gets 409 `result_conflict`.
 - **No free text**: no field in either direction carries condition messages, error strings or caveat sentences. Caveats, reasons and error codes are enums. `gateways.last_status` is an enum and `last_error` is written by the CP only.
@@ -272,8 +272,8 @@ Full details: [runtime.md](../design/runtime.md).
 - Connectors take one snapshot per pass. No informers, no watches, no state between passes. The CP schedules repeated passes.
 - ESO API version is discovered at boot from `/apis/external-secrets.io`, preferring `v1`. If neither `v1` nor `v1beta1` is served, the connector reports `api_version_not_served`.
 - Health and metrics on `127.0.0.1` only. Probes are `exec` on `gateway healthcheck`. Exposing metrics on the pod IP is opt-in with a NetworkPolicy peer list.
-- Helm chart `secrets-bridge-gateway` in `secrets-bridge/charts`: namespaced Roles by default, ClusterRole only with an explicit acknowledgement, no free-form RBAC field, NetworkPolicy egress limited to DNS, the CP, the API server and listed ArgoCD endpoints, image pinned by digest.
-- Boot self-check: `SelfSubjectAccessReview` for `get`, `list` and `watch` on core `secrets` in each allowed namespace, plus `SelfSubjectRulesReview`. Readiness fails closed if any `secrets` verb is allowed, or the rules review is `incomplete` with no SSAR answer. ArgoCD: `GET /api/v1/session/userinfo`, and optionally a negative probe through `GET /api/v1/account/can-i/applications/sync/<project>/<app>` (verify on supported ArgoCD versions); a `yes` for a write action on a bound app fails readiness.
+- Helm chart `secrets-bridge-gateway` in `secrets-bridge/charts`: namespaced Roles only (no ClusterRole in the MVP), no free-form RBAC field, NetworkPolicy egress limited to DNS, the CP, the API server and listed ArgoCD endpoints, image pinned by digest.
+- Boot self-check: `SelfSubjectAccessReview` for `get`, `list` and `watch` on core `secrets` in each allowed namespace, plus `SelfSubjectRulesReview`. The Gateway refuses to start (fails closed, with no override) if any `secrets` verb is allowed, or the rules review is `incomplete` with no SSAR answer. These two review creations are the only non-GET Kubernetes calls: the read-only transport allows `POST` to exactly `/apis/authorization.k8s.io/v1/selfsubjectaccessreviews` and `/apis/authorization.k8s.io/v1/selfsubjectrulesreviews` and refuses every other non-GET request. ArgoCD: `GET /api/v1/session/userinfo`, and optionally a negative probe through `GET /api/v1/account/can-i/applications/sync/<project>/<app>` (verify on supported ArgoCD versions); a `yes` for a write action on a bound app fails readiness.
 
 ## 7. Security
 
@@ -282,7 +282,7 @@ Full details: [threat-model.md](../design/threat-model.md).
 - The main harm is a false `verified`. Mitigations: CP-computed verdicts, closed schemas, CP recomputation of stage outcomes, timestamp bounds, the "observed by Gateway X" label, and per-environment policy that can refuse Gateway attestation as evidence for a gate owned by another party.
 - A compromised CP can only choose among objects the customer listed locally. It cannot point the Gateway at a new host, namespace or object.
 - A compromised Gateway pod has no RBAC on `secrets`, no route to the Agent (NetworkPolicy and no client code), and no credential that works on agent routes.
-- Accepted residual risks: a tenant admin can fabricate evidence for its own requests; bearer secret replay through a TLS-terminating proxy (same as the Agent today); ESO linkage is time-ordered unless pinned; a CP database administrator can fabricate rows.
+- Accepted residual risks: a tenant admin can fabricate evidence for its own requests (signed evidence, #7, must ship before Gateway evidence is presented as compliance evidence); bearer secret replay through a TLS-terminating proxy (same as the Agent today); ESO linkage is time-ordered unless pinned; a CP database administrator can fabricate rows.
 
 ## 8. Failure behaviour
 
@@ -327,28 +327,30 @@ Goal: per environment, exactly one observation source for a request, with a way 
 | In-pod enrollment like the agent | The agent persists its credential to a ReadWriteOnce PVC and rolls with `maxSurge: 0`. For N replicas this means N identities or a write to a Kubernetes Secret, which the RBAC forbids. |
 | Typed client-go objects | Decodes `env[].value` literals and inline Helm values into memory where a log or panic trace can expose them. Raw reads with projected decoding avoid that. |
 
-## 11. Open questions
+## 11. Decisions
 
-For the owner:
+The questions this ADR left open were answered on 2026-10-19: the owner's in this section, the security reviewer's in #5.
 
-1. Is `verified` acceptable for evidence that rests on time ordering plus a recorded provider version, given that ESO does not report which version it fetched? This ADR says yes, with the label "verified by time order". The alternative is `verified` only for `version_pinned`, which normal ESO setups never reach.
-2. Should the catalog (E3) send target namespace and name for display? Evidence already returns them in `resource`, so omitting them in E3 only hides cluster layout if `resource` drops them too. This ADR proposes sending them.
-3. Should a `failed` verdict exist? This ADR keeps it at the stage level only.
-4. Confirm the default deadline formula in section 2.5 and the 24h cap.
-5. Approve the additive agent change (`result.provider_version` on job completion, stored in `sync_jobs.result`) under the "Agent unchanged" rule. Without it no task can be `verified`.
-6. Confirm the patch-request gap in section 1.2 and whether bindings key on `secrets.id` for patch requests and `(provider_connection_id, secret_ref)` for cross-team requests, as proposed.
-7. Is a long-poll claim wanted in the MVP, or is jittered short polling enough until the benchmark says otherwise? This ADR says short polling.
-8. Retention for accepted evidence and for rejected results kept for audit.
-9. Credential rotation with two active hashes (`gateway_credentials`), or revoke and re-create as for agents today? Not in v1 as proposed.
+Owner:
 
-For the security reviewer (CISO):
+1. **`verified` on time order.** Yes. Evidence that rests on time ordering plus a recorded provider version can be `verified`, labelled "verified by time order, observed by Gateway X". Requiring `version_pinned` would make `verified` unreachable for normal ESO setups.
+2. **Namespace and name in the catalog.** Sent, for admin display only. Tasks never match on them.
+3. **`failed` verdict.** None. A stage can be `failed`; the verdict is then `unverified` with reason `failure_observed`.
+4. **Deadline.** The formula in section 2.5 with the 24h cap, default `observation_timeout_s` 1800.
+5. **Agent change.** Approved: the additive `result.provider_version` on job completion, stored in `sync_jobs.result`.
+6. **Binding keys.** As proposed: `secrets.id` for patch requests, `(provider_connection_id, secret_ref)` for cross-team requests. The patch-request gap in section 1.2 is confirmed with a live patch request before the poller is used as the parity baseline.
+7. **Claim polling.** Jittered short polling in the MVP. Long-poll only if the benchmark calls for it.
+8. **Retention.** Accepted evidence 90 days, rejected results 7 days, both configurable.
+9. **Credential rotation.** Revoke and re-create, as for agents. No two-hash table in v1.
 
-1. Accept the residual risk that a tenant admin can produce false evidence for its own requests, given the "observed by Gateway X" label and per-environment gate policy.
-2. Accept the boot self-check as the only non-GET Kubernetes call (creating `SelfSubjectRulesReview` and `SelfSubjectAccessReview`).
-3. Allow a ClusterRole for the one-Gateway-per-cluster shape, behind `rbac.acknowledgeClusterScope`, or require per-namespace Roles always?
-4. Is `selfCheck.failOnOverPrivilege: false` (fail open, every result labelled `gateway_over_privileged` and capped below `verified`) acceptable for clusters where an aggregated role grants `secrets` read, or must the Gateway always refuse to start?
-5. Accept bearer secrets for the MVP, with proof-of-possession or short-lived session tokens and signed evidence as post-MVP items.
-6. Accept the opt-in exposure of metrics on the pod IP as the one exception to loopback-only.
+Security reviewer (#5):
+
+1. **Customer-side attestation.** Accepted for the MVP, labelled "observed by Gateway X", with per-environment policy able to refuse it for gates another party owns. Signed evidence is tracked in #7 and must ship before Gateway evidence is presented as compliance evidence.
+2. **Non-GET Kubernetes calls.** Accepted for `SelfSubjectAccessReview` and `SelfSubjectRulesReview` only, as an exact method and path allowlist in the read-only transport, with a test that any other `POST` is refused.
+3. **ClusterRole.** Not in the MVP. Namespaced Roles only. Cluster-wide `get` on Deployments would expose every `env[].value` literal in the cluster.
+4. **Over-privilege.** Fail closed. A Gateway that can read `secrets` refuses to start. There is no `failOnOverPrivilege` override; the fix belongs in the customer's RBAC.
+5. **Credentials.** Bearer secret for the MVP on the agent model: SHA-256 at rest, constant-time compare, file-mounted, TLS 1.2 or later, rate limited per Gateway, revocable. Enrollment refuses plain `http`. Proof-of-possession is post-MVP.
+6. **Metrics on the pod IP.** Opt-in only. The chart requires a non-empty NetworkPolicy peer list when it is on, and metric labels are enums with no namespace or object names.
 
 ## 12. Consequences
 

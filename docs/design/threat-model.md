@@ -125,7 +125,7 @@ ESO linkage: `.status.syncedResourceVersion` tracks the ExternalSecret's own spe
 
 CI checks:
 
-- Chart RBAC lint: rendered `Role` and `ClusterRole` contain no `secrets`, no `*`, and exactly `get` on `externalsecrets`, `get` on `deployments`, `list` on `replicasets`.
+- Chart RBAC lint: rendered `Role` objects contain no `secrets`, no `*`, and exactly `get` on `externalsecrets`, `get` on `deployments`, `list` on `replicasets`.
 - Static checks: no `corev1.Secret` reference, no typed `appsv1.Deployment` decoding, no Kubernetes write call outside the two review-object creates.
 
 ### 5.3 Fencing versus replayed and late results
@@ -317,18 +317,17 @@ Legend: OUT outbound only, RO read-only, NOVAL no secret values or hashes, BIND 
 | S | Unsigned or substituted image | supply chain | Cosign keyless signature by digest; chart pins digest; admission guidance | 5.8 |
 | T | Malicious dependency adds write calls or a DB driver | supply chain | `go.sum` guard, RBAC lint, GET-only transport tests, SBOM review | 5.8, RO, STATE |
 | I | Values file stores the Gateway secret in Git | P3 vector | Chart takes `existingSecret` only | 5.6 |
-| E | Chart grants broad RBAC by default | design | Default Roles require listed namespaces; ClusterRole needs acknowledgement; no free-form rules | 5.2 |
+| E | Chart grants broad RBAC by default | design | Namespaced Roles only, with listed namespaces; no ClusterRole; no free-form rules | 5.2 |
 
 ## 7. Residual risks accepted for MVP
 
 | Risk | Why accepted | Revisit trigger |
 |---|---|---|
-| A malicious customer admin can produce false evidence for its own requests | Inherent to customer-side observation; contained by labelling, CP recomputation and per-environment gate policy | A customer needs third-party attested rollout evidence |
+| A malicious customer admin can produce false evidence for its own requests | Inherent to customer-side observation; contained by labelling, CP recomputation and per-environment gate policy | Signed evidence (#7), required before Gateway evidence is presented as compliance evidence |
 | Bearer secret replay through a TLS-terminating proxy | Same posture as the Agent today | Post-MVP proof-of-possession or short-lived session tokens |
 | ESO linkage is time-ordered unless the version is pinned | ESO status does not expose the fetched provider version (verify) | ESO exposes a fetched-version field, or customers pin `remoteRef.version` |
 | Out-of-band provider writes between the change and the ESO refresh are invisible | The CP only knows writes made through Secrets Bridge | Optional provider metadata read (not in v1; would add a provider credential to the Gateway) |
 | A CP insider with DB access can fabricate rows | Same as the rest of the CP | Signed evidence |
-| `failOnOverPrivilege: false` lets a Gateway run with `secrets` read | Only for clusters where an aggregated role cannot be changed; every task capped below `verified` | Security reviewer decision (ADR open question for the CISO, item 4) |
 
 ## 8. Security tests required before release
 
@@ -378,4 +377,4 @@ Each test must fail when its control is removed: delete the control in a scratch
 - Reloader: the exact annotation or env var it writes, and whether it contains a hash of Secret data.
 - ArgoCD: `status.reconciledAt` and `status.operationState.finishedAt` on supported versions; `account/can-i` support.
 - Fiber global `BodyLimit` in `api/cmd/api/main.go`, so the 64 KiB route limit is not undercut by a smaller global setting.
-- Agreement that the optional `result.provider_version` on job completion is acceptable under "Agent unchanged" (ADR open question 5).
+- Agreement that the optional `result.provider_version` on job completion is acceptable under "Agent unchanged" (approved, ADR 0001 section 11).

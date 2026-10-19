@@ -151,7 +151,7 @@ CREATE TABLE gateway_connectors (
 
 On the wire, `connector_id` is `gateway_connectors.name`, not the UUID primary key. A connector that disappears from the catalog moves to `missing`; no new tasks use it and open tasks are cancelled with verdict `unverified`, reason `connector_missing`. A target that disappears is marked `stale` in `advertised_targets`; bindings to it stay but no tasks are issued against it.
 
-`namespace` and `name` in the catalog are for admin display (ADR open question 2). If the owner decides against sending them, the catalog carries ids only and the evidence `resource` object must drop them too.
+`namespace` and `name` in the catalog are for admin display only (ADR 0001 section 11). The evidence `resource` object must drop them too.
 
 ### 3.5 `gateway_connector_bindings`
 
@@ -328,7 +328,7 @@ CREATE TRIGGER observation_evidence_no_delete BEFORE DELETE ON observation_evide
     FOR EACH ROW EXECUTE FUNCTION observation_evidence_reject_mutations();
 ```
 
-`body_sha256` hashes metadata-only evidence, never a secret value; the schema has no field that could hold one. Retention follows the audit retention decision (ADR open question 8), not a delete path in the API.
+`body_sha256` hashes metadata-only evidence, never a secret value; the schema has no field that could hold one. Retention follows the audit retention decision (ADR 0001 section 11: 90 days accepted, 7 days rejected), not a delete path in the API.
 
 ### 3.9 `sync_jobs.result`
 
@@ -431,7 +431,7 @@ All bodies are JSON with `Content-Type: application/json`. Error bodies are `{"e
 ```
 
 - 200 `{"accepted": n, "targets_stale": m, "catalog_version": "<digest>"}`.
-- Ids use the DNS-label pattern. `namespace` and `name` use Kubernetes name patterns and are display-only (ADR open question 2). Intervals are integers.
+- Ids use the DNS-label pattern. `namespace` and `name` use Kubernetes name patterns and are display-only (ADR 0001 section 11). Intervals are integers.
 - Advertising never creates or approves anything. New connectors appear as `advertised`; an admin approves them and creates bindings.
 
 ### 4.5 E4 claim

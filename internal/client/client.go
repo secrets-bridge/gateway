@@ -58,13 +58,43 @@ var allowedPath = regexp.MustCompile(`^/api/v1/gateways/(enroll|[0-9a-f-]{36}/(h
 
 // Client calls the gateway endpoints as one Gateway identity. Safe for
 // concurrent use.
+//
+// The secret is held in a closure, so reflection-based printing (fmt on
+// an unexported field, a debug dumper) sees a function pointer, never
+// the value. Client also redacts itself under every fmt verb, in JSON
+// and in slog.
 type Client struct {
 	base      *url.URL
 	hc        *http.Client
 	gatewayID string
-	secret    string
+	secret    func() string
 	userAgent string
 	now       func() time.Time
+}
+
+// Format prints the gateway id and a redacted secret under every verb,
+// including %+v and %#v.
+func (c Client) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, c.String()) }
+
+// String never prints the secret.
+func (c Client) String() string {
+	return "client.Client{gateway_id:" + c.gatewayID + ", secret:[redacted]}"
+}
+
+// GoString never prints the secret.
+func (c Client) GoString() string { return c.String() }
+
+// MarshalJSON emits the gateway id only.
+func (c Client) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		GatewayID string `json:"gateway_id"`
+		Secret    string `json:"secret"`
+	}{c.gatewayID, "[redacted]"})
+}
+
+// LogValue logs the gateway id only.
+func (c Client) LogValue() slog.Value {
+	return slog.GroupValue(slog.String("gateway_id", c.gatewayID))
 }
 
 // New builds a client for the control plane at base, authenticating as
@@ -80,11 +110,12 @@ func New(base *url.URL, hc *http.Client, id identity.Identity, version string) (
 	if id.GatewaySecret == "" {
 		return nil, fmt.Errorf("%w: gateway secret is empty", ErrInvalidArgument)
 	}
+	secret := id.GatewaySecret
 	return &Client{
 		base:      cleanBase(base),
 		hc:        noRedirect(hc),
 		gatewayID: id.GatewayID,
-		secret:    id.GatewaySecret,
+		secret:    func() string { return secret },
 		userAgent: "secrets-bridge-gateway/" + version,
 		now:       time.Now,
 	}, nil
@@ -107,7 +138,7 @@ func cleanBase(u *url.URL) *url.URL {
 
 func noRedirect(hc *http.Client) *http.Client {
 	if hc == nil {
-		hc = &http.Client{Timeout: 30 * time.Second}
+		hc = NewHTTPClient(nil)
 	}
 	cp := *hc
 	cp.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
@@ -151,7 +182,10 @@ func (c *Client) do(ctx context.Context, cl call) (*response, error) {
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", c.userAgent)
 	if cl.auth {
-		req.Header.Set(SecretHeader, c.secret)
+		if c.secret == nil {
+			return nil, ErrCallNotAllowed
+		}
+		req.Header.Set(SecretHeader, c.secret())
 	}
 	resp, err := c.hc.Do(req)
 	if err != nil {
@@ -293,6 +327,18 @@ func (r EnrollRequest) LogValue() slog.Value {
 	return slog.GroupValue(slog.String("cluster_name", r.ClusterName))
 }
 
+// enrollWire is the E1 body as sent. EnrollRequest itself marshals with
+// the token redacted, so only Enroll can put the token on the wire.
+type enrollWire struct {
+	EnrollmentToken string `json:"enrollment_token"`
+	ClusterName     string `json:"cluster_name,omitempty"`
+}
+
+// MarshalJSON never emits the token.
+func (r EnrollRequest) MarshalJSON() ([]byte, error) {
+	return json.Marshal(enrollWire{EnrollmentToken: "[redacted]", ClusterName: r.ClusterName})
+}
+
 // EnrollResponse is the E1 201 body. It holds the gateway secret, which
 // the control plane returns once.
 type EnrollResponse struct {
@@ -315,11 +361,30 @@ func (r EnrollResponse) LogValue() slog.Value {
 	return slog.GroupValue(slog.String("gateway_id", r.GatewayID))
 }
 
+// MarshalJSON never emits the secret. Decoding the E1 response uses the
+// field tags and is not affected.
+func (r EnrollResponse) MarshalJSON() ([]byte, error) {
+	type plain EnrollResponse
+	p := plain(r)
+	p.GatewaySecret = "[redacted]"
+	return json.Marshal(p)
+}
+
+// ErrInsecureEnrollment: enrollment was asked to use a scheme other than
+// https. The one-time token and the returned secret never travel in
+// clear (ADR 0001 section 11), and there is no override.
+var ErrInsecureEnrollment = errors.New("client: enrollment requires https")
+
 // Enroll exchanges a one-time enrollment token for the gateway identity
-// (E1). It sends no X-Gateway-Secret.
+// (E1). It sends no X-Gateway-Secret. It refuses any base URL that is
+// not https, even when the rest of the Gateway runs with the dev
+// insecure-transport flag.
 func Enroll(ctx context.Context, base *url.URL, hc *http.Client, req EnrollRequest) (*EnrollResponse, error) {
 	if base == nil || base.Host == "" {
 		return nil, fmt.Errorf("%w: control plane base URL", ErrInvalidArgument)
+	}
+	if base.Scheme != "https" {
+		return nil, ErrInsecureEnrollment
 	}
 	if req.EnrollmentToken == "" {
 		return nil, fmt.Errorf("%w: enrollment token is empty", ErrInvalidArgument)
@@ -327,7 +392,7 @@ func Enroll(ctx context.Context, base *url.URL, hc *http.Client, req EnrollReque
 	c := &Client{base: cleanBase(base), hc: noRedirect(hc), userAgent: "secrets-bridge-gateway", now: time.Now}
 	var out EnrollResponse
 	if _, err := c.postJSON(ctx, call{op: "enroll", method: http.MethodPost, path: apiPrefix + "enroll", maxBody: maxSmallRequest},
-		req, &out, http.StatusCreated); err != nil {
+		enrollWire(req), &out, http.StatusCreated); err != nil {
 		return nil, err
 	}
 	if !contract.ValidUUID(out.GatewayID) || out.GatewaySecret == "" {

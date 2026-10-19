@@ -1,11 +1,13 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -234,7 +236,7 @@ func TestStatusPaths(t *testing.T) {
 
 func TestEnroll(t *testing.T) {
 	var gotSecret atomic.Value
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotSecret.Store(r.Header.Get(SecretHeader))
 		if r.URL.Path != "/api/v1/gateways/enroll" || r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusNotFound)
@@ -282,6 +284,70 @@ func TestEnroll(t *testing.T) {
 	}
 	if _, err := Enroll(context.Background(), u, srv.Client(), EnrollRequest{}); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("empty token err = %v", err)
+	}
+	for _, v := range []any{*resp, resp, EnrollRequest{EnrollmentToken: "tok-secret"}} {
+		b, err := json.Marshal(v)
+		if err != nil || bytes.Contains(b, []byte("issued-once")) || bytes.Contains(b, []byte("tok-secret")) {
+			t.Fatalf("JSON leaks a credential: %s %v", b, err)
+		}
+	}
+}
+
+// TestEnroll_RefusesPlainHTTP: the one-time token and the returned
+// secret never go over http. The refusal happens before any request,
+// and there is no flag that allows it.
+func TestEnroll_RefusesPlainHTTP(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusCreated)
+		_, _ = fmt.Fprintf(w, `{"gateway_id":%q,"gateway_secret":"issued-once"}`, gwID)
+	}))
+	defer srv.Close()
+	for _, raw := range []string{srv.URL, strings.Replace(srv.URL, "http://", "HTTP://", 1), "ftp://cp.example.com"} {
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Enroll(context.Background(), u, srv.Client(), EnrollRequest{EnrollmentToken: "tok-secret"}); !errors.Is(err, ErrInsecureEnrollment) {
+			t.Fatalf("%s: err = %v, want ErrInsecureEnrollment", raw, err)
+		}
+	}
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("enrollment reached the server over http %d times", n)
+	}
+}
+
+// TestClient_NeverPrintsSecret: the client holds the gateway secret and
+// must not print it under any fmt verb, in JSON or in slog, alone or
+// inside a struct field (exported or not).
+func TestClient_NeverPrintsSecret(t *testing.T) {
+	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	type holder struct {
+		CP *Client
+		cp *Client
+		v  Client
+	}
+	h := holder{CP: c, cp: c, v: *c}
+	var out bytes.Buffer
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s"} {
+		fmt.Fprintf(&out, verb+"\n", c)
+		fmt.Fprintf(&out, verb+"\n", *c)
+		fmt.Fprintf(&out, verb+"\n", h)
+		fmt.Fprintf(&out, verb+"\n", &h)
+	}
+	for _, v := range []any{c, *c, h} {
+		b, _ := json.Marshal(v)
+		out.Write(b)
+	}
+	for _, hd := range []slog.Handler{slog.NewJSONHandler(&out, nil), slog.NewTextHandler(&out, nil)} {
+		slog.New(hd).Info("x", "client", c, "holder", h, "value", *c)
+	}
+	if strings.Contains(out.String(), gwSecret) {
+		t.Fatalf("secret printed:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), gwID) || !strings.Contains(fmt.Sprintf("%+v", c), "secret:[redacted]") {
+		t.Fatal("gateway id or the redaction marker missing from the redacted forms")
 	}
 }
 

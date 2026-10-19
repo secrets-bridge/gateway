@@ -58,7 +58,7 @@ CI guards:
 A connector can act only when three layers agree:
 
 1. **Local configuration (Helm values, customer-owned).** Connectors: `eso-main` of kind `eso` allowed in namespaces `tenant-a-uat`; `rollout-main` of kind `rollout`; `argocd-main` of kind `argocd` with URL `https://argocd.example.com`, CA, token file and allowed AppProjects. Targets per connector: `target_id`, namespace and object name (and for ArgoCD, the Application name and optional app namespace). URLs and credentials exist only here.
-2. **Catalog and binding (CP, admin-approved, audited).** At boot and when the heartbeat reports a different `catalog_version`, the Gateway sends `PUT /catalog` with connector ids, kinds, target ids, namespace and name for display (ADR open question 2), `refresh_interval_seconds` for ESO targets and `progress_deadline_seconds` for rollout targets. No URLs and no credentials. An admin approves connectors and binds targets to a secret scope.
+2. **Catalog and binding (CP, admin-approved, audited).** At boot and when the heartbeat reports a different `catalog_version`, the Gateway sends `PUT /catalog` with connector ids, kinds, target ids, namespace and name for display only (ADR 0001 section 11), `refresh_interval_seconds` for ESO targets and `progress_deadline_seconds` for rollout targets. No URLs and no credentials. An admin approves connectors and binds targets to a secret scope.
 3. **Task.** `connector_refs[]` of `{connector_id, target_id, stage}` plus the change marker. No URL, namespace, object name, credential, header or command.
 
 Before any read the runner checks: the schema version is supported; every `connector_id` exists locally with a kind that supports the stage; every `target_id` exists in that connector; the target namespace is in the connector allowlist and in `rbac.namespaces`. Any failure, or any unknown field, gives `attempt_status: refused` with a `refusal_reason` (`unknown_connector`, `unbound_target`, `stage_not_supported_by_connector`, `schema_violation`, `unsupported_schema_version`, `deadline_passed`) and no connector call. A compromised CP can therefore only choose among objects the customer listed.
@@ -190,7 +190,7 @@ Boot check: `GET /api/v1/session/userinfo` confirms the token works. Optional ne
 - **Authentication.** `X-Gateway-Secret` on every call after enrollment.
 - **Replica identity.** A random UUIDv4 generated at process start, sent as `replica_id` in each body. It does not come from the pod name or UID, which keeps cluster naming out of the CP. Ownership is enforced only by `attempt_id`.
 - **Revocation.** The next call gets 401. The runner stops claiming, `/readyz` turns not ready, and the pod stays up so operators see the reason in logs (the agent posture).
-- **Rotation.** Not in v1: revoke and re-create, as for agents. A two-hash `gateway_credentials` table is ADR open question 9.
+- **Rotation.** Not in v1: revoke and re-create, as for agents. A two-hash `gateway_credentials` table is out of v1 (ADR 0001 section 11).
 - **No keypair.** The Gateway never receives wraps or values, so it has no X25519 keypair and no DEK path.
 
 ## 5. Kubernetes RBAC
@@ -224,9 +224,9 @@ rules:
 - No `secrets` in any form, no `configmaps`, no `pods`, `pods/log`, `pods/exec`, no subresources, no `*`.
 - `SelfSubjectRulesReview` and `SelfSubjectAccessReview` creation is allowed for every authenticated user through `system:basic-user` and needs no rule here.
 
-### 5.2 Optional: ClusterRole
+### 5.2 No ClusterRole
 
-`rbac.scope: cluster` renders the same rules in a `ClusterRole` and `ClusterRoleBinding`. It requires `rbac.acknowledgeClusterScope: true` and prints a warning in NOTES. The local allowlist still applies, so cluster scope widens what RBAC permits, not what the Gateway reads (ADR open question for the security reviewer).
+The MVP renders namespaced Roles only (ADR 0001 section 11). There is no `rbac.scope: cluster`: a cluster-wide `get` on Deployments would expose every `env[].value` literal in the cluster.
 
 ### 5.3 Boot self-check
 
@@ -237,9 +237,9 @@ For each allowed namespace, each Kubernetes connector:
 3. Sends `SelfSubjectAccessReview` for the required verbs on `externalsecrets`, `deployments` and `replicasets`, and refuses readiness if any is missing.
 4. Logs a warning if the rules review shows any write verb on those resources.
 
-On over-privilege, readiness fails and the heartbeat reports `over_privileged`. `selfCheck.failOnOverPrivilege: false` exists for clusters where an aggregated role grants `secrets` read and cannot be changed; the Gateway then runs, and the CP sets `verdict_reason = gateway_over_privileged` and caps every task below `verified` (security reviewer open question 4).
+On over-privilege the Gateway refuses to start and logs the reason. There is no override (ADR 0001 section 11); the fix belongs in the customer's RBAC.
 
-Creating these review objects is the only non-GET call the Gateway makes to the Kubernetes API. They persist nothing.
+Creating these review objects is the only non-GET call the Gateway makes to the Kubernetes API. The read-only transport allows `POST` to exactly these two paths and refuses every other non-GET request. They persist nothing.
 
 ## 6. Polling, concurrency and limits
 
@@ -265,7 +265,7 @@ loop:
     other     -> interval*2, capped
 ```
 
-Long-poll is off in MVP (ADR open question 7).
+Long-poll is off in MVP (ADR 0001 section 11).
 
 The heartbeat loop is separate, jittered by plus or minus 10 percent, and carries `replica_id`, `gateway_version`, `contract_versions`, replica status, in-flight count, `catalog_version` and connector health. When the response `catalog_version` differs from the local digest, the replica sends E3.
 
@@ -359,7 +359,7 @@ gateway/
     _helpers.tpl              fullname, labels, image (digest or pinned tag), agent regex helpers
     _validation.tpl           render-time fail guards (11.4)
     serviceaccount.yaml
-    rbac.yaml                 Role and RoleBinding per namespace, or ClusterRole and binding
+    rbac.yaml                 Role and RoleBinding per namespace
     configmap-connectors.yaml connectors and targets, URLs, allowlists (no tokens)
     deployment.yaml
     networkpolicy.yaml
@@ -400,8 +400,6 @@ identity:
 
 rbac:
   create: true
-  scope: namespaced            # namespaced or cluster
-  acknowledgeClusterScope: false
   namespaces: []               # e.g. [tenant-a-uat]
 
 connectors:
@@ -448,7 +446,6 @@ kubernetesAPI:
   port: 443
 
 selfCheck:
-  failOnOverPrivilege: true
   argocdCanIProbe: false       # verify endpoint support before enabling
 
 metrics:
@@ -493,8 +490,8 @@ The ESO API version is not a value; it is discovered at boot (section 3.3).
 - `cp.endpoint` required and `https://` unless `cp.insecureTransport=true`.
 - `identity.existingSecret` required. No inline credential and no enrollment token value.
 - Image pin guard identical to the agent chart: `image.digest` must match `^sha256:[0-9a-f]{64}$`, otherwise a pinned tag, unless `image.allowMutableTag=true`.
-- `rbac.namespaces` non-empty when `rbac.scope=namespaced`; `rbac.acknowledgeClusterScope=true` required when `rbac.scope=cluster`.
-- Every connector namespace and every target namespace is in `rbac.namespaces` (namespaced mode) and in its connector's `namespaces`.
+- `rbac.namespaces` non-empty.
+- Every connector namespace and every target namespace is in `rbac.namespaces` and in its connector's `namespaces`.
 - Connector names unique across kinds; target ids unique per connector; both DNS-label format.
 - Each ArgoCD entry: `https://` URL, `tokenExistingSecret` and non-empty `projects`.
 - `networkPolicy.enabled=true` requires `cp.egressCIDRs`, `kubernetesAPI.egressCIDRs` when any eso or rollout connector exists, and a selector or CIDRs for each ArgoCD entry. No fallback to "443 to anywhere".

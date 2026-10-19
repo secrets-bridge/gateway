@@ -40,10 +40,12 @@ Control Plane (api, worker, Postgres)
 |---|---|
 | `cmd/gateway` | Entry point: env and flag config, TLS transport to the control plane, boot and graceful shutdown. The control-plane loop plugs in behind one interface; this build makes no control-plane calls and stays not ready |
 | `internal/connectors` | Connector interface, the registry of locally bound connectors, and the loader for the connectors file. No connector kinds are implemented yet |
-| `internal/readonly` | HTTP transport for connector clients. It refuses every method except GET and denies Kubernetes Secret paths before a request leaves the process |
-| `internal/identity` | Loads the gateway id and secret from env vars or an owner-only JSON file. Read-only, with no enrollment and no keypair |
+| `internal/readonly` | The only transport for connector clients. Per client it allowlists GET path patterns and query keys, allows POST only to the two Kubernetes self-review paths with a JSON body, and refuses opaque or non-canonical URLs, upgrades, exec, attach, portforward, proxy and log paths, and Kubernetes Secret paths before a request leaves the process |
+| `internal/client` | HTTP client for the control plane: no proxy, no redirects |
+| `internal/identity` | Loads the gateway id and secret from env vars or a JSON file. Read-only, with no enrollment and no keypair. The secret is redacted in every fmt, JSON and slog output |
 | `internal/local` | Loopback-only `/healthz`, `/readyz` and `/metrics` server |
 | `internal/observability` | JSON structured logger |
+| `internal/guard` | Guard tests for the module graph and source tree (see Development) |
 
 Planned next: the control-plane client (`internal/client`) and the ESO, rollout and ArgoCD connectors.
 
@@ -55,13 +57,15 @@ Planned next: the control-plane client (`internal/client`) and the ESO, rollout 
 | `SB_CP_CA_FILE` | empty | PEM bundle that replaces the system roots |
 | `SB_CP_TLS_SERVER_NAME` | empty | TLS server name override |
 | `SB_GATEWAY_ID`, `SB_GATEWAY_SECRET` | empty | Credential pair. When unset, `SB_GATEWAY_IDENTITY_FILE` is read |
-| `SB_GATEWAY_IDENTITY_FILE` | `/etc/secrets-bridge/gateway/identity.json` | `{"gateway_id": "...", "gateway_secret": "..."}`, mode 0600 or 0400. Looser modes are refused |
-| `SB_GATEWAY_LOCAL_ADDR` | `127.0.0.1:8091` | Must be a loopback address |
+| `SB_GATEWAY_IDENTITY_FILE` | `/etc/secrets-bridge/gateway/identity.json` | `{"gateway_id": "...", "gateway_secret": "..."}`, mode 0400, 0600, or 0440 as a Secret volume with `fsGroup` produces. Any other bit, or group write, is refused |
+| `SB_GATEWAY_LOCAL_ADDR` | `127.0.0.1:8091` | Must be a literal loopback IP; `localhost` is refused |
 | `SB_GATEWAY_CONNECTORS_FILE` | empty | JSON list of bound connectors, see below. Empty binds none |
 | `SB_GATEWAY_SHUTDOWN_GRACE` | `15s` | Graceful shutdown deadline |
 | `SB_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
 
 Each variable also has a flag; run `gateway -h` for the list.
+
+`SB_CP_ENDPOINT` must not carry userinfo. The Gateway ignores `HTTP_PROXY` and `HTTPS_PROXY` for every connection, to the control plane and to connectors, so a bearer credential never reaches a proxy.
 
 The connectors file is a JSON array. Each entry has a `name` (a DNS label that the control plane binds to), a `kind` (`eso`, `rollout` or `argocd`) and kind-specific `settings`. The loader refuses unknown kinds, duplicate names and unknown fields, and its errors never repeat settings content. This build implements no connector kinds yet, so it refuses any entry at boot as not supported. The shape will look like this:
 
@@ -79,7 +83,7 @@ go build ./... && go vet ./... && go test -race -count=1 ./...
 golangci-lint run
 ```
 
-CI also checks that `go.mod` and `go.sum` stay tidy, that no database, Redis, `k8s.io/client-go` or Agent module enters the dependency graph, and that no non-test Go file contains a Kubernetes Secrets API path.
+CI also checks that `go.mod` and `go.sum` stay tidy. The guard tests in `internal/guard` check that no database, Redis, KV or ORM driver, no `k8s.io/client-go` and no platform module (`api`, `worker`, `agent`, `controller`) appears in `go.mod` (require and replace) or `go.sum` or is imported, that no file outside `internal/readonly` and `internal/client` builds an `http.Transport` and none uses `http.DefaultClient` or `http.Get`, and that no non-test Go file names a Kubernetes Secrets path. Kubernetes and ArgoCD are read with stdlib `net/http`, not `client-go`.
 
 ## Contributing
 

@@ -14,7 +14,7 @@ Sources read on `main`: `agent/cmd/agent/{main.go,config.go,transport.go}`, `age
 
 ## 2. Process and repository layout
 
-The Gateway mirrors `agent/` in shape and dependency discipline (stdlib `net/http`, `log/slog`, Prometheus client) and adds `k8s.io/client-go`. It imports nothing from `api` or `agent` and nothing from `core/providers`.
+The Gateway mirrors `agent/` in shape and dependency discipline (stdlib `net/http`, `log/slog`, Prometheus client). It reads Kubernetes and ArgoCD with a stdlib `net/http` REST client on top of `internal/readonly`, not `k8s.io/client-go` (ADR 0001 section 6). It imports nothing from `api`, `worker`, `agent` or `controller` and nothing from `core/providers`.
 
 ```text
 gateway/
@@ -45,10 +45,14 @@ gateway/
 
 CI guards:
 
-- `no-db-or-redis`: the agent's forbidden module list (`jackc/pgx`, `lib/pq`, `go-sql-driver/mysql`, `mongo-driver`, `redis/go-redis`, `gomodule/redigo`, `go-redis/redis`) plus `mattn/go-sqlite3`, `modernc.org/sqlite`, `etcd-io/bbolt`.
-- `no-platform-import`: fail if `go.mod` or `go.sum` contains `github.com/secrets-bridge/agent` or `github.com/secrets-bridge/api`.
-- `no-secrets-access`: grep Go source for `CoreV1().Secrets(`, `corev1.Secret` and `"secrets"` as a resource in dynamic clients; render the chart with every values fixture and fail on any `secrets` resource.
-- `no-write-verbs`: grep for `.Create(`, `.Update(`, `.Patch(`, `.Delete(`, `.Apply(` on client-go clients outside `_test.go`. The allow file lists exactly two calls: `SelfSubjectRulesReviews().Create` and `SelfSubjectAccessReviews().Create` (section 5.3).
+CI runs these as Go tests in `internal/guard`, which parse `go.mod` (require and replace, both sides), `go.sum` and the Go source, plus a check of the resolved module graph (`go list -m all`).
+
+- `no-db-or-redis`: no module path matching `pgx`, `pgconn`, `lib/pq`, `go-pg`, `mysql`, `mssqldb`, `clickhouse-go`, `sqlite`, `bolt`, `badger`, `goleveldb`, `pebble`, `mongo`, `redis`, `redigo`, `rueidis`, `valkey`, `radix`, `etcd`, `gorm`, `bun`, `ent` or `xorm`, and no `database/sql` import.
+- `no-client-go`: no `k8s.io/client-go` or `controller-runtime` module.
+- `no-platform-import`: no `github.com/secrets-bridge/{api,worker,agent,controller}` in `go.mod`, `go.sum` or any import.
+- `http-transport-confined`: no `http.Transport` outside `internal/readonly` and `internal/client`, and no `http.DefaultClient`, `http.DefaultTransport`, `http.Get`/`Post`/`Head`/`PostForm` or `http.ProxyFromEnvironment` anywhere.
+- `no-secrets-access`: no string literal in non-test Go outside `internal/readonly` that names `secrets` as a path segment or on its own (this covers concatenation and `path.Join`), and no `.Secrets` selector; render the chart with every values fixture and fail on any `secrets` resource. The self-check uses `readonly.SecretsResource`.
+- `no-write-verbs`: enforced at runtime by `internal/readonly`, which allows `GET` on per-client path patterns and `POST` with a JSON body to exactly `/apis/authorization.k8s.io/v1/selfsubjectaccessreviews` and `/apis/authorization.k8s.io/v1/selfsubjectrulesreviews` (section 5.3), and refuses every other method before sending, with tests.
 - `no-typed-workloads`: fail on `appsv1.Deployment` or `appsv1.ReplicaSet` decoding outside tests; workloads are read raw (section 3.4).
 
 ## 3. Connectors
@@ -143,7 +147,7 @@ Proposed outcome: the ADR 2.3 `eso_sync` rules, with `T = expected_change.execut
 
 Read:
 
-- `GET /apis/apps/v1/namespaces/{ns}/deployments/{name}` through `RESTClient().Get().Do(ctx).Raw()`.
+- `GET /apis/apps/v1/namespaces/{ns}/deployments/{name}` through the stdlib REST client, read as raw bytes.
 - `GET /apis/apps/v1/namespaces/{ns}/replicasets?labelSelector=...&limit=50` with the selector built from `spec.selector`, following continue tokens, stopping after 200 items. Results are filtered to ReplicaSets whose `ownerReferences` include the Deployment `uid`.
 
 Both responses are decoded from raw bytes into projected structs. The Deployment struct holds:
@@ -516,7 +520,7 @@ Kubernetes API egress under NetworkPolicy depends on the CNI: some evaluate the 
 ### 11.6 Deployment specifics
 
 - `strategy: RollingUpdate` with defaults (no PVC, so surge is fine).
-- Identity Secret mounted read-only at `/etc/secrets-bridge/gateway/identity`, `defaultMode: 0400`, `fsGroupChangePolicy: OnRootMismatch` when `fsGroup` is set (`readCredentialFile` refuses "other" bits).
+- Identity Secret mounted read-only at `/etc/secrets-bridge/gateway/identity`, `defaultMode: 0400`, `fsGroupChangePolicy: OnRootMismatch` when `fsGroup` is set (`readCredentialFile` refuses any "other" bit and group write or execute, and accepts group read, so 0440 from `fsGroup` works).
 - ArgoCD tokens mounted read-only per connector at `/etc/secrets-bridge/gateway/argocd/<name>/token`.
 - The connectors ConfigMap mounted read-only, with a `checksum/connectors` pod annotation.
 - No downward API env for pod name or UID.

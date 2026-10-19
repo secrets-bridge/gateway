@@ -346,9 +346,6 @@ func TestLoop_StageConversion(t *testing.T) {
 		errorCode string
 		linkage   string
 	}{
-		{"verified becomes observed with a pinned version", func(tg connectors.Target) (connectors.Observation, error) {
-			return goodObs("eso-main", connectors.KindESO, tg, connectors.OutcomeVerified), nil
-		}, "observed", "", "version_pinned"},
 		{"no evidence detail is an internal error", func(tg connectors.Target) (connectors.Observation, error) {
 			o := goodObs("eso-main", connectors.KindESO, tg, connectors.OutcomeObserved)
 			o.Evidence = nil
@@ -400,7 +397,7 @@ func TestLoop_StageConversion(t *testing.T) {
 // refused by the registry and reported as an error, never as proof.
 func TestLoop_ArgoCDNeverVerified(t *testing.T) {
 	c := &fakeConn{name: "argocd-main", kind: connectors.KindArgoCD, obs: func(_ context.Context, tg connectors.Target) (connectors.Observation, error) {
-		return goodObs("argocd-main", connectors.KindArgoCD, tg, connectors.OutcomeVerified), nil
+		return goodObs("argocd-main", connectors.KindArgoCD, tg, connectors.Outcome("verified")), nil
 	}}
 	h := newHarness(t, nil, c)
 	h.cp.push(taskBody(t, taskOpts{n: 1, refs: allRefs[:1]}))

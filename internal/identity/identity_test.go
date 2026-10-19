@@ -2,11 +2,13 @@ package identity
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -61,7 +63,8 @@ func TestLoad_PartialEnvRefused(t *testing.T) {
 }
 
 func TestLoad_File(t *testing.T) {
-	for _, mode := range []os.FileMode{0o600, 0o400} {
+	// 0440 and 0640 are what a Secret volume with fsGroup produces.
+	for _, mode := range []os.FileMode{0o600, 0o400, 0o440, 0o640} {
 		p := writeFile(t, validJSON, mode)
 		id, src, err := Load(env(nil), p)
 		if err != nil {
@@ -74,7 +77,7 @@ func TestLoad_File(t *testing.T) {
 }
 
 func TestLoad_LooserModesRefused(t *testing.T) {
-	for _, mode := range []os.FileMode{0o640, 0o660, 0o620, 0o604, 0o644, 0o666, 0o700 | 0o044} {
+	for _, mode := range []os.FileMode{0o660, 0o620, 0o610, 0o450, 0o604, 0o602, 0o601, 0o644, 0o666, 0o444, 0o700 | 0o044} {
 		p := writeFile(t, validJSON, mode)
 		_, _, err := Load(env(nil), p)
 		if err == nil {
@@ -174,5 +177,77 @@ func TestIdentity_NeverFormatsSecret(t *testing.T) {
 	slog.New(slog.NewJSONHandler(&buf, nil)).Info("boot", "identity", id)
 	if strings.Contains(buf.String(), fakeSecret) || !strings.Contains(buf.String(), "gw-tenant-a-uat") {
 		t.Fatalf("log line: %q", buf.String())
+	}
+}
+
+// A struct that holds an Identity (as the boot code's loop deps do) is
+// formatted and logged field by field. LogValue only covers a top-level
+// Identity, so the secret must also be redacted by MarshalJSON and by
+// the fmt methods on the nested value.
+func TestIdentity_NestedNeverLeaksSecret(t *testing.T) {
+	type deps struct {
+		Name     string
+		Identity Identity
+		Ptr      *Identity
+	}
+	id := Identity{GatewayID: "gw-tenant-a-uat", GatewaySecret: fakeSecret}
+	d := deps{Name: "loop", Identity: id, Ptr: &id}
+
+	raw, err := json.Marshal(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), fakeSecret) || !strings.Contains(string(raw), "gw-tenant-a-uat") {
+		t.Fatalf("json: %s", raw)
+	}
+	if raw, _ := json.Marshal(id); strings.Contains(string(raw), fakeSecret) {
+		t.Fatalf("json of identity: %s", raw)
+	}
+
+	var buf bytes.Buffer
+	l := slog.New(slog.NewJSONHandler(&buf, nil))
+	l.Info("deps", "deps", d)
+	l.Info("deps-ptr", "deps", &d)
+	l.Info("group", slog.Group("g", "identity", id))
+	if strings.Contains(buf.String(), fakeSecret) {
+		t.Fatalf("JSON slog handler leaked the secret: %s", buf.String())
+	}
+	buf.Reset()
+	slog.New(slog.NewTextHandler(&buf, nil)).Info("deps", "deps", d)
+	if strings.Contains(buf.String(), fakeSecret) {
+		t.Fatalf("text slog handler leaked the secret: %s", buf.String())
+	}
+
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s"} {
+		if s := fmt.Sprintf(verb, d); strings.Contains(s, fakeSecret) {
+			t.Fatalf("%s leaked the secret: %s", verb, s)
+		}
+		if s := fmt.Sprintf(verb, &d); strings.Contains(s, fakeSecret) {
+			t.Fatalf("%s on pointer leaked the secret: %s", verb, s)
+		}
+	}
+}
+
+func TestLoad_TrailingValueRefused(t *testing.T) {
+	p := writeFile(t, validJSON+`{"gateway_id":"x"}`, 0o600)
+	if _, _, err := Load(env(nil), p); err == nil {
+		t.Fatal("trailing JSON value accepted")
+	}
+}
+
+// Each layer is checked on its own: the secret has no JSON name, so an
+// encoder that bypasses MarshalJSON (for example a copy into a plain
+// struct by reflection) still drops it, and MarshalJSON redacts it.
+func TestIdentity_RedactionLayers(t *testing.T) {
+	f, ok := reflect.TypeFor[Identity]().FieldByName("GatewaySecret")
+	if !ok || f.Tag.Get("json") != "-" {
+		t.Fatalf("GatewaySecret json tag = %q, want \"-\"", f.Tag.Get("json"))
+	}
+	raw, err := Identity{GatewayID: "gw", GatewaySecret: fakeSecret}.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != `{"gateway_id":"gw","gateway_secret":"[redacted]"}` {
+		t.Fatalf("MarshalJSON = %s", raw)
 	}
 }

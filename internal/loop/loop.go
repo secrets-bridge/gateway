@@ -728,9 +728,6 @@ func (l *Loop) toStage(ref contract.ConnectorRef, obs connectors.Observation, er
 		s.Confidence = contract.ConfidenceNone
 	}
 	switch obs.Outcome {
-	case connectors.OutcomeVerified:
-		// An identity link is a pinned version; only ESO can carry one.
-		s.Outcome, s.Linkage = contract.OutcomeObserved, contract.LinkageVersionPinned
 	case connectors.OutcomeObserved:
 		s.Outcome = contract.OutcomeObserved
 	case connectors.OutcomeNotObserved:

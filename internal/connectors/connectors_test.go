@@ -2,7 +2,9 @@ package connectors
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -115,10 +117,16 @@ func TestRegistry_ObserveChecksContract(t *testing.T) {
 		wantCalls bool
 	}{
 		{"observed passes", eso, "eso-main", esoTarget, nil, nil, OutcomeObserved, true},
-		{"eso verified passes", eso, "eso-main", esoTarget,
-			func(t Target) (Observation, error) { return goodObs(eso, t, OutcomeVerified), nil }, nil, OutcomeVerified, true},
+		{"eso verified refused", eso, "eso-main", esoTarget,
+			func(t Target) (Observation, error) { return goodObs(eso, t, "verified"), nil }, ErrInvalidObservation, OutcomeError, true},
+		{"eso failed passes", eso, "eso-main", esoTarget,
+			func(t Target) (Observation, error) { return goodObs(eso, t, OutcomeFailed), nil }, nil, OutcomeFailed, true},
+		{"eso not_applicable passes", eso, "eso-main", esoTarget,
+			func(t Target) (Observation, error) { return goodObs(eso, t, OutcomeNotApplicable), nil }, nil, OutcomeNotApplicable, true},
 		{"argocd verified refused", argo, "argocd-main", argoTarget,
-			func(t Target) (Observation, error) { return goodObs(argo, t, OutcomeVerified), nil }, ErrVerifiedNotAllowed, OutcomeError, true},
+			func(t Target) (Observation, error) { return goodObs(argo, t, "verified"), nil }, ErrInvalidObservation, OutcomeError, true},
+		{"argocd failed refused", argo, "argocd-main", argoTarget,
+			func(t Target) (Observation, error) { return goodObs(argo, t, OutcomeFailed), nil }, ErrOutcomeNotAllowed, OutcomeError, true},
 		{"argocd observed passes", argo, "argocd-main", argoTarget,
 			func(t Target) (Observation, error) { return goodObs(argo, t, OutcomeObserved), nil }, nil, OutcomeObserved, true},
 		{"wrong stage refused before call", eso, "eso-main", Target{ID: "payments-api", Stage: StageWorkloadRollout}, nil, ErrStageNotSupported, "", false},
@@ -218,5 +226,40 @@ func TestStageFor(t *testing.T) {
 	}
 	if _, ok := StageFor("vault"); ok {
 		t.Error("stage for unknown kind")
+	}
+}
+
+// The outcome set must be exactly the schema enum: no "verified", and
+// "failed" and "not_applicable" present.
+func TestOutcomesMatchSchema(t *testing.T) {
+	raw, err := os.ReadFile("../../schemas/evidence-result.schema.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Defs struct {
+			Outcome struct {
+				Enum []string `json:"enum"`
+			} `json:"outcome"`
+		} `json:"$defs"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Defs.Outcome.Enum) == 0 {
+		t.Fatal("schema has no $defs.outcome enum")
+	}
+	var got []string
+	for _, o := range Outcomes() {
+		got = append(got, string(o))
+		if !o.Valid() {
+			t.Errorf("%q is listed but not valid", o)
+		}
+	}
+	if !reflect.DeepEqual(got, doc.Defs.Outcome.Enum) {
+		t.Fatalf("outcomes = %v, schema enum = %v", got, doc.Defs.Outcome.Enum)
+	}
+	if Outcome("verified").Valid() {
+		t.Fatal("verified is a valid stage outcome")
 	}
 }

@@ -62,32 +62,43 @@ func StageFor(k Kind) (Stage, bool) {
 	return "", false
 }
 
-// Outcome is the honest result of one observation.
+// Outcome is the stage outcome a connector proposes. The set is exactly
+// $defs.outcome in schemas/evidence-result.schema.json. There is no
+// "verified": a verdict is computed by the control plane only (ADR 0001
+// section 2.4), and the Gateway never proposes one.
 type Outcome string
 
 // Outcomes. A connector reports what it saw and nothing stronger.
 const (
-	// OutcomeVerified: the connector linked the observation to the change
-	// by identity or by an ordering it can prove. ArgoCD may never report
-	// this: Healthy or Synced alone is not proof that a secret change
-	// rolled out.
-	OutcomeVerified Outcome = "verified"
-	// OutcomeObserved: the expected state was seen, but the link to the
-	// change is not proven.
+	// OutcomeObserved: the resource state is consistent with the change
+	// and ordered after it. The linkage says how.
 	OutcomeObserved Outcome = "observed"
-	// OutcomeNotObserved: the expected state was not seen (yet).
+	// OutcomeNotObserved: the resource was read and does not (yet)
+	// reflect the change. Non-terminal.
 	OutcomeNotObserved Outcome = "not_observed"
-	// OutcomeUnverifiable: the connector cannot tell, for example because
-	// the target is pinned elsewhere or the change is not observable.
+	// OutcomeNotApplicable: the stage cannot apply to this target, for
+	// example a volume-mounted consumer with no restart expected.
+	OutcomeNotApplicable Outcome = "not_applicable"
+	// OutcomeUnverifiable: the resource can be read but cannot carry the
+	// needed link, or will not change before the deadline.
 	OutcomeUnverifiable Outcome = "unverifiable"
-	// OutcomeError: the read failed.
+	// OutcomeFailed: positive evidence of failure after the change. Never
+	// for ArgoCD, whose state is context only.
+	OutcomeFailed Outcome = "failed"
+	// OutcomeError: the connector could not read the resource.
+	// Non-terminal.
 	OutcomeError Outcome = "error"
 )
+
+// Outcomes lists every defined outcome, in schema order.
+func Outcomes() []Outcome {
+	return []Outcome{OutcomeObserved, OutcomeNotObserved, OutcomeNotApplicable, OutcomeUnverifiable, OutcomeFailed, OutcomeError}
+}
 
 // Valid reports whether o is a defined outcome.
 func (o Outcome) Valid() bool {
 	switch o {
-	case OutcomeVerified, OutcomeObserved, OutcomeNotObserved, OutcomeUnverifiable, OutcomeError:
+	case OutcomeObserved, OutcomeNotObserved, OutcomeNotApplicable, OutcomeUnverifiable, OutcomeFailed, OutcomeError:
 		return true
 	}
 	return false
@@ -151,7 +162,7 @@ var (
 	ErrInvalidReference   = errors.New("connectors: reference is not a valid local name")
 	ErrStageNotSupported  = errors.New("connectors: stage is not supported by this connector kind")
 	ErrInvalidObservation = errors.New("connectors: connector returned an invalid observation")
-	ErrVerifiedNotAllowed = errors.New("connectors: this connector kind may not report verified")
+	ErrOutcomeNotAllowed  = errors.New("connectors: this connector kind may not report this outcome")
 	ErrDuplicateConnector = errors.New("connectors: duplicate connector name")
 	ErrUnknownKind        = errors.New("connectors: unknown connector kind")
 	ErrKindNotSupported   = errors.New("connectors: connector kind is not supported by this build")
@@ -265,8 +276,10 @@ func checkObservation(c Connector, t Target, o Observation) error {
 		return fmt.Errorf("%w: reason must be a machine code", ErrInvalidObservation)
 	case o.ObservedAt.IsZero():
 		return fmt.Errorf("%w: observed_at is missing", ErrInvalidObservation)
-	case c.Kind() == KindArgoCD && o.Outcome == OutcomeVerified:
-		return ErrVerifiedNotAllowed
+	case c.Kind() == KindArgoCD && o.Outcome == OutcomeFailed:
+		// ArgoCD is context only: Degraded or a failed operation is
+		// never a failure of the secret change (ADR 0001 section 2.3).
+		return ErrOutcomeNotAllowed
 	}
 	return nil
 }

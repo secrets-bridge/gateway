@@ -7,6 +7,9 @@
 // refuses it before any byte reaches the network unless all of these
 // hold:
 //
+//   - The URL scheme and host (with port, the scheme default when none
+//     is given) are the origin the policy was built for, so a request
+//     and its credentials never go to another server.
 //   - The URL has no Opaque part and no userinfo, and req.Host does not
 //     override the URL host.
 //   - The path is canonical: rooted, no "." or ".." segments, no
@@ -32,9 +35,11 @@ import (
 	"errors"
 	"fmt"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -81,6 +86,7 @@ var (
 	ErrOpaqueURL         = errors.New("readonly: opaque URLs are refused")
 	ErrUserinfo          = errors.New("readonly: URLs with userinfo are refused")
 	ErrHostOverride      = errors.New("readonly: Host override is refused")
+	ErrOriginNotAllowed  = errors.New("readonly: request scheme or host is not the client's origin")
 	ErrQueryNotAllowed   = errors.New("readonly: query key is not in the allowlist")
 	ErrUpgradeRefused    = errors.New("readonly: connection upgrades are refused")
 	ErrStreamSubresource = errors.New("readonly: exec, attach, portforward, proxy and log paths are refused")
@@ -96,6 +102,12 @@ type DenyFunc func(lowerPath string) bool
 
 // Policy is the per-client allowlist.
 type Policy struct {
+	// Origin is the scheme and host, with an optional port, that the
+	// client was built for, such as "https://k8s.example.com:6443". It
+	// is required. A request to any other scheme, host or port is
+	// refused before it is sent. A missing port means the scheme
+	// default (443 for https, 80 for http).
+	Origin string
 	// GET lists the path patterns a GET may target. A pattern is a
 	// canonical path in which a "*" segment matches exactly one
 	// non-empty segment. An empty list refuses every GET.
@@ -112,11 +124,13 @@ type Policy struct {
 
 // Transport wraps another RoundTripper and enforces a Policy.
 type Transport struct {
-	next  http.RoundTripper
-	get   [][]string
-	post  map[string]bool
-	query map[string]bool
-	deny  DenyFunc
+	next   http.RoundTripper
+	scheme string
+	host   string // lower-case host:port, port always present
+	get    [][]string
+	post   map[string]bool
+	query  map[string]bool
+	deny   DenyFunc
 }
 
 // New wraps next with policy p. next must not be nil: an implicit
@@ -125,7 +139,11 @@ func New(next http.RoundTripper, p Policy) (*Transport, error) {
 	if next == nil {
 		return nil, fmt.Errorf("%w: nil next transport", ErrInvalidPolicy)
 	}
-	t := &Transport{next: next, post: map[string]bool{}, query: map[string]bool{}, deny: p.Deny}
+	scheme, host, err := parseOrigin(p.Origin)
+	if err != nil {
+		return nil, err
+	}
+	t := &Transport{next: next, scheme: scheme, host: host, post: map[string]bool{}, query: map[string]bool{}, deny: p.Deny}
 	for _, pat := range p.GET {
 		if !canonical(pat) {
 			return nil, fmt.Errorf("%w: GET pattern is not a canonical path", ErrInvalidPolicy)
@@ -147,15 +165,62 @@ func New(next http.RoundTripper, p Policy) (*Transport, error) {
 	return t, nil
 }
 
-// KubernetesPolicy is the policy for a Kubernetes API client: the given
-// GET patterns and query keys, POST to the two self-review paths, and
-// DenyKubernetesSecrets.
-func KubernetesPolicy(get, query []string) Policy {
+// parseOrigin validates a policy origin and returns its scheme and its
+// host in the form normalHost returns.
+func parseOrigin(origin string) (scheme, host string, err error) {
+	if origin == "" {
+		return "", "", fmt.Errorf("%w: origin is required", ErrInvalidPolicy)
+	}
+	u, perr := url.Parse(origin)
+	if perr != nil {
+		return "", "", fmt.Errorf("%w: origin is not a URL", ErrInvalidPolicy)
+	}
+	scheme = strings.ToLower(u.Scheme)
+	if scheme != "https" && scheme != "http" {
+		return "", "", fmt.Errorf("%w: origin scheme must be https or http", ErrInvalidPolicy)
+	}
+	if u.Opaque != "" || u.User != nil || u.Hostname() == "" || (u.Path != "" && u.Path != "/") ||
+		u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return "", "", fmt.Errorf("%w: origin must be scheme and host only", ErrInvalidPolicy)
+	}
+	host, ok := normalHost(scheme, u)
+	if !ok {
+		return "", "", fmt.Errorf("%w: origin port is invalid", ErrInvalidPolicy)
+	}
+	return scheme, host, nil
+}
+
+// normalHost returns the lower-case host:port of u, filling in the
+// scheme default port. ok is false for a port that is not a number in
+// range.
+func normalHost(scheme string, u *url.URL) (string, bool) {
+	port := u.Port()
+	if port == "" {
+		if strings.HasSuffix(u.Host, ":") {
+			return "", false
+		}
+		port = "443"
+		if scheme == "http" {
+			port = "80"
+		}
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 || strconv.Itoa(n) != port {
+		return "", false
+	}
+	return net.JoinHostPort(strings.ToLower(u.Hostname()), port), true
+}
+
+// KubernetesPolicy is the policy for a Kubernetes API client at origin:
+// the given GET patterns and query keys, POST to the two self-review
+// paths, and DenyKubernetesSecrets.
+func KubernetesPolicy(origin string, get, query []string) Policy {
 	return Policy{
-		GET:   get,
-		POST:  []string{SelfSubjectAccessReviewPath, SelfSubjectRulesReviewPath},
-		Query: query,
-		Deny:  DenyKubernetesSecrets,
+		Origin: origin,
+		GET:    get,
+		POST:   []string{SelfSubjectAccessReviewPath, SelfSubjectRulesReviewPath},
+		Query:  query,
+		Deny:   DenyKubernetesSecrets,
 	}
 }
 
@@ -188,6 +253,12 @@ func (t *Transport) check(req *http.Request) error {
 		return ErrUserinfo
 	case req.Host != "" && req.Host != u.Host:
 		return ErrHostOverride
+	}
+	if strings.ToLower(u.Scheme) != t.scheme {
+		return ErrOriginNotAllowed
+	}
+	if h, ok := normalHost(t.scheme, u); !ok || h != t.host {
+		return ErrOriginNotAllowed
 	}
 	// The wire path is u.EscapedPath(). Requiring it to equal u.Path
 	// means no percent-encoding at all (so %2F or %2e cannot hide a

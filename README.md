@@ -13,7 +13,7 @@
 
 **Optional, outbound-only observation plane for [Secrets Bridge](https://github.com/secrets-bridge).** A Gateway runs inside a customer security boundary, reads local integrations (External Secrets Operator, Kubernetes rollout state, ArgoCD) without changing anything, and reports metadata-only evidence that an approved secret change actually reached the workloads.
 
-> **Status: early implementation.** The design is [ADR 0001: Gateway as an outbound-only observation plane](docs/adr/0001-gateway-observation-plane.md) (status: Accepted), with detail in [`docs/design/`](docs/design/) and the wire schemas in [`schemas/`](schemas/). The implementation is in progress on draft pull requests and is not usable yet. The current code boots, loads its identity and locally bound connectors, and serves loopback health and metrics. It heartbeats to the control plane, uploads its catalog and claims observation tasks. No connector kinds exist yet, so it refuses every task with `unknown_connector` and observes nothing.
+> **Status: early implementation.** The design is [ADR 0001: Gateway as an outbound-only observation plane](docs/adr/0001-gateway-observation-plane.md) (status: Accepted), with detail in [`docs/design/`](docs/design/) and the wire schemas in [`schemas/`](schemas/). The implementation is in progress on draft pull requests and is not usable yet. The current code boots, loads its identity and locally bound connectors, and serves loopback health and metrics. It heartbeats to the control plane, uploads its catalog and claims observation tasks. The only connector kind so far is `argocd`, which reports ArgoCD Application status as context. ESO and rollout connectors are not in this build, so tasks that name them are refused with `unknown_connector`.
 
 ## How it fits
 
@@ -42,14 +42,15 @@ Control Plane (api, worker, Postgres)
 | `internal/client` | Typed client for the gateway endpoints of the control plane (enroll, heartbeat, catalog, claim, lease, release, result). It refuses any other method or path, uses no proxy, never follows redirects, caps every response body and never copies response text into errors. Enrollment refuses any URL that is not `https`, and the client never prints the gateway secret |
 | `internal/contract` | Go structs for the v1 ObservationTask and EvidenceResult, with validation that matches the JSON schemas vendored under `internal/contract/testdata`. `StageEvidence` is the one evidence model every connector returns |
 | `internal/loop` | Heartbeat loop with connector health and the catalog upload, and the claim loop: jittered polling with idle backoff, bounded concurrency, one pass per lease that ends before the lease runs out, `attempt_id` echoed on every call, refusal of any task that names a connector or target not configured locally, the change marker passed to each connector, and stage linkage derived from the facts |
-| `internal/connectors` | Connector interface (targets, self-check, observe), the registry of locally bound connectors and their targets, and the loader for the connectors file. No connector kinds are implemented yet |
+| `internal/connectors` | Connector interface (targets, self-check, observe), the registry of locally bound connectors and their targets, and the loader for the connectors file |
+| `internal/connectors/argocd` | Read-only ArgoCD connector. One `GET /api/v1/applications/{name}` per observation and `GET /api/v1/session/userinfo` for the self-check. The token is read from a file. Results are context only: at most `observed`, confidence `low`, linkage `none` |
 | `internal/readonly` | The only transport for connector clients. Per client it allowlists GET path patterns and query keys, allows POST only to the two Kubernetes self-review paths with a JSON body, and refuses opaque or non-canonical URLs, upgrades, exec, attach, portforward, proxy and log paths, and Kubernetes Secret paths before a request leaves the process |
 | `internal/identity` | Loads the gateway id and secret from env vars or a JSON file. Read-only, with no enrollment and no keypair. The secret is redacted in every fmt, JSON and slog output |
 | `internal/local` | Loopback-only `/healthz`, `/readyz` and `/metrics` server |
 | `internal/observability` | JSON structured logger |
 | `internal/guard` | Guard tests for the module graph and source tree (see Development) |
 
-Planned next: the ESO, rollout and ArgoCD connectors, and `enroll` and `healthcheck` subcommands.
+Planned next: the ESO and rollout connectors, and `enroll` and `healthcheck` subcommands.
 
 Runtime behaviour:
 
@@ -83,14 +84,49 @@ Each variable also has a flag; run `gateway -h` for the list.
 
 `SB_CP_ENDPOINT` must not carry userinfo. The Gateway ignores `HTTP_PROXY` and `HTTPS_PROXY` for every connection, to the control plane and to connectors, so a bearer credential never reaches a proxy.
 
-The connectors file is a JSON array. Each entry has a `name` (a DNS label that the control plane binds to), a `kind` (`eso`, `rollout` or `argocd`) and kind-specific `settings`. The loader refuses unknown kinds, duplicate names and unknown fields, and its errors never repeat settings content. This build implements no connector kinds yet, so it refuses any entry at boot as not supported. The shape will look like this:
+The connectors file is a JSON array. Each entry has a `name` (a DNS label that the control plane binds to), a `kind` (`eso`, `rollout` or `argocd`) and kind-specific `settings`. The loader refuses unknown kinds, duplicate names and unknown fields, and its errors never repeat settings content. This build implements the `argocd` kind. It refuses `eso` and `rollout` entries at boot as not supported.
 
 ```json
 [
-  {"name": "eso-main", "kind": "eso", "settings": {}},
-  {"name": "argocd-main", "kind": "argocd", "settings": {}}
+  {
+    "name": "argocd-main",
+    "kind": "argocd",
+    "settings": {
+      "base_url": "https://argocd.example.com",
+      "token_file": "/etc/secrets-bridge/gateway/argocd/argocd-main/token",
+      "ca_file": "/etc/secrets-bridge/gateway/argocd/argocd-main/ca.crt",
+      "timeout": "10s",
+      "allowed_projects": ["tenant-a"],
+      "applications": [
+        {"id": "payments", "name": "payments-api", "app_namespace": ""}
+      ]
+    }
+  }
 ]
 ```
+
+ArgoCD settings:
+
+- `base_url` must be `https://` (`http://` only with `SB_INSECURE_TRANSPORT=true`, for development). It may not carry credentials, a query, a fragment or percent-encoding, and its path may only hold plain lower-case segments.
+- `token_file` is read on each request and again whenever the file changes, so a rotated token needs no restart. There is no inline token setting.
+- `ca_file`, when set, is the only trust anchor. `tls_server_name` overrides the server name.
+- `applications` maps the target ids the control plane may bind to ArgoCD Applications. The catalog advertises each id with the Application name and app namespace, for display only. A task that names any other target id is refused with `unbound_target` before anything is read.
+- `allowed_projects` lists the AppProjects the connector may report on. An Application in any other project comes back `unverifiable`, with sync and health reported as `Unknown`.
+
+The read-only transport admits exactly `GET <base>/api/v1/applications/<name>`, with `appNamespace` as the only query key, and `GET <base>/api/v1/session/userinfo`. It refuses every other method, path and query key before the request leaves the process: the application list, `resource-tree`, `managed-resources`, `manifests`, and `refresh`, which would make ArgoCD patch the Application.
+
+ArgoCD outcomes (stage `argocd_context`, never part of a verdict):
+
+| ArgoCD state | Outcome | Caveats besides `argocd_health_not_proof` |
+|---|---|---|
+| Healthy, Synced, no operation or `Succeeded`, reconciled after the change | `observed`, confidence `low` | none |
+| The same, reconciled before the change or with no reconcile time | `not_observed` | `observed_before_not_before` |
+| Operation `Failed` or `Error` | `not_observed` | `argocd_operation_unrelated` |
+| Anything else (OutOfSync, Progressing, Degraded, Running) | `not_observed` | none |
+| Application outside `allowed_projects` | `unverifiable` | none |
+| Read failed (401, 403, 404, timeout, TLS, size) | `error` with `connector_unauthorized`, `connector_forbidden`, `resource_not_found` and so on | none |
+
+`error` and `not_observed` are not terminal, so the control plane looks again; a rotated or revoked token does not close the stage. Health and operation messages, sources and Helm values are never decoded.
 
 ## Development
 

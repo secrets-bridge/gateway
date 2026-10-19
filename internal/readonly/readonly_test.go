@@ -34,6 +34,7 @@ func (c *closeTracker) Close() error { c.closed = true; return nil }
 const k8s = "https://k8s.example.com"
 
 var testK8sPolicy = KubernetesPolicy(
+	k8s,
 	[]string{
 		"/apis/apps/v1/namespaces/*/deployments/*",
 		"/apis/apps/v1/namespaces/*/replicasets",
@@ -94,13 +95,23 @@ func mustAllow(t *testing.T, tr http.RoundTripper, next *countingRT, req *http.R
 func TestNewRefusesBadPolicy(t *testing.T) {
 	next := &countingRT{}
 	cases := map[string]Policy{
-		"post elsewhere":      {POST: []string{"/apis/apps/v1/namespaces/a/deployments"}},
-		"post near miss":      {POST: []string{SelfSubjectAccessReviewPath + "/x"}},
-		"non canonical get":   {GET: []string{"/apis/../api/v1"}},
-		"trailing slash get":  {GET: []string{"/apis/apps/v1/"}},
-		"relative get":        {GET: []string{"apis/apps/v1"}},
-		"empty query key":     {Query: []string{""}},
-		"post with wildcards": {POST: []string{"/apis/authorization.k8s.io/v1/*"}},
+		"post elsewhere":      {Origin: k8s, POST: []string{"/apis/apps/v1/namespaces/a/deployments"}},
+		"post near miss":      {Origin: k8s, POST: []string{SelfSubjectAccessReviewPath + "/x"}},
+		"non canonical get":   {Origin: k8s, GET: []string{"/apis/../api/v1"}},
+		"trailing slash get":  {Origin: k8s, GET: []string{"/apis/apps/v1/"}},
+		"relative get":        {Origin: k8s, GET: []string{"apis/apps/v1"}},
+		"empty query key":     {Origin: k8s, Query: []string{""}},
+		"post with wildcards": {Origin: k8s, POST: []string{"/apis/authorization.k8s.io/v1/*"}},
+		"no origin":           {},
+		"origin no scheme":    {Origin: "k8s.example.com"},
+		"origin ftp":          {Origin: "ftp://k8s.example.com"},
+		"origin with path":    {Origin: k8s + "/api"},
+		"origin with query":   {Origin: k8s + "?a=b"},
+		"origin with user":    {Origin: "https://u:p@k8s.example.com"},
+		"origin no host":      {Origin: "https://"},
+		"origin bad port":     {Origin: "https://k8s.example.com:99999"},
+		"origin empty port":   {Origin: "https://k8s.example.com:"},
+		"origin port text":    {Origin: "https://k8s.example.com:https"},
 	}
 	for name, p := range cases {
 		if _, err := New(next, p); !errors.Is(err, ErrInvalidPolicy) {
@@ -178,7 +189,7 @@ func TestKubernetesPOSTAllowlist(t *testing.T) {
 // A policy without the review paths (ArgoCD) refuses every POST.
 func TestPOSTRefusedWithoutPolicy(t *testing.T) {
 	next := &countingRT{}
-	tr := newT(t, next, Policy{GET: []string{"/api/v1/applications/*"}})
+	tr := newT(t, next, Policy{Origin: k8s, GET: []string{"/api/v1/applications/*"}})
 	mustRefuse(t, tr, next, jsonPost(k8s+SelfSubjectAccessReviewPath), ErrMethodNotAllowed)
 }
 
@@ -224,7 +235,7 @@ func TestRefusesOpaqueURL(t *testing.T) {
 
 func TestRefusesNonCanonicalPath(t *testing.T) {
 	next := &countingRT{}
-	tr := newT(t, next, Policy{GET: []string{"/apis/apps/v1/namespaces/*/deployments/*", "/api/v1/namespaces/*"}})
+	tr := newT(t, next, Policy{Origin: k8s, GET: []string{"/apis/apps/v1/namespaces/*/deployments/*", "/api/v1/namespaces/*"}})
 	for _, raw := range []string{
 		"/apis/apps/v1/namespaces/a/deployments/web/",
 		"/apis/apps/v1/namespaces/a/deployments/web/.",
@@ -257,7 +268,7 @@ func TestRefusesNonCanonicalPath(t *testing.T) {
 
 func TestQueryKeyAllowlist(t *testing.T) {
 	next := &countingRT{}
-	argo := newT(t, next, Policy{GET: []string{"/api/v1/applications/*"}, Query: []string{"appNamespace"}})
+	argo := newT(t, next, Policy{Origin: "https://argocd.example.com", GET: []string{"/api/v1/applications/*"}, Query: []string{"appNamespace"}})
 	mustAllow(t, argo, next, get("https://argocd.example.com/api/v1/applications/web?appNamespace=apps"))
 	// refresh=hard makes ArgoCD patch the Application.
 	mustRefuse(t, argo, next, get("https://argocd.example.com/api/v1/applications/web?refresh=hard"), ErrQueryNotAllowed)
@@ -290,7 +301,7 @@ func TestRefusesUpgradeHeaders(t *testing.T) {
 // written too wide.
 func TestRefusesStreamSubresources(t *testing.T) {
 	next := &countingRT{}
-	wide := newT(t, next, Policy{GET: []string{
+	wide := newT(t, next, Policy{Origin: k8s, GET: []string{
 		"/api/v1/namespaces/*/pods/*/*",
 		"/api/v1/namespaces/*/services/*/*/*",
 		"/api/v1/nodes/*/*",
@@ -363,7 +374,7 @@ func TestDenyKubernetesSecrets(t *testing.T) {
 // wide enough to match them.
 func TestKubernetesPolicyDeniesSecretsUnderWidePattern(t *testing.T) {
 	next := &countingRT{}
-	p := KubernetesPolicy([]string{"/api/v1/namespaces/*/*/*", "/k8s/clusters/*/api/v1/namespaces/*/*/*"}, nil)
+	p := KubernetesPolicy(k8s, []string{"/api/v1/namespaces/*/*/*", "/k8s/clusters/*/api/v1/namespaces/*/*/*"}, nil)
 	tr := newT(t, next, p)
 	mustRefuse(t, tr, next, get(k8s+"/api/v1/namespaces/a/secrets/db"), ErrPathDenied)
 	mustRefuse(t, tr, next, get(k8s+"/k8s/clusters/c-1/api/v1/namespaces/a/secrets/db"), ErrPathDenied)
@@ -404,8 +415,9 @@ func TestEndToEndThroughClient(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	hc, err := NewClient(srv.Client().Transport, Policy{
-		GET:  []string{"/apis/apps/v1/namespaces/*/deployments/*", "/redirect"},
-		Deny: DenyKubernetesSecrets,
+		Origin: srv.URL,
+		GET:    []string{"/apis/apps/v1/namespaces/*/deployments/*", "/redirect"},
+		Deny:   DenyKubernetesSecrets,
 	}, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -484,8 +496,72 @@ func TestCleanPath(t *testing.T) {
 }
 
 func TestNilRequestURL(t *testing.T) {
-	tr := newT(t, &countingRT{}, Policy{})
+	tr := newT(t, &countingRT{}, Policy{Origin: k8s})
 	if _, err := tr.RoundTrip(&http.Request{Method: http.MethodGet}); err == nil {
 		t.Fatal("request without URL accepted")
+	}
+}
+
+// Each client is pinned to the origin it was built for: a request to any
+// other scheme, host or port is refused before it is sent, so a bearer
+// token cannot be carried to another server.
+func TestRefusesOtherOrigin(t *testing.T) {
+	next := &countingRT{}
+	tr := newT(t, next, KubernetesPolicy("https://K8s.Example.com:6443", []string{"/apis/apps/v1/namespaces/*/deployments/*"}, nil))
+	const p = "/apis/apps/v1/namespaces/a/deployments/web"
+	mustAllow(t, tr, next, get("https://k8s.example.com:6443"+p))
+	mustAllow(t, tr, next, get("HTTPS://K8S.EXAMPLE.COM:6443"+p))
+	for _, raw := range []string{
+		"https://other.example.com:6443" + p,
+		"https://k8s.example.com" + p,
+		"https://k8s.example.com:443" + p,
+		"https://k8s.example.com:6444" + p,
+		"http://k8s.example.com:6443" + p,
+		"https://k8s.example.com.evil.example:6443" + p,
+		"https://127.0.0.1:6443" + p,
+	} {
+		mustRefuse(t, tr, next, get(raw), ErrOriginNotAllowed)
+	}
+	jp := jsonPost("https://other.example.com:6443" + SelfSubjectAccessReviewPath)
+	mustRefuse(t, tr, next, jp, ErrOriginNotAllowed)
+
+	// No port in the origin means the scheme default, written or not.
+	def := newT(t, next, Policy{Origin: "https://argocd.example.com", GET: []string{"/api/v1/applications/*"}})
+	mustAllow(t, def, next, get("https://argocd.example.com/api/v1/applications/web"))
+	mustAllow(t, def, next, get("https://argocd.example.com:443/api/v1/applications/web"))
+	mustRefuse(t, def, next, get("https://argocd.example.com:8443/api/v1/applications/web"), ErrOriginNotAllowed)
+	plain := newT(t, next, Policy{Origin: "http://127.0.0.1", GET: []string{"/api/v1/applications/*"}})
+	mustAllow(t, plain, next, get("http://127.0.0.1:80/api/v1/applications/web"))
+	mustRefuse(t, plain, next, get("https://127.0.0.1/api/v1/applications/web"), ErrOriginNotAllowed)
+
+	// The error names the rule, not the host.
+	_, err := tr.RoundTrip(get("https://other.example.com:6443" + p))
+	if err == nil || strings.Contains(err.Error(), "other.example.com") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// A redirect-free client built for one server cannot be pointed at a
+// second server, even one that serves the same paths.
+func TestClientPinnedToItsServer(t *testing.T) {
+	var hitsA, hitsB atomic.Int32
+	a := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hitsA.Add(1) }))
+	t.Cleanup(a.Close)
+	b := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hitsB.Add(1) }))
+	t.Cleanup(b.Close)
+	hc, err := NewClient(BaseTransport(nil), Policy{Origin: a.URL, GET: []string{"/api/v1/applications/*"}}, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := hc.Get(a.URL + "/api/v1/applications/web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if _, err := hc.Get(b.URL + "/api/v1/applications/web"); !errors.Is(err, ErrOriginNotAllowed) {
+		t.Fatalf("err = %v, want ErrOriginNotAllowed", err)
+	}
+	if hitsA.Load() != 1 || hitsB.Load() != 0 {
+		t.Fatalf("hits a=%d b=%d", hitsA.Load(), hitsB.Load())
 	}
 }

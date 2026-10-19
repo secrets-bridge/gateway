@@ -13,7 +13,7 @@
 
 **Optional, outbound-only observation plane for [Secrets Bridge](https://github.com/secrets-bridge).** A Gateway runs inside a customer security boundary, reads local integrations (External Secrets Operator, Kubernetes rollout state, ArgoCD) without changing anything, and reports metadata-only evidence that an approved secret change actually reached the workloads.
 
-> **Status: early implementation.** The design is [ADR 0001: Gateway as an outbound-only observation plane](docs/adr/0001-gateway-observation-plane.md) (status: Accepted), with detail in [`docs/design/`](docs/design/) and the wire schemas in [`schemas/`](schemas/). The implementation is in progress on draft pull requests and is not usable yet. The current code boots, loads its identity and locally bound connectors, and serves loopback health and metrics. It heartbeats to the control plane and claims observation tasks. No connector kinds exist yet, so it refuses every task with `unknown_connector` and observes nothing.
+> **Status: early implementation.** The design is [ADR 0001: Gateway as an outbound-only observation plane](docs/adr/0001-gateway-observation-plane.md) (status: Accepted), with detail in [`docs/design/`](docs/design/) and the wire schemas in [`schemas/`](schemas/). The implementation is in progress on draft pull requests and is not usable yet. The current code boots, loads its identity and locally bound connectors, and serves loopback health and metrics. It heartbeats to the control plane, uploads its catalog and claims observation tasks. No connector kinds exist yet, so it refuses every task with `unknown_connector` and observes nothing.
 
 ## How it fits
 
@@ -39,17 +39,24 @@ Control Plane (api, worker, Postgres)
 | Path | Purpose |
 |---|---|
 | `cmd/gateway` | Entry point: env and flag config, TLS transport to the control plane, boot and graceful shutdown |
-| `internal/client` | Typed client for the gateway endpoints of the control plane (enroll, heartbeat, catalog, claim, lease, release, result). It refuses any other method or path, uses no proxy, never follows redirects, caps every response body and never copies response text into errors |
-| `internal/contract` | Go structs for the v1 ObservationTask and EvidenceResult, with validation that matches the JSON schemas vendored under `internal/contract/testdata` |
-| `internal/loop` | Heartbeat loop and claim loop: jittered polling with idle backoff, bounded concurrency, one pass per lease that ends before the lease runs out, `attempt_id` echoed on every call, and refusal of any task that names a connector not bound locally |
-| `internal/connectors` | Connector interface, the registry of locally bound connectors, and the loader for the connectors file. No connector kinds are implemented yet |
+| `internal/client` | Typed client for the gateway endpoints of the control plane (enroll, heartbeat, catalog, claim, lease, release, result). It refuses any other method or path, uses no proxy, never follows redirects, caps every response body and never copies response text into errors. Enrollment refuses any URL that is not `https`, and the client never prints the gateway secret |
+| `internal/contract` | Go structs for the v1 ObservationTask and EvidenceResult, with validation that matches the JSON schemas vendored under `internal/contract/testdata`. `StageEvidence` is the one evidence model every connector returns |
+| `internal/loop` | Heartbeat loop with connector health and the catalog upload, and the claim loop: jittered polling with idle backoff, bounded concurrency, one pass per lease that ends before the lease runs out, `attempt_id` echoed on every call, refusal of any task that names a connector or target not configured locally, the change marker passed to each connector, and stage linkage derived from the facts |
+| `internal/connectors` | Connector interface (targets, self-check, observe), the registry of locally bound connectors and their targets, and the loader for the connectors file. No connector kinds are implemented yet |
 | `internal/readonly` | The only transport for connector clients. Per client it allowlists GET path patterns and query keys, allows POST only to the two Kubernetes self-review paths with a JSON body, and refuses opaque or non-canonical URLs, upgrades, exec, attach, portforward, proxy and log paths, and Kubernetes Secret paths before a request leaves the process |
 | `internal/identity` | Loads the gateway id and secret from env vars or a JSON file. Read-only, with no enrollment and no keypair. The secret is redacted in every fmt, JSON and slog output |
 | `internal/local` | Loopback-only `/healthz`, `/readyz` and `/metrics` server |
 | `internal/observability` | JSON structured logger |
 | `internal/guard` | Guard tests for the module graph and source tree (see Development) |
 
-Planned next: the ESO, rollout and ArgoCD connectors, the catalog upload, and `enroll` and `healthcheck` subcommands.
+Planned next: the ESO, rollout and ArgoCD connectors, and `enroll` and `healthcheck` subcommands.
+
+Runtime behaviour:
+
+- Readiness needs a recent accepted heartbeat, an accepted catalog and a passing self-check on every connector. Claiming starts only after the first heartbeat and catalog are accepted.
+- A 401 from the control plane, or an unsupported contract version, stops claiming and leaves the process up and not ready, with the reason in the logs, so the pod does not restart-loop.
+- A connector whose credential can read Kubernetes Secrets (or write) refuses the boot, and no setting overrides that.
+- The Gateway proposes stage outcomes only. It never sends a verdict, and it reports `version_pinned` only when the ExternalSecret pins a version that matches the provider version the agent reported.
 
 ## Configuration
 

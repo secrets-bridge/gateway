@@ -324,8 +324,12 @@ func (c *Client) GetUserInfo(ctx context.Context) (UserInfo, error) {
 }
 
 // do issues one GET, maps the status code and decodes a bounded body.
-// The request is built from the URL struct, not from a string, so what
-// the transport judges is what is sent.
+// target is built from the base URL and validated path segments, then
+// serialised with target.String() and parsed again by
+// http.NewRequestWithContext. The read-only transport judges that parsed
+// URL, which is the one sent, so a segment that changed meaning on the
+// round trip is refused rather than sent, and the transport's origin pin
+// refuses any host other than the base URL's.
 func (c *Client) do(ctx context.Context, target *url.URL, out any) error {
 	token, err := c.token()
 	if err != nil || token == "" {

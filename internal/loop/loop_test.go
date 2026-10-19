@@ -852,3 +852,46 @@ func TestLoop_UnverifiedConnectorStopsWork(t *testing.T) {
 		t.Fatal("claiming did not resume")
 	}
 }
+
+// TestLoop_NoHeartbeatAfterShuttingDown: a regular heartbeat in flight at
+// shutdown is answered before shutting_down is sent, so the control plane
+// never takes an ok heartbeat after shutting_down.
+func TestLoop_NoHeartbeatAfterShuttingDown(t *testing.T) {
+	h := newHarness(t, nil)
+	h.start()
+	waitFor(t, "ready", h.ready.ready.Load)
+	h.cp.mu.Lock()
+	h.cp.hbDelay = 300 * time.Millisecond
+	h.cp.mu.Unlock()
+	time.Sleep(50 * time.Millisecond) // a delayed heartbeat is in flight
+	if err := h.stop(); err != nil {
+		t.Fatal(err)
+	}
+	// Give a heartbeat the loop gave up on time to land.
+	time.Sleep(400 * time.Millisecond)
+	hbs := h.cp.snapshot().heartbeats
+	if last := hbs[len(hbs)-1]["status"]; last != "shutting_down" {
+		t.Fatalf("last heartbeat = %v, want shutting_down", last)
+	}
+}
+
+// TestLoop_NoHeartbeatAfterHalt: once the control plane has refused the
+// Gateway (a claim answered 401 while a heartbeat is in flight), no
+// heartbeat or claim reaches the control plane after Halted reports true.
+func TestLoop_NoHeartbeatAfterHalt(t *testing.T) {
+	h := newHarness(t, nil)
+	h.cp.claimReply = []reply{{status: 204}, {status: 204}, {status: 401}}
+	h.start()
+	waitFor(t, "ready", h.ready.ready.Load)
+	h.cp.mu.Lock()
+	h.cp.hbDelay = 200 * time.Millisecond
+	h.cp.mu.Unlock()
+	waitFor(t, "halt", h.loop.Halted)
+	before := h.cp.snapshot()
+	time.Sleep(400 * time.Millisecond)
+	after := h.cp.snapshot()
+	if after.claimCalls != before.claimCalls || len(after.heartbeats) != len(before.heartbeats) {
+		t.Fatalf("calls reached the control plane after the halt: claims %d -> %d, heartbeats %d -> %d",
+			before.claimCalls, after.claimCalls, len(before.heartbeats), len(after.heartbeats))
+	}
+}

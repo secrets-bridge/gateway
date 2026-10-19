@@ -150,6 +150,11 @@ type Loop struct {
 	haltOnce   sync.Once
 	halted     chan struct{}
 	haltReason atomic.Value // string
+	// cpMu orders the heartbeat, catalog and claim calls against halt.
+	// Each of those calls holds it shared from its halted check until
+	// its response is read; halt takes it exclusively. So once Halted
+	// reports true, none of them is in flight and none starts.
+	cpMu sync.RWMutex
 
 	claimGate     chan struct{} // closed once a heartbeat and the catalog are accepted
 	claimGateOnce sync.Once
@@ -161,6 +166,10 @@ type Loop struct {
 	catalogAccepted atomic.Bool
 	heartbeatFresh  atomic.Bool
 }
+
+// errHalted: a call was not sent because the control plane has refused
+// this Gateway.
+var errHalted = errors.New("loop: halted")
 
 // ErrInvalidConfig is returned by New.
 var ErrInvalidConfig = errors.New("loop: invalid config")
@@ -318,10 +327,25 @@ func (l *Loop) fail(err error) {
 // halt stops claiming for good and keeps the process up and not ready.
 func (l *Loop) halt(reason string) {
 	l.haltOnce.Do(func() {
+		l.cpMu.Lock()
+		defer l.cpMu.Unlock()
 		l.haltReason.Store(reason)
 		l.cfg.Ready.SetReady(false)
 		close(l.halted)
 	})
+}
+
+// unlessHalted runs call, a heartbeat, catalog or claim call, unless the
+// control plane has refused this Gateway. It reports whether call ran.
+// call must not call halt.
+func (l *Loop) unlessHalted(call func()) bool {
+	l.cpMu.RLock()
+	defer l.cpMu.RUnlock()
+	if l.isHalted() {
+		return false
+	}
+	call()
+	return true
 }
 
 func (l *Loop) isHalted() bool {
@@ -413,7 +437,11 @@ func CatalogFor(c Connectors) client.Catalog {
 func (l *Loop) uploadCatalog(ctx context.Context) error {
 	callCtx, cancel := context.WithTimeout(ctx, l.cfg.CallTimeout)
 	defer cancel()
-	resp, err := l.cfg.CP.PutCatalog(callCtx, CatalogFor(l.cfg.Connectors))
+	var resp *client.CatalogResponse
+	var err error
+	if !l.unlessHalted(func() { resp, err = l.cfg.CP.PutCatalog(callCtx, CatalogFor(l.cfg.Connectors)) }) {
+		return errHalted
+	}
 	if err != nil {
 		l.m.catalog("error")
 		return err
@@ -461,9 +489,16 @@ func (l *Loop) heartbeatLoop(ctx context.Context) {
 		if !l.connectorsHealthy() {
 			status = client.ReplicaDegraded
 		}
-		callCtx, cancel := context.WithTimeout(ctx, l.cfg.CallTimeout)
-		resp, err := l.cfg.CP.Heartbeat(callCtx, l.heartbeatRequest(status))
+		// The call is not cancelled by shutdown: Run waits for its answer
+		// before it sends the shutting_down heartbeat, so the control
+		// plane never takes an ok heartbeat after shutting_down.
+		callCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), l.cfg.CallTimeout)
+		var resp *client.HeartbeatResponse
+		sent := l.unlessHalted(func() { resp, err = l.cfg.CP.Heartbeat(callCtx, l.heartbeatRequest(status)) })
 		cancel()
+		if !sent {
+			return
+		}
 		var wait time.Duration
 		switch {
 		case err == nil:
@@ -476,6 +511,9 @@ func (l *Loop) heartbeatLoop(ctx context.Context) {
 			wait = l.cfg.Jitter(interval, 0.9, 1.1)
 			if !l.catalogAccepted.Load() || resp.CatalogVersion != l.catVersion() {
 				if cerr := l.uploadCatalog(ctx); cerr != nil {
+					if errors.Is(cerr, errHalted) {
+						return
+					}
 					if errors.Is(cerr, client.ErrUnauthorized) {
 						l.halt(haltUnauthorized)
 						return
@@ -584,8 +622,14 @@ func (l *Loop) claimLoop(runCtx, workCtx context.Context) {
 			continue // all slots busy; try again next tick
 		}
 		callCtx, cancel := context.WithTimeout(runCtx, l.cfg.CallTimeout)
-		res, err := l.cfg.CP.Claim(callCtx, l.cfg.ReplicaID)
+		var res *client.ClaimResult
+		var err error
+		claimed := l.unlessHalted(func() { res, err = l.cfg.CP.Claim(callCtx, l.cfg.ReplicaID) })
 		cancel()
+		if !claimed {
+			<-l.sem
+			return
+		}
 		if err != nil || (res.Task == nil && res.Invalid == nil) {
 			<-l.sem
 		}

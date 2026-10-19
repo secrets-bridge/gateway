@@ -185,6 +185,9 @@ func TestRegistry_ObserveChecksContract(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			if err := r.Check(context.Background(), time.Second); err != nil {
+				t.Fatal(err)
+			}
 			got, err := r.Observe(ctx, tc.ref, tc.target)
 			if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
 				t.Fatalf("err = %v, want %v", err, tc.wantErr)
@@ -225,6 +228,9 @@ func TestRegistry_ObserveKeepsErrorCode(t *testing.T) {
 			c := &fakeConnector{name: "eso-main", kind: KindESO, obs: func(Target) (Observation, error) { return tc.obs, tc.err }}
 			r, err := NewRegistry(c)
 			if err != nil {
+				t.Fatal(err)
+			}
+			if err := r.Check(context.Background(), time.Second); err != nil {
 				t.Fatal(err)
 			}
 			got, _ := r.Observe(context.Background(), "eso-main", Target{ID: "payments-api", Stage: StageESOSync})
@@ -414,5 +420,120 @@ func TestOutcomesMatchSchema(t *testing.T) {
 	}
 	if Outcome("verified").Valid() {
 		t.Fatal("verified is a valid stage outcome")
+	}
+}
+
+// RecheckAll checks every connector again, including those that passed,
+// so a Secrets grant added after start is found. An unproven result
+// leaves the connector degraded without failing the call.
+func TestRegistry_RecheckAll(t *testing.T) {
+	var granted, unproven bool
+	a := &fakeConnector{name: "rollout-main", kind: KindRollout, check: func() error {
+		if granted {
+			return fmt.Errorf("x: %w", ErrOverPrivileged)
+		}
+		return nil
+	}}
+	b := &fakeConnector{name: "eso-main", kind: KindESO, check: func() error {
+		if unproven {
+			return fmt.Errorf("x: %w", ErrPrivilegeUnproven)
+		}
+		return nil
+	}}
+	r, err := NewRegistry(a, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Check(context.Background(), time.Second); err != nil {
+		t.Fatal(err)
+	}
+	granted, unproven = true, true
+	if err := r.Recheck(context.Background(), time.Second); err != nil || a.checks != 1 {
+		t.Fatalf("Recheck err = %v, checks = %d: passing connectors must not be rechecked", err, a.checks)
+	}
+	if err := r.RecheckAll(context.Background(), time.Second); !errors.Is(err, ErrOverPrivileged) {
+		t.Fatalf("RecheckAll err = %v, want ErrOverPrivileged", err)
+	}
+	if a.checks != 2 || b.checks != 2 {
+		t.Fatalf("checks = %d, %d", a.checks, b.checks)
+	}
+	want := map[string]HealthStatus{"rollout-main": HealthOverPrivileged, "eso-main": HealthDegraded}
+	for _, h := range r.Health() {
+		if h.Status != want[h.Connector] {
+			t.Fatalf("%s = %s, want %s", h.Connector, h.Status, want[h.Connector])
+		}
+	}
+}
+
+// TestRegistry_ObserveRefusesUnverified: nothing is read through a
+// connector whose last self-check did not prove that its credential
+// cannot read Secrets, or that has not been checked yet. A later passing
+// check lifts the refusal; Verified follows the same state.
+func TestRegistry_ObserveRefusesUnverified(t *testing.T) {
+	var proven bool
+	called := 0
+	c := &fakeConnector{name: "rollout-main", kind: KindRollout,
+		check: func() error {
+			if proven {
+				return nil
+			}
+			return fmt.Errorf("rules review failed: %w", ErrPrivilegeUnproven)
+		},
+		obs: func(tg Target) (Observation, error) {
+			called++
+			return Observation{Connector: "rollout-main", Kind: KindRollout, TargetID: tg.ID, Stage: tg.Stage, Outcome: OutcomeObserved, ObservedAt: time.Now()}, nil
+		}}
+	other := &fakeConnector{name: "eso-main", kind: KindESO}
+	r, err := NewRegistry(c, other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	tg := Target{ID: "payments-api", Stage: StageWorkloadRollout}
+	observe := func(when string, wantRefused bool) {
+		t.Helper()
+		_, err := r.Observe(ctx, "rollout-main", tg)
+		if wantRefused != errors.Is(err, ErrConnectorUnverified) {
+			t.Fatalf("%s: Observe err = %v, want refused=%v", when, err, wantRefused)
+		}
+	}
+	observe("before any check", true)
+	if r.Verified() {
+		t.Fatal("verified before any check")
+	}
+	if err := r.Check(ctx, time.Second); !errors.Is(err, ErrPrivilegeUnproven) {
+		t.Fatalf("Check = %v", err)
+	}
+	observe("after an unproven boot check", true)
+	if err := r.RecheckAll(ctx, time.Second); err != nil {
+		t.Fatalf("RecheckAll = %v", err)
+	}
+	observe("after an unproven recheck", true)
+	if r.Verified() {
+		t.Fatal("verified with an unproven connector")
+	}
+	// The other connector passed and is still observable.
+	if _, err := r.Observe(ctx, "eso-main", Target{ID: "payments-api", Stage: StageESOSync}); err != nil {
+		t.Fatalf("passing connector refused: %v", err)
+	}
+	if called != 0 {
+		t.Fatalf("unverified connector read %d times", called)
+	}
+	proven = true
+	if err := r.Recheck(ctx, time.Second); err != nil {
+		t.Fatalf("Recheck = %v", err)
+	}
+	observe("after a passing recheck", false)
+	if !r.Verified() || called != 1 {
+		t.Fatalf("verified=%v called=%d after a passing recheck", r.Verified(), called)
+	}
+	// A recheck that finds over-privilege refuses again, for good.
+	c.check = func() error { return ErrOverPrivileged }
+	if err := r.RecheckAll(ctx, time.Second); !errors.Is(err, ErrOverPrivileged) {
+		t.Fatalf("RecheckAll = %v", err)
+	}
+	observe("after over-privilege", true)
+	if r.Verified() {
+		t.Fatal("verified with an over-privileged connector")
 	}
 }

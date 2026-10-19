@@ -52,6 +52,10 @@ type Connectors interface {
 	Catalog() []connectors.CatalogEntry
 	Health() []connectors.Health
 	Recheck(ctx context.Context, timeout time.Duration) error
+	RecheckAll(ctx context.Context, timeout time.Duration) error
+	// Verified reports whether every connector's last self-check proved
+	// that its credential cannot read Secrets.
+	Verified() bool
 }
 
 // Readiness is the readiness gate (*local.Probes).
@@ -71,6 +75,9 @@ const (
 	DefaultDrainTimeout      = 10 * time.Second
 	DefaultCallTimeout       = 10 * time.Second
 	DefaultMinStageBudget    = time.Second
+	// DefaultPrivilegeRecheckInterval is how often every connector's
+	// self-check, including the over-privilege check, is run again.
+	DefaultPrivilegeRecheckInterval = 5 * time.Minute
 
 	maxBackoff          = 60 * time.Second
 	minHeartbeatSeconds = 5
@@ -110,6 +117,11 @@ type Config struct {
 	// MinStageBudget: a stage is not started with less time than this
 	// left in the pass.
 	MinStageBudget time.Duration
+	// PrivilegeRecheckInterval is how often the self-check of every
+	// connector is run again, including connectors whose last check
+	// passed, so a Secrets grant added after start is found. Connectors
+	// whose last check failed are rechecked before every heartbeat.
+	PrivilegeRecheckInterval time.Duration
 	// ResultRetry is the wait before each retry of a result post after a
 	// network error or a 5xx. Default 1s, 2s, 4s.
 	ResultRetry []time.Duration
@@ -138,6 +150,11 @@ type Loop struct {
 	haltOnce   sync.Once
 	halted     chan struct{}
 	haltReason atomic.Value // string
+	// cpMu orders the heartbeat, catalog and claim calls against halt.
+	// Each of those calls holds it shared from its halted check until
+	// its response is read; halt takes it exclusively. So once Halted
+	// reports true, none of them is in flight and none starts.
+	cpMu sync.RWMutex
 
 	claimGate     chan struct{} // closed once a heartbeat and the catalog are accepted
 	claimGateOnce sync.Once
@@ -149,6 +166,10 @@ type Loop struct {
 	catalogAccepted atomic.Bool
 	heartbeatFresh  atomic.Bool
 }
+
+// errHalted: a call was not sent because the control plane has refused
+// this Gateway.
+var errHalted = errors.New("loop: halted")
 
 // ErrInvalidConfig is returned by New.
 var ErrInvalidConfig = errors.New("loop: invalid config")
@@ -181,6 +202,7 @@ func New(cfg Config) (*Loop, error) {
 	def(&cfg.DrainTimeout, DefaultDrainTimeout)
 	def(&cfg.CallTimeout, DefaultCallTimeout)
 	def(&cfg.MinStageBudget, DefaultMinStageBudget)
+	def(&cfg.PrivilegeRecheckInterval, DefaultPrivilegeRecheckInterval)
 	if cfg.ClaimIdleMax < cfg.ClaimInterval {
 		cfg.ClaimIdleMax = cfg.ClaimInterval
 	}
@@ -305,10 +327,25 @@ func (l *Loop) fail(err error) {
 // halt stops claiming for good and keeps the process up and not ready.
 func (l *Loop) halt(reason string) {
 	l.haltOnce.Do(func() {
+		l.cpMu.Lock()
+		defer l.cpMu.Unlock()
 		l.haltReason.Store(reason)
 		l.cfg.Ready.SetReady(false)
 		close(l.halted)
 	})
+}
+
+// unlessHalted runs call, a heartbeat, catalog or claim call, unless the
+// control plane has refused this Gateway. It reports whether call ran.
+// call must not call halt.
+func (l *Loop) unlessHalted(call func()) bool {
+	l.cpMu.RLock()
+	defer l.cpMu.RUnlock()
+	if l.isHalted() {
+		return false
+	}
+	call()
+	return true
 }
 
 func (l *Loop) isHalted() bool {
@@ -400,7 +437,11 @@ func CatalogFor(c Connectors) client.Catalog {
 func (l *Loop) uploadCatalog(ctx context.Context) error {
 	callCtx, cancel := context.WithTimeout(ctx, l.cfg.CallTimeout)
 	defer cancel()
-	resp, err := l.cfg.CP.PutCatalog(callCtx, CatalogFor(l.cfg.Connectors))
+	var resp *client.CatalogResponse
+	var err error
+	if !l.unlessHalted(func() { resp, err = l.cfg.CP.PutCatalog(callCtx, CatalogFor(l.cfg.Connectors)) }) {
+		return errHalted
+	}
 	if err != nil {
 		l.m.catalog("error")
 		return err
@@ -421,21 +462,43 @@ func (l *Loop) catVersion() string {
 func (l *Loop) heartbeatLoop(ctx context.Context) {
 	interval := l.cfg.HeartbeatInterval
 	backoff := time.Second
+	// The boot self-check ran just before the loop started.
+	lastFull := l.startedAt
 	for {
 		// Self-checks that did not pass are retried before each
-		// heartbeat, so the reported health is current.
-		if err := l.cfg.Connectors.Recheck(ctx, l.cfg.CallTimeout); errors.Is(err, connectors.ErrOverPrivileged) {
+		// heartbeat, so the reported health is current. Every
+		// PrivilegeRecheckInterval all connectors are checked again,
+		// including those that passed, so a Secrets grant added after
+		// start is found.
+		recheck := l.cfg.Connectors.Recheck
+		if now := l.cfg.Now(); now.Sub(lastFull) >= l.cfg.PrivilegeRecheckInterval {
+			recheck = l.cfg.Connectors.RecheckAll
+			lastFull = now
+		}
+		err := recheck(ctx, l.cfg.CallTimeout)
+		if errors.Is(err, connectors.ErrOverPrivileged) {
+			l.cfg.Ready.SetReady(false)
+			l.log.Error("connector self-check found an over-privileged credential; not ready, claiming stopped, gateway stopping",
+				"error", err)
 			l.reportOverPrivileged()
 			l.fail(err)
 			return
 		}
+		l.updateReady()
 		status := client.ReplicaOK
 		if !l.connectorsHealthy() {
 			status = client.ReplicaDegraded
 		}
-		callCtx, cancel := context.WithTimeout(ctx, l.cfg.CallTimeout)
-		resp, err := l.cfg.CP.Heartbeat(callCtx, l.heartbeatRequest(status))
+		// The call is not cancelled by shutdown: Run waits for its answer
+		// before it sends the shutting_down heartbeat, so the control
+		// plane never takes an ok heartbeat after shutting_down.
+		callCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), l.cfg.CallTimeout)
+		var resp *client.HeartbeatResponse
+		sent := l.unlessHalted(func() { resp, err = l.cfg.CP.Heartbeat(callCtx, l.heartbeatRequest(status)) })
 		cancel()
+		if !sent {
+			return
+		}
 		var wait time.Duration
 		switch {
 		case err == nil:
@@ -448,6 +511,9 @@ func (l *Loop) heartbeatLoop(ctx context.Context) {
 			wait = l.cfg.Jitter(interval, 0.9, 1.1)
 			if !l.catalogAccepted.Load() || resp.CatalogVersion != l.catVersion() {
 				if cerr := l.uploadCatalog(ctx); cerr != nil {
+					if errors.Is(cerr, errHalted) {
+						return
+					}
 					if errors.Is(cerr, client.ErrUnauthorized) {
 						l.halt(haltUnauthorized)
 						return
@@ -529,9 +595,26 @@ func (l *Loop) claimLoop(runCtx, workCtx context.Context) {
 	}
 	base := l.cfg.ClaimInterval
 	interval := base
+	paused := false
 	for {
 		if !sleepCtx(runCtx, l.cfg.Jitter(interval, 0.5, 1.5)) {
 			return
+		}
+		// Fail closed: while a recheck has not proven that every
+		// connector's credential cannot read Secrets, claim nothing. Not
+		// ready alone does not stop work in a pod that is not behind a
+		// Service. Claiming resumes after a passing recheck.
+		if !l.cfg.Connectors.Verified() {
+			if !paused {
+				paused = true
+				l.log.Warn("a connector self-check has not proven the credential cannot read secrets; claiming paused")
+			}
+			interval = base
+			continue
+		}
+		if paused {
+			paused = false
+			l.log.Info("connector self-checks passed; claiming resumed")
 		}
 		select {
 		case l.sem <- struct{}{}:
@@ -539,8 +622,14 @@ func (l *Loop) claimLoop(runCtx, workCtx context.Context) {
 			continue // all slots busy; try again next tick
 		}
 		callCtx, cancel := context.WithTimeout(runCtx, l.cfg.CallTimeout)
-		res, err := l.cfg.CP.Claim(callCtx, l.cfg.ReplicaID)
+		var res *client.ClaimResult
+		var err error
+		claimed := l.unlessHalted(func() { res, err = l.cfg.CP.Claim(callCtx, l.cfg.ReplicaID) })
 		cancel()
+		if !claimed {
+			<-l.sem
+			return
+		}
 		if err != nil || (res.Task == nil && res.Invalid == nil) {
 			<-l.sem
 		}

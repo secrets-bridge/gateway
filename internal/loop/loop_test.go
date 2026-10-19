@@ -722,3 +722,176 @@ func TestNewReplicaID(t *testing.T) {
 		t.Fatalf("replica ids %q %q", a, b)
 	}
 }
+
+// TestLoop_OverPrivilegeAddedAfterStart: a connector that passed its
+// self-check is checked again every PrivilegeRecheckInterval. A Secrets
+// grant added after start makes the replica not ready, stops claiming,
+// reports over_privileged and logs the reason.
+func TestLoop_OverPrivilegeAddedAfterStart(t *testing.T) {
+	var granted atomic.Bool
+	var checks atomic.Int32
+	rollout := okConn("rollout-main", connectors.KindRollout)
+	rollout.check = func() error {
+		checks.Add(1)
+		if granted.Load() {
+			return fmt.Errorf("can patch secrets: %w", connectors.ErrOverPrivileged)
+		}
+		return nil
+	}
+	h := newHarness(t, func(c *Config) { c.PrivilegeRecheckInterval = 20 * time.Millisecond },
+		okConn("eso-main", connectors.KindESO), rollout)
+	h.start()
+	waitFor(t, "ready and claiming", func() bool { return h.ready.ready.Load() && h.cp.snapshot().claimCalls > 0 })
+	// Passing connectors are checked again, not only the failed ones.
+	before := checks.Load()
+	waitFor(t, "periodic recheck of a passing connector", func() bool { return checks.Load() > before+1 })
+
+	granted.Store(true)
+	select {
+	case err := <-h.done:
+		h.done <- err
+		if !errors.Is(err, connectors.ErrOverPrivileged) {
+			t.Fatalf("Run err = %v, want ErrOverPrivileged", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("loop kept running after a Secrets grant was added")
+	}
+	if h.ready.ready.Load() {
+		t.Fatal("ready with an over-privileged connector")
+	}
+	claims := h.cp.snapshot().claimCalls
+	time.Sleep(100 * time.Millisecond)
+	snap := h.cp.snapshot()
+	if snap.claimCalls != claims {
+		t.Fatalf("claiming continued: %d then %d", claims, snap.claimCalls)
+	}
+	if len(snap.heartbeats) == 0 || snap.heartbeats[len(snap.heartbeats)-1]["status"] != "over_privileged" {
+		t.Fatalf("last heartbeat = %v", snap.heartbeats[len(snap.heartbeats)-1])
+	}
+	logs := h.logs.String()
+	if !strings.Contains(logs, "over-privileged credential") || !strings.Contains(logs, "rollout-main") {
+		t.Fatalf("reason not logged: %s", logs)
+	}
+}
+
+// With the default interval a passing connector is not checked before
+// every heartbeat.
+func TestLoop_PassingConnectorNotRecheckedEveryHeartbeat(t *testing.T) {
+	var checks atomic.Int32
+	rollout := okConn("rollout-main", connectors.KindRollout)
+	rollout.check = func() error { checks.Add(1); return nil }
+	h := newHarness(t, nil, okConn("eso-main", connectors.KindESO), rollout)
+	h.start()
+	waitFor(t, "ready", func() bool { return h.ready.ready.Load() })
+	waitFor(t, "several heartbeats", func() bool { return len(h.cp.snapshot().heartbeats) > 5 })
+	if n := checks.Load(); n != 1 {
+		t.Fatalf("passing connector checked %d times, want 1", n)
+	}
+}
+
+// TestLoop_UnverifiedConnectorStopsWork: when a periodic recheck cannot
+// prove that a connector's credential cannot read Secrets (a review call
+// failed), the replica turns not ready, stops claiming and refuses to
+// observe through that connector. Not ready alone does not stop work in
+// a pod that is not behind a Service. A later passing recheck resumes
+// claiming.
+func TestLoop_UnverifiedConnectorStopsWork(t *testing.T) {
+	var unproven atomic.Bool
+	rollout := okConn("rollout-main", connectors.KindRollout)
+	rollout.check = func() error {
+		if unproven.Load() {
+			return fmt.Errorf("rules review failed: %w", connectors.ErrPrivilegeUnproven)
+		}
+		return nil
+	}
+	h := newHarness(t, func(c *Config) { c.PrivilegeRecheckInterval = 10 * time.Millisecond },
+		okConn("eso-main", connectors.KindESO), rollout)
+	h.start()
+	waitFor(t, "ready and claiming", func() bool { return h.ready.ready.Load() && h.cp.snapshot().claimCalls > 2 })
+
+	unproven.Store(true)
+	waitFor(t, "not ready after a failing recheck", func() bool { return !h.ready.ready.Load() })
+	before := h.cp.snapshot().claimCalls
+	// A task queued now must not be claimed while the connector is
+	// unverified.
+	h.cp.push(taskBody(t, taskOpts{n: 1, refs: []contract.ConnectorRef{
+		{ConnectorID: "rollout-main", TargetID: "payments-api", Stage: contract.StageWorkloadRollout},
+	}}))
+	time.Sleep(300 * time.Millisecond)
+	after := h.cp.snapshot()
+	// One claim may have been in flight when readiness dropped.
+	if after.claimCalls > before+1 {
+		t.Fatalf("claiming continued while unverified: %d -> %d claim calls", before, after.claimCalls)
+	}
+	if len(after.results) != 0 {
+		t.Fatalf("a task was run while unverified: %d results", len(after.results))
+	}
+	if h.ready.ready.Load() {
+		t.Fatal("ready with an unverified connector")
+	}
+	calls := rollout.calls.Load()
+	_, err := h.loop.cfg.Connectors.Observe(context.Background(), "rollout-main",
+		connectors.Target{ID: "payments-api", Stage: contract.StageWorkloadRollout})
+	if !errors.Is(err, connectors.ErrConnectorUnverified) {
+		t.Fatalf("Observe through an unverified connector: err = %v, want ErrConnectorUnverified", err)
+	}
+	if rollout.calls.Load() != calls {
+		t.Fatal("the unverified connector was read")
+	}
+	if !strings.Contains(h.logs.String(), "claiming paused") {
+		t.Fatal("pause not logged")
+	}
+
+	unproven.Store(false)
+	waitFor(t, "ready again after a passing recheck", h.ready.ready.Load)
+	res := decodeResult(t, h.waitResults(1)[0])
+	if res["attempt_status"] != "completed" || rollout.calls.Load() != calls+1 {
+		t.Fatalf("result after resume = %v (rollout calls %d)", res, rollout.calls.Load())
+	}
+	if h.cp.snapshot().claimCalls <= after.claimCalls {
+		t.Fatal("claiming did not resume")
+	}
+}
+
+// TestLoop_NoHeartbeatAfterShuttingDown: a regular heartbeat in flight at
+// shutdown is answered before shutting_down is sent, so the control plane
+// never takes an ok heartbeat after shutting_down.
+func TestLoop_NoHeartbeatAfterShuttingDown(t *testing.T) {
+	h := newHarness(t, nil)
+	h.start()
+	waitFor(t, "ready", h.ready.ready.Load)
+	h.cp.mu.Lock()
+	h.cp.hbDelay = 300 * time.Millisecond
+	h.cp.mu.Unlock()
+	time.Sleep(50 * time.Millisecond) // a delayed heartbeat is in flight
+	if err := h.stop(); err != nil {
+		t.Fatal(err)
+	}
+	// Give a heartbeat the loop gave up on time to land.
+	time.Sleep(400 * time.Millisecond)
+	hbs := h.cp.snapshot().heartbeats
+	if last := hbs[len(hbs)-1]["status"]; last != "shutting_down" {
+		t.Fatalf("last heartbeat = %v, want shutting_down", last)
+	}
+}
+
+// TestLoop_NoHeartbeatAfterHalt: once the control plane has refused the
+// Gateway (a claim answered 401 while a heartbeat is in flight), no
+// heartbeat or claim reaches the control plane after Halted reports true.
+func TestLoop_NoHeartbeatAfterHalt(t *testing.T) {
+	h := newHarness(t, nil)
+	h.cp.claimReply = []reply{{status: 204}, {status: 204}, {status: 401}}
+	h.start()
+	waitFor(t, "ready", h.ready.ready.Load)
+	h.cp.mu.Lock()
+	h.cp.hbDelay = 200 * time.Millisecond
+	h.cp.mu.Unlock()
+	waitFor(t, "halt", h.loop.Halted)
+	before := h.cp.snapshot()
+	time.Sleep(400 * time.Millisecond)
+	after := h.cp.snapshot()
+	if after.claimCalls != before.claimCalls || len(after.heartbeats) != len(before.heartbeats) {
+		t.Fatalf("calls reached the control plane after the halt: claims %d -> %d, heartbeats %d -> %d",
+			before.claimCalls, after.claimCalls, len(before.heartbeats), len(after.heartbeats))
+	}
+}

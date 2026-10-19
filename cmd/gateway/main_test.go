@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -319,7 +320,7 @@ func TestSetup_OverPrivilegedRefusesBoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	orig := connectorFactories
-	connectorFactories = func() connectors.Factories {
+	connectorFactories = func(Config, func(string) (string, bool), *slog.Logger) connectors.Factories {
 		return connectors.Factories{connectors.KindRollout: func(name string, _ json.RawMessage) (connectors.Connector, error) {
 			return overPrivConn{name: name}, nil
 		}}
@@ -336,9 +337,51 @@ func TestSetup_OverPrivilegedRefusesBoot(t *testing.T) {
 	}
 }
 
+// unprovenConn is a connector whose self-check could not prove it cannot
+// read Secrets (a review call failed).
+type unprovenConn struct{ overPrivConn }
+
+func (unprovenConn) Check(context.Context) error {
+	return fmt.Errorf("rules review failed: %w", connectors.ErrPrivilegeUnproven)
+}
+
+// TestSetup_UnprovenSelfCheckRefusesBoot: the self-check fails closed. A
+// failed review call refuses the boot; nothing overrides it.
+func TestSetup_UnprovenSelfCheckRefusesBoot(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "connectors.json")
+	if err := os.WriteFile(file, []byte(`[{"name":"rollout-main","kind":"rollout"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	orig := connectorFactories
+	connectorFactories = func(Config, func(string) (string, bool), *slog.Logger) connectors.Factories {
+		return connectors.Factories{connectors.KindRollout: func(name string, _ json.RawMessage) (connectors.Connector, error) {
+			return unprovenConn{overPrivConn{name: name}}, nil
+		}}
+	}
+	t.Cleanup(func() { connectorFactories = orig })
+	f := newFixture(t)
+	f.cfg.ConnectorsFile = file
+	_, err := f.setup()
+	if !errors.Is(err, connectors.ErrPrivilegeUnproven) || !strings.Contains(err.Error(), "refusing to start") {
+		t.Fatalf("setup err = %v, want a fail-closed refusal", err)
+	}
+	if f.cpHits.Load() != 0 {
+		t.Fatal("control plane was called before the refusal")
+	}
+}
+
 func TestSetup_Refusals(t *testing.T) {
 	dir := t.TempDir()
-	esoFile := filepath.Join(dir, "connectors.json")
+	argoFile := filepath.Join(dir, "connectors.json")
+	if err := os.WriteFile(argoFile, []byte(`[{"name":"argocd-main","kind":"argocd","settings":{"namespaces":["tenant-a-uat"]}}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rolloutFile := filepath.Join(dir, "rollout.json")
+	if err := os.WriteFile(rolloutFile, []byte(`[{"name":"rollout-main","kind":"rollout","settings":{"namespaces":["tenant-a-uat"]}}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	esoFile := filepath.Join(dir, "eso.json")
 	if err := os.WriteFile(esoFile, []byte(`[{"name":"eso-main","kind":"eso","settings":{"namespaces":["tenant-a-uat"]}}]`), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -360,7 +403,9 @@ func TestSetup_Refusals(t *testing.T) {
 		{"missing CA file", func(f *bootFixture) { f.cfg.CAFile = filepath.Join(dir, "absent.pem") }, "CA file"},
 		{"no identity", func(f *bootFixture) { f.env = envMap(nil); f.cfg.IdentityFile = "" }, "no credential"},
 		{"loose identity file", func(f *bootFixture) { f.env = envMap(nil); f.cfg.IdentityFile = looseID }, "not be readable by other users"},
-		{"connector kind not in this build", func(f *bootFixture) { f.cfg.ConnectorsFile = esoFile }, "not supported by this build"},
+		{"connector kind not in this build", func(f *bootFixture) { f.cfg.ConnectorsFile = argoFile }, "not supported by this build"},
+		{"rollout outside a cluster without a server", func(f *bootFixture) { f.cfg.ConnectorsFile = rolloutFile }, "not running in a cluster"},
+		{"eso outside a cluster without a server", func(f *bootFixture) { f.cfg.ConnectorsFile = esoFile }, "not running in a cluster"},
 		{"gateway id is not a uuid", func(f *bootFixture) {
 			f.env = envMap(map[string]string{"SB_GATEWAY_ID": "gw-tenant-a-uat", "SB_GATEWAY_SECRET": testSecret})
 		}, "UUID"},

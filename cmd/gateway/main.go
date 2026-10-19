@@ -40,6 +40,9 @@ import (
 
 	"github.com/secrets-bridge/gateway/internal/client"
 	"github.com/secrets-bridge/gateway/internal/connectors"
+	"github.com/secrets-bridge/gateway/internal/connectors/eso"
+	"github.com/secrets-bridge/gateway/internal/connectors/kubeconn"
+	"github.com/secrets-bridge/gateway/internal/connectors/rollout"
 	"github.com/secrets-bridge/gateway/internal/contract"
 	"github.com/secrets-bridge/gateway/internal/identity"
 	"github.com/secrets-bridge/gateway/internal/local"
@@ -118,10 +121,16 @@ func gatewayVersion() string {
 	return "0.0.0-dev"
 }
 
-// connectorFactories lists the connector kinds this build can run.
-// Connectors are added kind by kind; until then a connectors file that
-// names a kind is refused at boot. A variable so tests can bind fakes.
-var connectorFactories = func() connectors.Factories { return connectors.Factories{} }
+// connectorFactories lists the connector kinds this build can run. A
+// connectors file that names any other kind is refused at boot. A
+// variable so tests can bind fakes.
+var connectorFactories = func(cfg Config, getenv func(string) (string, bool), logger *slog.Logger) connectors.Factories {
+	kopts := kubeconn.Options{InsecureTransport: cfg.InsecureTransport, Getenv: getenv, Logger: logger}
+	return connectors.Factories{
+		connectors.KindESO:     eso.Factory(kopts),
+		connectors.KindRollout: rollout.Factory(kopts),
+	}
+}
 
 // selfCheckTimeout bounds each connector self-check at boot.
 const selfCheckTimeout = 10 * time.Second
@@ -193,7 +202,7 @@ func setup(cfg Config, getenv func(string) (string, bool), logger *slog.Logger, 
 	}
 	logger.Info("identity loaded", "source", string(src), "gateway_id", id.GatewayID)
 
-	registry, err := connectors.LoadFile(cfg.ConnectorsFile, connectorFactories())
+	registry, err := connectors.LoadFile(cfg.ConnectorsFile, connectorFactories(cfg, getenv, logger))
 	if err != nil {
 		return nil, err
 	}
@@ -208,6 +217,9 @@ func setup(cfg Config, getenv func(string) (string, bool), logger *slog.Logger, 
 	if err := registry.Check(context.Background(), selfCheckTimeout); err != nil {
 		if errors.Is(err, connectors.ErrOverPrivileged) {
 			return nil, fmt.Errorf("refusing to start: %w; remove every verb on secrets (and any write) from the gateway's RBAC", err)
+		}
+		if errors.Is(err, connectors.ErrPrivilegeUnproven) {
+			return nil, fmt.Errorf("refusing to start: %w; the self-check fails closed when a review call fails", err)
 		}
 		return nil, err
 	}

@@ -1,17 +1,22 @@
 # Example RBAC for the Gateway's Kubernetes rollout connector.
 #
-# Default: one Role and RoleBinding per namespace listed in the
-# connector's "namespaces" setting. Every read is a GET of a Deployment
-# by name and a label-selected LIST of ReplicaSets, so these are the only
-# verbs granted. No watch, no pods, no events and no secrets in any form:
-# a GET on a Secret returns its data.
+# Namespaced only: one Role and one RoleBinding per namespace listed in
+# the connectors' "namespaces" setting. There is no cluster-scoped
+# variant (ADR 0001 section 11): a cluster-wide get on Deployments would
+# expose every env[].value literal in the cluster.
 #
-# The ExternalSecret status rule is not part of this build. The Gateway
-# ships no ESO connector yet.
+# Every read is a GET of a Deployment by name or a
+# label-selected LIST of ReplicaSets, so these are the only verbs
+# granted. No watch, no pods, no events and no secrets in any form: a
+# GET on a Secret returns its data. If the service account can get, list
+# or watch secrets in an allowed namespace, the Gateway refuses to start.
+# SelfSubjectAccessReview and SelfSubjectRulesReview creation, which the
+# boot self-check uses, needs no rule here (system:basic-user).
 #
 # internal/kube/rbac_example_test.go parses this file and fails on any
-# secrets resource, wildcard or write verb. Keep the rules in flow style
-# (one rule per line group, lists in [...]) so the test can read them.
+# cluster-scoped kind, any secrets resource, wildcard or write verb. Keep
+# the rules in flow style (one rule per line group, lists in [...]) so
+# the test can read them.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -33,34 +38,6 @@ metadata:
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: secrets-bridge-gateway-read
-subjects:
-  - kind: ServiceAccount
-    name: secrets-bridge-gateway
-    namespace: secrets-bridge-gateway
----
-# Optional cluster scope. The same rules in a ClusterRole. The
-# connector's namespace allowlist still applies, so this only widens what
-# RBAC would permit, not what the Gateway reads. Prefer the Role above.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: secrets-bridge-gateway-read
-rules:
-  - apiGroups: ["apps"]
-    resources: ["deployments"]
-    verbs: ["get"]
-  - apiGroups: ["apps"]
-    resources: ["replicasets"]
-    verbs: ["list"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: secrets-bridge-gateway-read
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
   name: secrets-bridge-gateway-read
 subjects:
   - kind: ServiceAccount

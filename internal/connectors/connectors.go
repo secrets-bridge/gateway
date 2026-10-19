@@ -238,6 +238,12 @@ var (
 	// read (any verb on Kubernetes secrets, or a write). The Gateway
 	// refuses to start; there is no override (ADR 0001 section 11).
 	ErrOverPrivileged = errors.New("connectors: credential is over-privileged")
+	// ErrPrivilegeUnproven: the self-check could not prove that the
+	// credential cannot read Kubernetes Secrets (a review call failed,
+	// or a rules review was incomplete with no access review answer).
+	// The check fails closed: at boot the Gateway refuses to start, and
+	// later the connector stays not ready.
+	ErrPrivilegeUnproven = errors.New("connectors: self-check could not prove the credential cannot read secrets")
 	// ErrCheckUnauthorized: the integration refused the credential.
 	ErrCheckUnauthorized = errors.New("connectors: credential refused by the integration")
 	// ErrCheckUnreachable: the integration could not be reached.
@@ -407,7 +413,8 @@ func (r *Registry) Catalog() []CatalogEntry {
 
 // Check runs every connector's self-check, each bounded by timeout, and
 // records the results. It returns ErrOverPrivileged if any connector is
-// over-privileged.
+// over-privileged, and otherwise ErrPrivilegeUnproven if any connector
+// could not prove it cannot read Secrets: both refuse the boot.
 func (r *Registry) Check(ctx context.Context, timeout time.Duration) error {
 	return r.check(ctx, timeout, false)
 }
@@ -419,7 +426,7 @@ func (r *Registry) Recheck(ctx context.Context, timeout time.Duration) error {
 }
 
 func (r *Registry) check(ctx context.Context, timeout time.Duration, onlyFailed bool) error {
-	var over error
+	var over, unproven error
 	for _, n := range r.Names() {
 		r.mu.Lock()
 		last := r.health[n]
@@ -434,8 +441,16 @@ func (r *Registry) check(ctx context.Context, timeout time.Duration, onlyFailed 
 			continue
 		}
 		cctx, cancel := context.WithTimeout(ctx, timeout)
-		st := healthFor(r.byName[n].Check(cctx))
+		cerr := r.byName[n].Check(cctx)
+		st := healthFor(cerr)
 		cancel()
+		if st != HealthOverPrivileged && errors.Is(cerr, ErrPrivilegeUnproven) {
+			// Fail closed: not ready, and at boot not started.
+			st = HealthDegraded
+			if unproven == nil {
+				unproven = fmt.Errorf("%w: connector %q", ErrPrivilegeUnproven, n)
+			}
+		}
 		r.mu.Lock()
 		r.health[n] = st
 		r.mu.Unlock()
@@ -443,7 +458,15 @@ func (r *Registry) check(ctx context.Context, timeout time.Duration, onlyFailed 
 			over = fmt.Errorf("%w: connector %q", ErrOverPrivileged, n)
 		}
 	}
-	return over
+	if over != nil {
+		return over
+	}
+	if !onlyFailed {
+		// At boot an unproven check refuses the start. A recheck leaves
+		// the connector degraded, so the replica stays not ready.
+		return unproven
+	}
+	return nil
 }
 
 // Health returns the last self-check status of every connector, sorted

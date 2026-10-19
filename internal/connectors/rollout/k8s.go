@@ -21,18 +21,21 @@ type condition struct {
 
 type deployment struct {
 	Metadata struct {
-		UID         string      `json:"uid"`
-		Generation  int64       `json:"generation"`
-		Annotations annotations `json:"annotations"`
+		UID             string      `json:"uid"`
+		ResourceVersion string      `json:"resourceVersion"`
+		Generation      int64       `json:"generation"`
+		Annotations     annotations `json:"annotations"`
 	} `json:"metadata"`
 	Spec struct {
-		Replicas *int64        `json:"replicas"`
-		Paused   bool          `json:"paused"`
-		Selector labelSelector `json:"selector"`
-		Template struct {
+		Replicas                *int64        `json:"replicas"`
+		Paused                  bool          `json:"paused"`
+		ProgressDeadlineSeconds *int64        `json:"progressDeadlineSeconds"`
+		Selector                labelSelector `json:"selector"`
+		Template                struct {
 			Metadata struct {
 				Annotations annotations `json:"annotations"`
 			} `json:"metadata"`
+			Spec podSpec `json:"spec"`
 		} `json:"template"`
 	} `json:"spec"`
 	Status struct {
@@ -44,6 +47,125 @@ type deployment struct {
 		UnavailableReplicas int64       `json:"unavailableReplicas"`
 		Conditions          []condition `json:"conditions"`
 	} `json:"status"`
+}
+
+// podSpec holds only the Secret names the pod template references and
+// whether a mount uses subPath. env[].value, args, command, images and
+// every other field are not declared, so they are never decoded.
+type podSpec struct {
+	Containers     []container `json:"containers"`
+	InitContainers []container `json:"initContainers"`
+	Volumes        []volume    `json:"volumes"`
+}
+
+type container struct {
+	EnvFrom []struct {
+		SecretRef *struct {
+			Name string `json:"name"`
+		} `json:"secretRef"`
+	} `json:"envFrom"`
+	Env []struct {
+		ValueFrom *struct {
+			SecretKeyRef *struct {
+				Name string `json:"name"`
+			} `json:"secretKeyRef"`
+		} `json:"valueFrom"`
+	} `json:"env"`
+	VolumeMounts []struct {
+		Name        string   `json:"name"`
+		SubPath     presence `json:"subPath"`
+		SubPathExpr presence `json:"subPathExpr"`
+	} `json:"volumeMounts"`
+}
+
+type volume struct {
+	Name   string `json:"name"`
+	Secret *struct {
+		SecretName string `json:"secretName"`
+	} `json:"secret"`
+	Projected *struct {
+		Sources []struct {
+			Secret *struct {
+				Name string `json:"name"`
+			} `json:"secret"`
+		} `json:"sources"`
+	} `json:"projected"`
+}
+
+// presence records that a string field is set and non-empty, and drops
+// its value.
+type presence bool
+
+func (p *presence) UnmarshalJSON(b []byte) error {
+	var s string
+	if json.Unmarshal(b, &s) == nil && s != "" {
+		*p = true
+	}
+	return nil
+}
+
+// Consumption modes (evidence schema rolloutFacts.consumption_mode).
+const (
+	modeEnv           = "env"
+	modeVolume        = "volume"
+	modeSubpathVolume = "subpath_volume"
+	modeMixed         = "mixed"
+	modeNotReferenced = "not_referenced"
+	modeUnknown       = "unknown"
+)
+
+// consumptionMode compares the Secret names the pod template references
+// with target, the ExternalSecret spec.target.name read in the same
+// pass. Names are compared here and never reported.
+func (p podSpec) consumptionMode(target string) string {
+	if target == "" {
+		return modeUnknown
+	}
+	env := false
+	vols := map[string]bool{}
+	for _, v := range p.Volumes {
+		if v.Secret != nil && v.Secret.SecretName == target {
+			vols[v.Name] = true
+		}
+		if v.Projected != nil {
+			for _, src := range v.Projected.Sources {
+				if src.Secret != nil && src.Secret.Name == target {
+					vols[v.Name] = true
+				}
+			}
+		}
+	}
+	subpath := false
+	for _, c := range append(append([]container(nil), p.Containers...), p.InitContainers...) {
+		for _, ef := range c.EnvFrom {
+			if ef.SecretRef != nil && ef.SecretRef.Name == target {
+				env = true
+			}
+		}
+		for _, e := range c.Env {
+			if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil && e.ValueFrom.SecretKeyRef.Name == target {
+				env = true
+			}
+		}
+		for _, m := range c.VolumeMounts {
+			if vols[m.Name] && (bool(m.SubPath) || bool(m.SubPathExpr)) {
+				subpath = true
+			}
+		}
+	}
+	switch {
+	case subpath:
+		// A subPath mount never refreshes until the pod restarts, so it
+		// decides the mode even when env also references the Secret.
+		return modeSubpathVolume
+	case env && len(vols) > 0:
+		return modeMixed
+	case env:
+		return modeEnv
+	case len(vols) > 0:
+		return modeVolume
+	}
+	return modeNotReferenced
 }
 
 type ownerRef struct {
@@ -156,6 +278,9 @@ var (
 )
 
 const maxSelectorTerms = 32
+
+// resourceVersionPattern is the schema k8sResourceVersion pattern.
+var resourceVersionPattern = regexp.MustCompile(`^[0-9A-Za-z]{1,64}$`)
 
 // String renders the selector in the label-selector query syntax. It
 // returns false for an empty selector (which would match every

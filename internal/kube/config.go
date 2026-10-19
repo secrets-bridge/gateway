@@ -11,7 +11,7 @@ import (
 
 // Defaults.
 const (
-	DefaultTimeout      = 15 * time.Second
+	DefaultTimeout      = 5 * time.Second
 	DefaultMaxBodyBytes = 4 << 20
 	// DefaultTokenMaxAge bounds how long a token read from file is
 	// reused even when the file looks unchanged. Projected service
@@ -22,9 +22,8 @@ const (
 
 // Config describes how to reach one Kubernetes API server.
 type Config struct {
-	// Server is the API server base URL, https:// unless
-	// AllowInsecureHTTP. A path prefix (an API proxy) is allowed; query,
-	// fragment and userinfo are not.
+	// Server is the API server origin, https:// unless
+	// AllowInsecureHTTP. Path, query, fragment and userinfo are refused.
 	Server string
 	// CAFile, when set, is the only trust anchor for the server
 	// certificate. Empty means system roots.
@@ -37,12 +36,18 @@ type Config struct {
 	Timeout time.Duration
 	// MaxBodyBytes caps a response body. Zero means DefaultMaxBodyBytes.
 	MaxBodyBytes int64
+	// GET lists the path patterns this client may read (readonly.Policy
+	// syntax, "*" matches one segment). Required: a client reads only
+	// what its connector needs.
+	GET []string
+	// Query lists the query keys a GET may carry.
+	Query []string
 }
 
 // ServiceAccountDir is where the kubelet mounts the pod's service
 // account token and cluster CA.
 func ServiceAccountDir() string {
-	return filepath.Join("/var/run", "secrets", "kubernetes.io", "serviceaccount")
+	return "/var/run/secrets/kubernetes.io/serviceaccount"
 }
 
 // ErrNotInCluster is returned by InClusterConfig outside a pod.

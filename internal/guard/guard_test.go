@@ -336,6 +336,13 @@ var secretsLiteral = regexp.MustCompile(`(?i)(^|/)secrets(/|\?|$)`)
 // deny rule and the resource constant the boot self-check uses.
 var secretsAllowedDirs = []string{"internal/readonly/", "internal/guard/"}
 
+// allowedSecretsLiterals are exact literals that name a filesystem path,
+// never an API path: the kubelet mounts the pod's service account token
+// and CA there.
+var allowedSecretsLiterals = map[string]bool{
+	"/var/run/secrets/kubernetes.io/serviceaccount": true,
+}
+
 func secretsViolations(f *ast.File) []string {
 	var out []string
 	ast.Inspect(f, func(n ast.Node) bool {
@@ -348,7 +355,7 @@ func secretsViolations(f *ast.File) []string {
 			if err != nil {
 				s = v.Value
 			}
-			if secretsLiteral.MatchString(s) {
+			if secretsLiteral.MatchString(s) && !allowedSecretsLiterals[s] {
 				out = append(out, "string literal naming secrets")
 			}
 		case *ast.SelectorExpr:
@@ -368,6 +375,7 @@ func TestSecretsDetector(t *testing.T) {
 		"package x\nvar p = `/api/v1/secrets?watch=1`\n",
 		"package x\nvar p = \"/API/V1/SECRETS/\"\n",
 		"package x\nfunc f() { c.CoreV1().Secrets(ns) }\n",
+		"package x\nvar p = \"/var/run/secrets/kubernetes.io/serviceaccount/../../../api/v1/secrets\"\n",
 	}
 	for _, src := range bad {
 		if len(secretsViolations(parseSrc(t, src))) == 0 {

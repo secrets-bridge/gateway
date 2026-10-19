@@ -2,15 +2,12 @@ package kube
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
-	"net/url"
 	"regexp"
 
+	"github.com/secrets-bridge/gateway/internal/contract"
 	"github.com/secrets-bridge/gateway/internal/readonly"
 )
 
@@ -56,55 +53,48 @@ func ResourcePath(group, version, namespace, resource, name string) (string, err
 	if name != "" {
 		p += "/" + name
 	}
-	if readonly.DenyKubernetesSecrets(readonly.CleanPath(p)) {
+	if readonly.DenyKubernetesSecrets(p) {
 		return "", ErrPathDenied
 	}
 	return p, nil
 }
 
-// ErrorCode maps an error from Get to the evidence schema error code.
-func ErrorCode(err error) string {
+// ErrorCode maps an error from Get or Create to the evidence schema
+// error code.
+func ErrorCode(err error) contract.ErrorCode {
 	var se *StatusError
-	var ne net.Error
-	var ue *url.Error
-	var unknownCA x509.UnknownAuthorityError
-	var hostErr x509.HostnameError
-	var invalidCert x509.CertificateInvalidError
-	var verifyErr *tls.CertificateVerificationError
 	switch {
 	case err == nil:
 		return ""
 	case errors.As(err, &se):
 		switch se.Code {
 		case http.StatusUnauthorized:
-			return "connector_unauthorized"
+			return contract.ErrorConnectorUnauthorized
 		case http.StatusForbidden:
-			return "connector_forbidden"
+			return contract.ErrorConnectorForbidden
 		case http.StatusNotFound:
 			if se.Reason == "NotFound" {
-				return "resource_not_found"
+				return contract.ErrorResourceNotFound
 			}
-			return "api_version_not_served"
+			// A 404 without a NotFound Status body is the API server
+			// saying the group version is not served.
+			return contract.ErrorAPIVersionNotServed
 		case http.StatusTooManyRequests:
-			return "rate_limited"
+			return contract.ErrorRateLimited
 		case http.StatusRequestEntityTooLarge:
-			return "response_too_large"
+			return contract.ErrorResponseTooLarge
 		}
-		return "connector_unreachable"
+		return contract.ErrorConnectorUnreachable
 	case errors.Is(err, ErrResponseTooLarge):
-		return "response_too_large"
-	case errors.Is(err, context.DeadlineExceeded):
-		return "connector_timeout"
-	case errors.As(err, &unknownCA), errors.As(err, &hostErr), errors.As(err, &invalidCert), errors.As(err, &verifyErr):
-		return "tls_verification_failed"
+		return contract.ErrorResponseTooLarge
+	case errors.Is(err, ErrTimeout), errors.Is(err, context.DeadlineExceeded):
+		return contract.ErrorConnectorTimeout
+	case errors.Is(err, ErrTLS):
+		return contract.ErrorTLSVerificationFailed
 	case errors.Is(err, ErrTokenUnreadable), errors.Is(err, ErrTokenEmpty):
-		return "connector_unauthorized"
-	case errors.Is(err, ErrPathDenied), errors.Is(err, readonly.ErrMethodNotAllowed), errors.Is(err, ErrForeignHost):
-		return "internal"
-	case errors.As(err, &ne) && ne.Timeout():
-		return "connector_timeout"
-	case errors.As(err, &ue):
-		return "connector_unreachable"
+		return contract.ErrorConnectorUnauthorized
+	case errors.Is(err, ErrUnreachable):
+		return contract.ErrorConnectorUnreachable
 	}
-	return "internal"
+	return contract.ErrorInternal
 }

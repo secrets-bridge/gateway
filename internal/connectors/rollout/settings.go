@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"time"
 
 	"github.com/secrets-bridge/gateway/internal/connectors"
+	"github.com/secrets-bridge/gateway/internal/connectors/kubeconn"
 	"github.com/secrets-bridge/gateway/internal/kube"
 )
 
@@ -15,6 +15,24 @@ const (
 	maxNamespaces = 64
 	maxTargets    = 256
 )
+
+// getPatterns and queryKeys are the rollout client's whole allowlist: a
+// Deployment by name and the ReplicaSet collection of a namespace, with
+// a label selector, a page size and a continue token. Nothing else in
+// the Kubernetes API is reachable through this client.
+var (
+	getPatterns = []string{
+		"/apis/apps/v1/namespaces/*/deployments/*",
+		"/apis/apps/v1/namespaces/*/replicasets",
+	}
+	queryKeys = []string{"labelSelector", "limit", "continue"}
+)
+
+// requiredAccess is what the self-check asks for (runtime design 5.1).
+var requiredAccess = []kubeconn.Access{
+	{Verb: "get", Group: "apps", Resource: "deployments"},
+	{Verb: "list", Group: "apps", Resource: "replicasets"},
+}
 
 // Settings is the local, operator-owned configuration of one rollout
 // connector, the "settings" object of its connectors-file entry:
@@ -29,9 +47,9 @@ const (
 // Deployment name live here and nowhere else. "kubernetes" is optional;
 // without it the connector uses the pod's in-cluster service account.
 type Settings struct {
-	Namespaces []string      `json:"namespaces"`
-	Targets    []Target      `json:"targets"`
-	Kubernetes *KubeSettings `json:"kubernetes,omitempty"`
+	Namespaces []string           `json:"namespaces"`
+	Targets    []Target           `json:"targets"`
+	Kubernetes *kubeconn.Settings `json:"kubernetes,omitempty"`
 }
 
 // Target maps a local target id to one Deployment.
@@ -41,69 +59,19 @@ type Target struct {
 	Deployment string `json:"deployment"`
 }
 
-// KubeSettings points the connector at an API server outside the pod's
-// own cluster.
-type KubeSettings struct {
-	Server    string `json:"server"`
-	CAFile    string `json:"ca_file,omitempty"`
-	TokenFile string `json:"token_file"`
-}
-
-// Options are process-wide inputs to the factory.
-type Options struct {
-	// InsecureTransport allows an http:// server (SB_INSECURE_TRANSPORT).
-	InsecureTransport bool
-	// Getenv reads KUBERNETES_SERVICE_HOST and KUBERNETES_SERVICE_PORT.
-	Getenv func(string) (string, bool)
-	// ServiceAccountDir overrides the mounted token and CA directory.
-	ServiceAccountDir string
-	// Now is the clock; time.Now when nil.
-	Now func() time.Time
-}
-
 // Factory returns the connectors.Factory for the rollout kind.
-func Factory(opts Options) connectors.Factory {
+func Factory(opts kubeconn.Options) connectors.Factory {
 	return func(name string, raw json.RawMessage) (connectors.Connector, error) {
 		s, err := parseSettings(raw)
 		if err != nil {
 			return nil, err
 		}
-		cfg, err := kubeConfig(s.Kubernetes, opts)
+		api, err := kubeconn.NewClient(s.Kubernetes, opts, getPatterns, queryKeys)
 		if err != nil {
 			return nil, err
 		}
-		api, err := kube.New(cfg)
-		if err != nil {
-			return nil, &connectors.SettingsError{Field: "kubernetes", Reason: "cannot build the Kubernetes client; check server, ca_file and token_file"}
-		}
-		return newConnector(name, s, api, opts.Now), nil
+		return newConnector(name, s, api, opts), nil
 	}
-}
-
-func kubeConfig(k *KubeSettings, opts Options) (kube.Config, error) {
-	if k == nil {
-		getenv := opts.Getenv
-		if getenv == nil {
-			getenv = func(string) (string, bool) { return "", false }
-		}
-		dir := opts.ServiceAccountDir
-		if dir == "" {
-			dir = kube.ServiceAccountDir()
-		}
-		cfg, err := kube.InClusterConfigAt(getenv, dir)
-		if err != nil {
-			return kube.Config{}, &connectors.SettingsError{Field: "kubernetes", Reason: "not running in a cluster; set kubernetes.server and kubernetes.token_file"}
-		}
-		cfg.AllowInsecureHTTP = opts.InsecureTransport
-		return cfg, nil
-	}
-	switch {
-	case k.Server == "":
-		return kube.Config{}, &connectors.SettingsError{Field: "kubernetes.server", Reason: "is required"}
-	case k.TokenFile == "":
-		return kube.Config{}, &connectors.SettingsError{Field: "kubernetes.token_file", Reason: "is required"}
-	}
-	return kube.Config{Server: k.Server, CAFile: k.CAFile, TokenFile: k.TokenFile, AllowInsecureHTTP: opts.InsecureTransport}, nil
 }
 
 func parseSettings(raw json.RawMessage) (Settings, error) {
@@ -131,6 +99,10 @@ func parseSettings(raw json.RawMessage) (Settings, error) {
 	if len(s.Targets) > maxTargets {
 		return Settings{}, &connectors.SettingsError{Field: "targets", Reason: "too many entries"}
 	}
+	allowed := make(map[string]struct{}, len(s.Namespaces))
+	for _, ns := range s.Namespaces {
+		allowed[ns] = struct{}{}
+	}
 	seen := make(map[string]struct{}, len(s.Targets))
 	for _, t := range s.Targets {
 		switch {
@@ -140,6 +112,11 @@ func parseSettings(raw json.RawMessage) (Settings, error) {
 			return Settings{}, &connectors.SettingsError{Field: "targets.namespace", Reason: "must be a namespace name"}
 		case !kube.ValidObjectName(t.Deployment):
 			return Settings{}, &connectors.SettingsError{Field: "targets.deployment", Reason: "must be an object name"}
+		}
+		if _, ok := allowed[t.Namespace]; !ok {
+			// Refused at boot: a target outside the allowed namespaces
+			// would never be read, so it must not be advertised.
+			return Settings{}, &connectors.SettingsError{Field: "targets.namespace", Reason: "must be one of the connector namespaces"}
 		}
 		if _, dup := seen[t.ID]; dup {
 			return Settings{}, &connectors.SettingsError{Field: "targets.id", Reason: "duplicate target id"}

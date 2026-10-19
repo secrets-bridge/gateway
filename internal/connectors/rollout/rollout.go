@@ -3,75 +3,80 @@
 //
 // Each Observe call is one snapshot: a GET of the Deployment and a
 // bounded, label-selected LIST of ReplicaSets in its namespace. It reads
-// no pods, no logs, no events and never a Secret. The link to the
-// change is time order only (a ReplicaSet created after the change
-// marker), so the connector reports observed at most, never verified.
+// no pods, no logs, no events and never a Secret. It proposes a stage
+// outcome by the rules of ADR 0001 section 2.3 and returns its facts in
+// the shared evidence model. It never sets a linkage: the loop derives
+// it from the facts, and for a rollout it is at most time_ordered.
 package rollout
 
 import (
 	"context"
-	"errors"
 	"net/url"
 	"strconv"
 	"time"
 
 	"github.com/secrets-bridge/gateway/internal/connectors"
+	"github.com/secrets-bridge/gateway/internal/connectors/kubeconn"
+	"github.com/secrets-bridge/gateway/internal/contract"
 	"github.com/secrets-bridge/gateway/internal/kube"
 	"github.com/secrets-bridge/gateway/internal/safetext"
 )
 
-// ReplicaSet list paging: pages of listPageSize, at most listMaxPages.
+// ReplicaSet list paging: pages of listPageSize, at most listMaxPages
+// (runtime design 3.4: limit=50, stop after 200 items).
 const (
 	listPageSize = 50
 	listMaxPages = 4
 )
 
-// Reason codes this connector sets on an Observation.
+// Defaults Kubernetes applies when the field is unset.
 const (
-	ReasonTargetNotConfigured      = "target_not_configured"
-	ReasonNamespaceNotAllowed      = "namespace_not_allowed"
-	ReasonChangeMarkerMissing      = "change_marker_missing"
-	ReasonRolloutPaused            = "rollout_paused"
-	ReasonScaledToZero             = "scaled_to_zero"
-	ReasonSelectorUnsupported      = "selector_unsupported"
-	ReasonReplicaSetListTruncated  = "replicaset_list_truncated"
-	ReasonGenerationNotObserved    = "generation_not_observed"
-	ReasonNewReplicaSetAvailable   = "new_replicaset_available"
-	ReasonRolloutInProgress        = "rollout_in_progress"
-	ReasonProgressDeadlineExceeded = "progress_deadline_exceeded"
-	ReasonNoRolloutSinceChange     = "no_rollout_since_change"
-	ReasonNoReloadMechanism        = "no_reload_mechanism"
+	defaultReplicas         = 1
+	defaultProgressDeadline = 600
+)
+
+// Rollout triggers (evidence schema rolloutFacts.rollout_trigger).
+const (
+	triggerAnnotationAfter  = "pod_template_annotation_after_change"
+	triggerAnnotationBefore = "pod_template_annotation_before_change"
+	triggerRSCreated        = "replicaset_created_after_change"
+	triggerRSBumped         = "replicaset_revision_bumped_after_change"
+	triggerNone             = "no_rollout_since_change"
+)
+
+// Reload mechanisms (evidence schema rolloutFacts.reload_mechanism).
+const (
+	reloadReloader = "reloader_annotation"
+	reloadChecksum = "checksum_annotation"
+	reloadNone     = "none_detected"
 )
 
 type apiClient interface {
-	Get(ctx context.Context, apiPath string, query url.Values, out any) error
+	Get(ctx context.Context, apiPath string, query url.Values, out any) (kube.Info, error)
+	kubeconn.Reviewer
 }
 
 // Connector observes Deployment rollouts in its allowed namespaces.
 type Connector struct {
 	name       string
-	namespaces map[string]struct{}
+	namespaces []string
 	targets    map[string]Target
+	order      []string
 	api        apiClient
-	now        func() time.Time
+	opts       kubeconn.Options
 }
 
-func newConnector(name string, s Settings, api apiClient, now func() time.Time) *Connector {
-	if now == nil {
-		now = time.Now
-	}
+func newConnector(name string, s Settings, api apiClient, opts kubeconn.Options) *Connector {
 	c := &Connector{
 		name:       name,
-		namespaces: make(map[string]struct{}, len(s.Namespaces)),
+		namespaces: append([]string(nil), s.Namespaces...),
 		targets:    make(map[string]Target, len(s.Targets)),
 		api:        api,
-		now:        now,
-	}
-	for _, ns := range s.Namespaces {
-		c.namespaces[ns] = struct{}{}
+		opts:       opts,
 	}
 	for _, t := range s.Targets {
 		c.targets[t.ID] = t
+		c.order = append(c.order, t.ID)
 	}
 	return c
 }
@@ -82,108 +87,171 @@ func (c *Connector) Name() string { return c.name }
 // Kind implements connectors.Connector.
 func (c *Connector) Kind() connectors.Kind { return connectors.KindRollout }
 
+// Targets implements connectors.Connector. Namespace and Name are for
+// display in the catalog only.
+func (c *Connector) Targets() []connectors.TargetInfo {
+	out := make([]connectors.TargetInfo, 0, len(c.order))
+	for _, id := range c.order {
+		t := c.targets[id]
+		out = append(out, connectors.TargetInfo{ID: t.ID, Namespace: t.Namespace, Name: t.Deployment})
+	}
+	return out
+}
+
+// Check implements connectors.Connector with the boot self-check of
+// runtime design 5.3 for every allowed namespace.
+func (c *Connector) Check(ctx context.Context) error {
+	rep, err := kubeconn.SelfCheck(ctx, c.api, c.namespaces, requiredAccess)
+	if err == nil && rep.WriteVerbs {
+		c.opts.Log().Warn("rules review shows a write verb on deployments or replicasets; the gateway needs only get and list", "connector_id", c.name)
+	}
+	return err
+}
+
 // Observe implements connectors.Connector.
 func (c *Connector) Observe(ctx context.Context, target connectors.Target) (connectors.Observation, error) {
+	now := c.opts.Clock()
+	offsets := kubeconn.NewOffsetTracker(now)
 	obs := connectors.Observation{
 		Connector: c.name,
 		Kind:      connectors.KindRollout,
 		TargetID:  target.ID,
 		Stage:     connectors.StageWorkloadRollout,
 	}
-	done := func(o connectors.Outcome, reason string) (connectors.Observation, error) {
-		obs.Outcome = o
-		obs.Reason = reason
-		obs.ObservedAt = c.now().UTC()
+	finish := func() (connectors.Observation, error) {
+		obs.ObservedAt = now().UTC()
+		obs.APIServerOffset, obs.APIServerOffsetKnown = offsets.Offset()
 		return obs, nil
+	}
+	fail := func(code contract.ErrorCode) (connectors.Observation, error) {
+		obs.Outcome = connectors.OutcomeError
+		obs.Evidence = contract.StageEvidence{ErrorCode: code, Confidence: contract.ConfidenceNone}
+		return finish()
 	}
 
 	t, ok := c.targets[target.ID]
-	if !ok {
-		return done(connectors.OutcomeError, ReasonTargetNotConfigured)
-	}
-	if _, ok := c.namespaces[t.Namespace]; !ok {
-		// Checked before any request: a target outside the allowed
-		// namespaces is never read, whatever RBAC would permit.
-		return done(connectors.OutcomeUnverifiable, ReasonNamespaceNotAllowed)
+	if !ok || target.NotBefore.IsZero() {
+		// The registry refuses unknown targets before this point, and
+		// the loop always sets a bound. Neither is readable as evidence.
+		return fail(contract.ErrorInternal)
 	}
 
 	depPath, err := kube.ResourcePath("apps", "v1", t.Namespace, "deployments", t.Deployment)
 	if err != nil {
-		return done(connectors.OutcomeError, "internal")
+		return fail(contract.ErrorInternal)
 	}
 	var dep deployment
-	if err := c.api.Get(ctx, depPath, nil, &dep); err != nil {
-		return done(connectors.OutcomeError, kube.ErrorCode(err))
+	info, err := c.api.Get(ctx, depPath, nil, &dep)
+	offsets.Note(info)
+	if err != nil {
+		return fail(kube.ErrorCode(err))
 	}
-
 	selector, ok := dep.Spec.Selector.String()
 	if !ok || dep.Metadata.UID == "" {
-		obs.Rollout = deploymentFacts(dep)
-		return done(connectors.OutcomeUnverifiable, ReasonSelectorUnsupported)
+		// apps/v1 requires a non-empty selector; anything else cannot be
+		// turned into a safe label query.
+		return fail(contract.ErrorInternal)
 	}
-	rss, truncated, err := c.listReplicaSets(ctx, t.Namespace, selector)
+	rss, truncated, err := c.listReplicaSets(ctx, t.Namespace, selector, offsets)
 	if err != nil {
-		obs.Rollout = deploymentFacts(dep)
-		if errors.Is(err, kube.ErrInvalidConfig) {
-			return done(connectors.OutcomeError, "internal")
-		}
-		return done(connectors.OutcomeError, kube.ErrorCode(err))
+		return fail(kube.ErrorCode(err))
+	}
+	if truncated {
+		// Non-terminal: the control plane looks again.
+		return fail(contract.ErrorResponseTooLarge)
 	}
 
 	facts, current := buildFacts(dep, rss)
-	anchor := ceilSecond(target.NotBefore)
-	facts.RolloutTrigger = trigger(target.NotBefore, anchor, facts, current)
-	obs.Rollout = facts
+	mode := dep.Spec.Template.Spec.consumptionMode(target.Change.ESOTargetName)
+	facts.ConsumptionMode = mode
+	bound := offsets.Bound(target.NotBefore)
+	facts.RolloutTrigger = trigger(bound, facts, current, target.Change.Baseline, dep)
 
-	if truncated {
-		return done(connectors.OutcomeUnverifiable, ReasonReplicaSetListTruncated)
+	outcome, caveats, conf := decide(facts, target.Change)
+	obs.Outcome = outcome
+	obs.Evidence = contract.StageEvidence{
+		Resource:   resource(t, dep),
+		Facts:      &facts,
+		Confidence: conf,
+		Caveats:    caveats,
 	}
-	if target.NotBefore.IsZero() {
-		return done(connectors.OutcomeUnverifiable, ReasonChangeMarkerMissing)
-	}
-	if facts.Paused {
-		return done(connectors.OutcomeUnverifiable, ReasonRolloutPaused)
-	}
-	if facts.SpecReplicas == 0 {
-		return done(connectors.OutcomeUnverifiable, ReasonScaledToZero)
-	}
-	if facts.ObservedGeneration < facts.Generation {
-		obs.Caveats = obs.Caveats.With(connectors.CaveatGenerationNotObserved)
-		return done(connectors.OutcomeNotObserved, ReasonGenerationNotObserved)
-	}
-
-	if facts.RolloutTrigger == connectors.TriggerReplicaSetAfterChange {
-		obs.Caveats = obs.Caveats.With(connectors.CaveatTemporalInferenceOnly)
-		switch {
-		case complete(facts, current):
-			return done(connectors.OutcomeObserved, ReasonNewReplicaSetAvailable)
-		case facts.ProgressingReason == "ProgressDeadlineExceeded":
-			return done(connectors.OutcomeNotObserved, ReasonProgressDeadlineExceeded)
-		default:
-			obs.Caveats = obs.Caveats.With(connectors.CaveatRolloutInProgress)
-			return done(connectors.OutcomeNotObserved, ReasonRolloutInProgress)
-		}
-	}
-
-	// No ReplicaSet newer than the change.
-	if facts.ReloadMechanism == connectors.ReloadNoneDetected {
-		// Nothing configured to restart the pods: an env consumer will
-		// not pick up the change until something restarts it, and a
-		// volume consumer refreshes without any rollout to observe.
-		// Waiting longer would not change the answer.
-		obs.Caveats = obs.Caveats.With(connectors.CaveatReloadMechanismUnknown)
-		return done(connectors.OutcomeUnverifiable, ReasonNoReloadMechanism)
-	}
-	obs.Caveats = obs.Caveats.With(connectors.CaveatRolloutNotTriggeredByChange)
-	if facts.RolloutTrigger == connectors.TriggerAnnotationAfterChange {
-		// restartedAt is after the change but no matching ReplicaSet is:
-		// the clocks disagree or the controller has not caught up.
-		obs.Caveats = obs.Caveats.With(connectors.CaveatClockSkewSuspected)
-	}
-	return done(connectors.OutcomeNotObserved, ReasonNoRolloutSinceChange)
+	return finish()
 }
 
-func (c *Connector) listReplicaSets(ctx context.Context, ns, selector string) ([]replicaSet, bool, error) {
+// decide applies the workload_rollout rules of ADR 0001 section 2.3 to
+// the facts. It never claims more than the facts show: observed needs a
+// qualifying rollout that follows the ESO refresh when the task expects
+// one, and a complete rollout by the kubectl rules.
+func decide(f contract.RolloutFacts, ch connectors.Change) (contract.Outcome, []contract.Caveat, contract.Confidence) {
+	cav := []contract.Caveat{}
+	add := func(c contract.Caveat) { cav = append(cav, c) }
+	if f.ObservedGeneration < f.Generation {
+		add(contract.CaveatGenerationNotObserved)
+	}
+
+	switch {
+	case f.SpecReplicas == 0:
+		add(contract.CaveatZeroReplicas)
+		return contract.OutcomeUnverifiable, cav, contract.ConfidenceLow
+	case f.Paused != nil && *f.Paused:
+		add(contract.CaveatRolloutPaused)
+		return contract.OutcomeUnverifiable, cav, contract.ConfidenceLow
+	case f.ConsumptionMode == modeSubpathVolume:
+		add(contract.CaveatSubpathMountNotRefreshed)
+		return contract.OutcomeUnverifiable, cav, contract.ConfidenceLow
+	}
+
+	// A rollout qualifies only after the ESO refresh that fetched the
+	// change, when the task expects eso_sync (ADR 0001 section 2.2 step
+	// 3). Without an observed refresh in this pass it cannot qualify.
+	esoOrdered := !ch.ESOExpected || !ch.ESORefreshTime.IsZero()
+	qualifying := esoOrdered && (f.RolloutTrigger == triggerRSCreated || f.RolloutTrigger == triggerRSBumped)
+	if f.RolloutTrigger == triggerRSBumped {
+		add(contract.CaveatReplicaSetReused)
+	}
+
+	if qualifying {
+		switch {
+		case f.ProgressingReason == "ProgressDeadlineExceeded":
+			return contract.OutcomeFailed, cav, contract.ConfidenceMedium
+		case complete(f):
+			return contract.OutcomeObserved, cav, contract.ConfidenceMedium
+		}
+		add(contract.CaveatRolloutInProgress)
+		return contract.OutcomeNotObserved, cav, contract.ConfidenceLow
+	}
+
+	noReload := f.ReloadMechanism == reloadNone
+	switch {
+	case f.ConsumptionMode == modeVolume && noReload:
+		// The kubelet refreshes mounted files without a rollout, and
+		// nothing in Deployment or ReplicaSet status shows that.
+		add(contract.CaveatVolumeRefreshNotObservable)
+		return contract.OutcomeNotApplicable, cav, contract.ConfidenceLow
+	case (f.ConsumptionMode == modeEnv || f.ConsumptionMode == modeMixed) && noReload:
+		add(contract.CaveatReloadMechanismUnknown)
+		return contract.OutcomeUnverifiable, cav, contract.ConfidenceLow
+	case f.ConsumptionMode == modeUnknown && !ch.ESOExpected && noReload:
+		// No ESO stage names the Secret, so the mode cannot be told; and
+		// nothing is configured to restart the pods either way.
+		add(contract.CaveatReloadMechanismUnknown)
+		return contract.OutcomeUnverifiable, cav, contract.ConfidenceLow
+	case f.ConsumptionMode == modeNotReferenced:
+		// The pod template does not reference the ExternalSecret target,
+		// so no rollout of this Deployment can carry the change.
+		add(contract.CaveatRolloutNotTriggeredByChange)
+		return contract.OutcomeUnverifiable, cav, contract.ConfidenceLow
+	}
+	add(contract.CaveatRolloutNotTriggeredByChange)
+	if f.RolloutTrigger == triggerAnnotationAfter {
+		// restartedAt is after the bound but no ReplicaSet is: the
+		// clocks disagree or the controller has not caught up.
+		add(contract.CaveatClockSkewSuspected)
+	}
+	return contract.OutcomeNotObserved, cav, contract.ConfidenceLow
+}
+
+func (c *Connector) listReplicaSets(ctx context.Context, ns, selector string, offsets *kubeconn.OffsetTracker) ([]replicaSet, bool, error) {
 	p, err := kube.ResourcePath("apps", "v1", ns, "replicasets", "")
 	if err != nil {
 		return nil, false, err
@@ -196,7 +264,9 @@ func (c *Connector) listReplicaSets(ctx context.Context, ns, selector string) ([
 			q.Set("continue", cont)
 		}
 		var page replicaSetList
-		if err := c.api.Get(ctx, p, q, &page); err != nil {
+		info, err := c.api.Get(ctx, p, q, &page)
+		offsets.Note(info)
+		if err != nil {
 			return nil, false, err
 		}
 		out = append(out, page.Items...)
@@ -208,25 +278,43 @@ func (c *Connector) listReplicaSets(ctx context.Context, ns, selector string) ([
 	return out, true, nil
 }
 
-func deploymentFacts(d deployment) connectors.RolloutFacts {
-	spec := int64(1)
-	if d.Spec.Replicas != nil {
-		spec = *d.Spec.Replicas
+func resource(t Target, d deployment) *contract.Resource {
+	r := &contract.Resource{APIVersion: "apps/v1", Kind: "Deployment", Namespace: t.Namespace, Name: t.Deployment}
+	if contract.ValidUUID(d.Metadata.UID) {
+		r.UID = d.Metadata.UID
 	}
-	f := connectors.RolloutFacts{
-		Present:             true,
-		Generation:          nonNeg(d.Metadata.Generation),
-		ObservedGeneration:  nonNeg(d.Status.ObservedGeneration),
-		SpecReplicas:        nonNeg(spec),
-		Replicas:            nonNeg(d.Status.Replicas),
-		UpdatedReplicas:     nonNeg(d.Status.UpdatedReplicas),
-		ReadyReplicas:       nonNeg(d.Status.ReadyReplicas),
-		AvailableReplicas:   nonNeg(d.Status.AvailableReplicas),
-		UnavailableReplicas: nonNeg(d.Status.UnavailableReplicas),
-		Paused:              d.Spec.Paused,
-		DeploymentRevision:  safetext.Revision(d.Metadata.Annotations.revision),
-		RolloutTrigger:      connectors.TriggerNotChecked,
-		ReloadMechanism:     reloadMechanism(d),
+	if rv := safetext.Token(d.Metadata.ResourceVersion, 64, resourceVersionPattern, ""); rv != "" {
+		r.ResourceVersion = rv
+	}
+	g := nonNeg(d.Metadata.Generation)
+	r.Generation = &g
+	return r
+}
+
+func deploymentFacts(d deployment) contract.RolloutFacts {
+	spec := int64(defaultReplicas)
+	if d.Spec.Replicas != nil {
+		spec = nonNeg(*d.Spec.Replicas)
+	}
+	pds := int64(defaultProgressDeadline)
+	if d.Spec.ProgressDeadlineSeconds != nil {
+		pds = nonNeg(*d.Spec.ProgressDeadlineSeconds)
+	}
+	paused := d.Spec.Paused
+	ptr := func(n int64) *int64 { v := nonNeg(n); return &v }
+	f := contract.RolloutFacts{
+		Generation:              nonNeg(d.Metadata.Generation),
+		ObservedGeneration:      nonNeg(d.Status.ObservedGeneration),
+		SpecReplicas:            spec,
+		Paused:                  &paused,
+		ProgressDeadlineSeconds: &pds,
+		Replicas:                ptr(d.Status.Replicas),
+		UpdatedReplicas:         ptr(d.Status.UpdatedReplicas),
+		ReadyReplicas:           ptr(d.Status.ReadyReplicas),
+		AvailableReplicas:       ptr(d.Status.AvailableReplicas),
+		UnavailableReplicas:     ptr(d.Status.UnavailableReplicas),
+		DeploymentRevision:      safetext.Revision(d.Metadata.Annotations.revision),
+		ReloadMechanism:         reloadMechanism(d),
 	}
 	for _, cond := range d.Status.Conditions {
 		switch cond.Type {
@@ -237,86 +325,90 @@ func deploymentFacts(d deployment) connectors.RolloutFacts {
 			f.AvailableStatus = safetext.ConditionStatus(cond.Status)
 		}
 	}
-	if ts := d.Spec.Template.Metadata.Annotations.restartedAt; ts != "" {
-		if t, err := time.Parse(time.RFC3339, safetext.Clean(ts, 40)); err == nil {
-			f.RestartedAt = t.UTC()
-		}
-	}
 	return f
 }
 
-func reloadMechanism(d deployment) connectors.ReloadMechanism {
+func reloadMechanism(d deployment) string {
 	meta, tmpl := d.Metadata.Annotations, d.Spec.Template.Metadata.Annotations
 	switch {
 	case meta.reloader || tmpl.reloader || tmpl.lastReloaded:
-		return connectors.ReloadReloaderAnnotation
+		return reloadReloader
 	case tmpl.checksum:
-		return connectors.ReloadChecksumAnnotation
+		return reloadChecksum
 	}
-	return connectors.ReloadNoneDetected
+	return reloadNone
 }
 
 // buildFacts fills the facts and returns the current ReplicaSet: the
-// owned one whose revision equals the Deployment's revision.
-func buildFacts(d deployment, rss []replicaSet) (connectors.RolloutFacts, *replicaSet) {
+// owned one whose revision equals the Deployment's revision, or the
+// owned one with the highest revision when the Deployment has none.
+func buildFacts(d deployment, rss []replicaSet) (contract.RolloutFacts, *replicaSet) {
 	f := deploymentFacts(d)
 	var current *replicaSet
+	best := int64(-1)
 	for i := range rss {
 		rs := &rss[i]
 		if !rs.ownedBy(d.Metadata.UID) {
 			continue
 		}
-		f.OwnedReplicaSets++
 		rev := safetext.Revision(rs.Metadata.Annotations.revision)
-		if f.DeploymentRevision != "" && rev == f.DeploymentRevision {
-			current = rs
+		if f.DeploymentRevision != "" {
+			if rev == f.DeploymentRevision {
+				current = rs
+			}
+			continue
+		}
+		if n, err := strconv.ParseInt(rev, 10, 64); err == nil && n > best {
+			best, current = n, rs
 		}
 	}
-	if current != nil {
-		f.CurrentReplicaSetCreatedAt = current.Metadata.CreationTimestamp.UTC()
-		f.CurrentReplicaSetAvailable = nonNeg(current.Status.AvailableReplicas)
+	if current != nil && !current.Metadata.CreationTimestamp.IsZero() {
+		ts := current.Metadata.CreationTimestamp.UTC()
+		f.NewestReplicaSetCreatedAt = &ts
 	}
 	return f, current
 }
 
-func trigger(notBefore, anchor time.Time, f connectors.RolloutFacts, current *replicaSet) connectors.RolloutTrigger {
-	switch {
-	case notBefore.IsZero():
-		return connectors.TriggerNotChecked
-	case current != nil && current.Metadata.CreationTimestamp.After(anchor):
-		return connectors.TriggerReplicaSetAfterChange
-	case !f.RestartedAt.IsZero() && f.RestartedAt.After(anchor):
-		return connectors.TriggerAnnotationAfterChange
-	case !f.RestartedAt.IsZero():
-		return connectors.TriggerAnnotationBeforeChange
+// trigger is the qualifying-rollout rule of runtime design 3.4, judged
+// against bound (the rollout NotBefore plus the API server offset):
+//  1. the current ReplicaSet was created strictly after bound;
+//  2. otherwise the Deployment revision is greater than the baseline the
+//     control plane copied from the earliest pass with eso_sync observed
+//     (a rollback or a template that reuses an older ReplicaSet);
+//  3. otherwise the restartedAt annotation, when present, is reported as
+//     before or after the bound; it is never a qualifying rollout.
+func trigger(bound time.Time, f contract.RolloutFacts, current *replicaSet, baseline *contract.RolloutBaseline, d deployment) string {
+	if current != nil && current.Metadata.CreationTimestamp.After(bound) {
+		return triggerRSCreated
 	}
-	return connectors.TriggerNoRolloutSinceChange
+	if baseline != nil {
+		cur, err1 := strconv.ParseInt(f.DeploymentRevision, 10, 64)
+		base, err2 := strconv.ParseInt(baseline.DeploymentRevision, 10, 64)
+		if err1 == nil && err2 == nil && cur > base {
+			return triggerRSBumped
+		}
+	}
+	if ts := d.Spec.Template.Metadata.Annotations.restartedAt; ts != "" {
+		if rt, err := time.Parse(time.RFC3339, safetext.Clean(ts, 40)); err == nil {
+			if rt.After(bound) {
+				return triggerAnnotationAfter
+			}
+			return triggerAnnotationBefore
+		}
+	}
+	return triggerNone
 }
 
-// complete is kubectl rollout status's rule, plus the current
-// ReplicaSet being fully available and the Progressing reason.
-func complete(f connectors.RolloutFacts, current *replicaSet) bool {
-	return current != nil &&
-		f.ObservedGeneration >= f.Generation &&
-		f.UpdatedReplicas == f.SpecReplicas &&
-		f.Replicas == f.UpdatedReplicas &&
-		f.AvailableReplicas == f.UpdatedReplicas &&
-		f.CurrentReplicaSetAvailable >= f.SpecReplicas &&
-		f.ProgressingReason == "NewReplicaSetAvailable"
-}
-
-// ceilSecond rounds t up to the next whole second. Kubernetes
-// timestamps have second precision, so "strictly after the change"
-// means strictly after the change rounded up; an equal timestamp never
-// counts.
-func ceilSecond(t time.Time) time.Time {
-	if t.IsZero() {
-		return t
+// complete is the kubectl rollout status rule (ADR 0001 section 2.2
+// step 3). .status.replicas alone is never the desired count.
+func complete(f contract.RolloutFacts) bool {
+	if f.UpdatedReplicas == nil || f.Replicas == nil || f.AvailableReplicas == nil {
+		return false
 	}
-	if tr := t.Truncate(time.Second); !tr.Equal(t) {
-		return tr.Add(time.Second)
-	}
-	return t
+	return f.ObservedGeneration >= f.Generation &&
+		*f.UpdatedReplicas == f.SpecReplicas &&
+		*f.Replicas == *f.UpdatedReplicas &&
+		*f.AvailableReplicas == *f.UpdatedReplicas
 }
 
 func nonNeg(n int64) int64 {

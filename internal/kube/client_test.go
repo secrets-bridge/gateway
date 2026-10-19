@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/secrets-bridge/gateway/internal/contract"
 	"github.com/secrets-bridge/gateway/internal/readonly"
 )
 
@@ -67,10 +68,21 @@ func writeToken(t *testing.T, dir, tok string) string {
 	return p
 }
 
-func newTestClient(t *testing.T, f *fakeAPI, prefix string) (*Client, string) {
+// testGET and testQuery are the union of the rollout and ESO allowlists.
+var (
+	testGET = []string{
+		"/apis/apps/v1/namespaces/*/deployments/*",
+		"/apis/apps/v1/namespaces/*/replicasets",
+		"/apis/external-secrets.io/v1/namespaces/*/externalsecrets/*",
+		"/apis/external-secrets.io/v1beta1/namespaces/*/externalsecrets/*",
+	}
+	testQuery = []string{"labelSelector", "limit", "continue"}
+)
+
+func newTestClient(t *testing.T, f *fakeAPI) (*Client, string) {
 	t.Helper()
 	tokFile := writeToken(t, t.TempDir(), "tok-one")
-	c, err := New(Config{Server: f.srv.URL + prefix, CAFile: f.caFile(t), TokenFile: tokFile})
+	c, err := New(Config{Server: f.srv.URL, CAFile: f.caFile(t), TokenFile: tokFile, GET: testGET, Query: testQuery})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,13 +97,14 @@ type obj struct {
 
 func TestGetSendsBearerOverVerifiedTLS(t *testing.T) {
 	f := newFakeAPI(t, nil)
-	c, _ := newTestClient(t, f, "")
+	c, _ := newTestClient(t, f)
 	p, err := ResourcePath("apps", "v1", "tenant-a-uat", "deployments", "web")
 	if err != nil {
 		t.Fatal(err)
 	}
 	var o obj
-	if err := c.Get(context.Background(), p, url.Values{"limit": {"5"}}, &o); err != nil {
+	info, err := c.Get(context.Background(), p, url.Values{"limit": {"5"}}, &o)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if o.Metadata.Name != "web" {
@@ -103,14 +116,17 @@ func TestGetSendsBearerOverVerifiedTLS(t *testing.T) {
 	if f.auths[0] != "Bearer tok-one" {
 		t.Fatalf("authorization = %q", f.auths[0])
 	}
+	if !info.HasDate || time.Since(info.Date) > time.Minute {
+		t.Fatalf("Date header not reported: %+v", info)
+	}
 }
 
 func TestTokenFileIsReReadOnChange(t *testing.T) {
 	f := newFakeAPI(t, nil)
-	c, tokFile := newTestClient(t, f, "")
+	c, tokFile := newTestClient(t, f)
 	p, _ := ResourcePath("apps", "v1", "tenant-a-uat", "deployments", "web")
 	var o obj
-	if err := c.Get(context.Background(), p, nil, &o); err != nil {
+	if _, err := c.Get(context.Background(), p, nil, &o); err != nil {
 		t.Fatal(err)
 	}
 	// Rotate the way the kubelet does: new content, new mtime.
@@ -121,7 +137,7 @@ func TestTokenFileIsReReadOnChange(t *testing.T) {
 	if err := os.Chtimes(tokFile, future, future); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Get(context.Background(), p, nil, &o); err != nil {
+	if _, err := c.Get(context.Background(), p, nil, &o); err != nil {
 		t.Fatal(err)
 	}
 	if f.auths[1] != "Bearer tok-rotated-two" {
@@ -175,40 +191,183 @@ func TestTokenErrorsCarryNoContent(t *testing.T) {
 // The core of the no-secrets invariant: every spelling of a Secrets
 // path is refused and the API server never sees a request.
 func TestSecretsPathsNeverLeaveTheProcess(t *testing.T) {
-	for _, prefix := range []string{"", "/k8s/clusters/c-1"} {
-		f := newFakeAPI(t, nil)
-		c, _ := newTestClient(t, f, prefix)
-		paths := []string{
-			"/api/v1/secrets",
-			"/api/v1/namespaces/tenant-a-uat/secrets",
-			"/api/v1/namespaces/tenant-a-uat/secrets/db",
-			"/api/v1/namespaces/tenant-a-uat/secrets/db/status",
-			"/api/v1/watch/secrets",
-			"/api/v1/watch/namespaces/tenant-a-uat/secrets",
-			"/API/V1/namespaces/tenant-a-uat/Secrets/db",
-			"/api//v1/namespaces/tenant-a-uat/secrets/db",
-			"/apis/apps/v1/../../api/v1/namespaces/tenant-a-uat/secrets/db",
-			"/apis/apps/v1/../../../api/v1/namespaces/tenant-a-uat/secrets/db",
-			"/api/v1/namespaces/tenant-a-uat/%73ecrets/db",
-			"/api/v1/namespaces/tenant-a-uat%2Fsecrets/db",
-			"/api/v1/namespaces/tenant-a-uat/./secrets",
+	f := newFakeAPI(t, nil)
+	c, _ := newTestClient(t, f)
+	paths := []string{
+		"/api/v1/secrets",
+		"/api/v1/namespaces/tenant-a-uat/secrets",
+		"/api/v1/namespaces/tenant-a-uat/secrets/db",
+		"/api/v1/namespaces/tenant-a-uat/secrets/db/status",
+		"/api/v1/watch/secrets",
+		"/api/v1/watch/namespaces/tenant-a-uat/secrets",
+		"/API/V1/namespaces/tenant-a-uat/Secrets/db",
+		"/api//v1/namespaces/tenant-a-uat/secrets/db",
+		"/apis/apps/v1/../../api/v1/namespaces/tenant-a-uat/secrets/db",
+		"/apis/apps/v1/namespaces/tenant-a-uat/deployments/../../../../../api/v1/namespaces/a/secrets/db",
+		"/api/v1/namespaces/tenant-a-uat/%73ecrets/db",
+		"/api/v1/namespaces/tenant-a-uat%2Fsecrets/db",
+		"/api/v1/namespaces/tenant-a-uat/./secrets",
+		"/k8s/clusters/c-1/api/v1/namespaces/tenant-a-uat/secrets/db",
+	}
+	for _, p := range paths {
+		var o obj
+		if _, err := c.Get(context.Background(), p, nil, &o); err == nil {
+			t.Errorf("Get(%q) succeeded", p)
 		}
-		for _, p := range paths {
-			var o obj
-			if err := c.Get(context.Background(), p, nil, &o); !errors.Is(err, ErrPathDenied) {
-				t.Errorf("prefix %q Get(%q) err = %v, want ErrPathDenied", prefix, p, err)
-			}
-			// Bypass Get: the transport itself must refuse.
-			resp, err := c.http.Get(f.srv.URL + prefix + p)
-			if resp != nil {
-				_ = resp.Body.Close()
-			}
-			if !errors.Is(err, ErrPathDenied) {
-				t.Errorf("prefix %q raw GET %q err = %v, want ErrPathDenied", prefix, p, err)
-			}
+		// Bypass Get: the transport itself must refuse.
+		resp, err := c.http.Get(f.srv.URL + p)
+		if resp != nil {
+			_ = resp.Body.Close()
 		}
-		if n := f.hits.Load(); n != 0 {
-			t.Fatalf("prefix %q: API server saw %d requests: %v", prefix, n, f.paths)
+		if err == nil {
+			t.Errorf("raw GET %q succeeded", p)
+		}
+	}
+	if n := f.hits.Load(); n != 0 {
+		t.Fatalf("API server saw %d requests: %v", n, f.paths)
+	}
+}
+
+// TestTransportAllowlist: the client can read only the allowlisted
+// Deployment, ReplicaSet and ExternalSecret paths with the allowlisted
+// query keys, and can POST only to the two self-review paths. Every
+// other request is refused before it leaves the process.
+func TestTransportAllowlist(t *testing.T) {
+	f := newFakeAPI(t, nil)
+	c, _ := newTestClient(t, f)
+	refused := []struct {
+		method, path string
+		body         string
+	}{
+		{"GET", "/api/v1/namespaces/a/pods", ""},
+		{"GET", "/api/v1/namespaces/a/pods/p/exec", ""},
+		{"GET", "/api/v1/namespaces/a/pods/p/log", ""},
+		{"GET", "/api/v1/namespaces/a/pods/p/portforward", ""},
+		{"GET", "/api/v1/namespaces/a/pods/p/attach", ""},
+		{"GET", "/api/v1/namespaces/a/services/s/proxy/x", ""},
+		{"GET", "/api/v1/nodes/n/proxy", ""},
+		{"GET", "/api/v1/namespaces/a/configmaps/c", ""},
+		{"GET", "/apis/apps/v1/deployments", ""},
+		{"GET", "/apis/apps/v1/namespaces/a/deployments", ""},
+		{"GET", "/apis/apps/v1/namespaces/a/deployments/web/scale", ""},
+		{"GET", "/apis/apps/v1/namespaces/a/replicasets/rs-1", ""},
+		{"GET", "/apis/external-secrets.io", ""},
+		{"GET", "/apis/external-secrets.io/v1/namespaces/a/externalsecrets", ""},
+		{"GET", "/apis/external-secrets.io/v1/namespaces/a/clusterexternalsecrets/x", ""},
+		{"GET", "/apis/apps/v1/namespaces/a/deployments/web?watch=true", ""},
+		{"GET", "/apis/apps/v1/namespaces/a/replicasets?fieldSelector=x", ""},
+		{"GET", "/apis/apps/v1/namespaces/a/deployments/web/", ""},
+		{"POST", "/apis/apps/v1/namespaces/a/deployments", "{}"},
+		{"POST", "/apis/authorization.k8s.io/v1/subjectaccessreviews", "{}"},
+		{"POST", "/apis/authorization.k8s.io/v1/namespaces/a/localsubjectaccessreviews", "{}"},
+		{"POST", "/apis/authentication.k8s.io/v1/tokenreviews", "{}"},
+		{"POST", "/api/v1/namespaces/a/serviceaccounts/sa/token", "{}"},
+		{"POST", "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews?dryRun=All", "{}"},
+		{"PUT", "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews", "{}"},
+		{"PUT", "/apis/apps/v1/namespaces/a/deployments/web", "{}"},
+		{"PATCH", "/apis/apps/v1/namespaces/a/deployments/web", "{}"},
+		{"PATCH", "/apis/external-secrets.io/v1/namespaces/a/externalsecrets/x", "{}"},
+		{"DELETE", "/apis/apps/v1/namespaces/a/replicasets", ""},
+		{"HEAD", "/apis/apps/v1/namespaces/a/deployments/web", ""},
+		{"OPTIONS", "/apis/apps/v1/namespaces/a/deployments/web", ""},
+	}
+	for _, tc := range refused {
+		var body *strings.Reader
+		if tc.body != "" {
+			body = strings.NewReader(tc.body)
+		}
+		var req *http.Request
+		if body != nil {
+			req, _ = http.NewRequest(tc.method, f.srv.URL+tc.path, body)
+			req.Header.Set("Content-Type", "application/json")
+		} else {
+			req, _ = http.NewRequest(tc.method, f.srv.URL+tc.path, nil)
+		}
+		resp, err := c.http.Do(req)
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		if err == nil {
+			t.Errorf("%s %s was sent", tc.method, tc.path)
+		}
+	}
+	// Opaque URL: the wire path would be the opaque string.
+	req, _ := http.NewRequest(http.MethodGet, f.srv.URL, nil)
+	req.URL.Opaque = "/api/v1/namespaces/a/secrets/db"
+	if resp, err := c.http.Do(req); err == nil {
+		_ = resp.Body.Close()
+		t.Error("opaque URL was sent")
+	}
+	if n := f.hits.Load(); n != 0 {
+		t.Fatalf("API server saw %d refused requests: %v", n, f.paths)
+	}
+
+	allowed := []string{
+		"/apis/apps/v1/namespaces/a/deployments/web",
+		"/apis/apps/v1/namespaces/a/replicasets?labelSelector=app%3Dweb&limit=50&continue=x",
+		"/apis/external-secrets.io/v1/namespaces/a/externalsecrets/db.creds",
+		"/apis/external-secrets.io/v1beta1/namespaces/a/externalsecrets/db",
+	}
+	for _, p := range allowed {
+		resp, err := c.http.Get(f.srv.URL + p)
+		if err != nil {
+			t.Errorf("GET %s refused: %v", p, err)
+			continue
+		}
+		_ = resp.Body.Close()
+	}
+	var out struct{}
+	for _, p := range []string{readonly.SelfSubjectAccessReviewPath, readonly.SelfSubjectRulesReviewPath} {
+		if _, err := c.Create(context.Background(), p, map[string]string{"kind": "x"}, &out); err != nil {
+			t.Errorf("POST %s refused: %v", p, err)
+		}
+	}
+	if _, err := c.Create(context.Background(), "/apis/apps/v1/namespaces/a/deployments", map[string]string{}, &out); !errors.Is(err, ErrRefused) {
+		t.Errorf("Create to a non-review path: err = %v, want ErrRefused", err)
+	}
+	if n := f.hits.Load(); int(n) != len(allowed)+2 {
+		t.Fatalf("API server saw %d requests, want %d", n, len(allowed)+2)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, p := range f.paths {
+		if !strings.HasPrefix(p, "GET ") && !strings.HasPrefix(p, "POST /apis/authorization.k8s.io/v1/selfsubject") {
+			t.Errorf("unexpected request on the wire: %s", p)
+		}
+	}
+}
+
+// TestErrorsCarryNoURL: no error from Get names the host, the namespace,
+// the object name or the label selector (a *url.Error would quote all of
+// them).
+func TestErrorsCarryNoURL(t *testing.T) {
+	f := newFakeAPI(t, nil)
+	tokFile := writeToken(t, t.TempDir(), "tok")
+	// An unreachable server: nothing listens on a closed httptest port.
+	dead := httptest.NewServer(http.NotFoundHandler())
+	deadURL := dead.URL
+	dead.Close()
+	cases := map[string]Config{
+		"unreachable":   {Server: deadURL, TokenFile: tokFile, AllowInsecureHTTP: true, GET: testGET, Query: testQuery},
+		"tls":           {Server: f.srv.URL, TokenFile: tokFile, GET: testGET, Query: testQuery},
+		"refused query": {Server: f.srv.URL, CAFile: f.caFile(t), TokenFile: tokFile, GET: testGET},
+	}
+	for name, cfg := range cases {
+		c, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var o obj
+		_, err = c.Get(context.Background(), "/apis/apps/v1/namespaces/tenant-a-uat/replicasets",
+			url.Values{"labelSelector": {"app=payments-api"}}, &o)
+		if err == nil {
+			t.Fatalf("%s: no error", name)
+		}
+		host := strings.TrimPrefix(strings.TrimPrefix(cfg.Server, "https://"), "http://")
+		for _, leak := range []string{"tenant-a-uat", "payments-api", "replicasets", host, "labelSelector"} {
+			if strings.Contains(err.Error(), leak) {
+				t.Errorf("%s: error %q contains %q", name, err, leak)
+			}
 		}
 	}
 }
@@ -247,28 +406,10 @@ func TestResourcePath(t *testing.T) {
 	}
 }
 
-func TestOnlyGETLeavesTheProcess(t *testing.T) {
-	f := newFakeAPI(t, nil)
-	c, _ := newTestClient(t, f, "")
-	for _, m := range []string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodHead} {
-		req, _ := http.NewRequest(m, f.srv.URL+"/apis/apps/v1/namespaces/tenant-a-uat/deployments/web", strings.NewReader("{}"))
-		resp, err := c.http.Do(req)
-		if resp != nil {
-			_ = resp.Body.Close()
-		}
-		if !errors.Is(err, readonly.ErrMethodNotAllowed) {
-			t.Errorf("%s: err = %v", m, err)
-		}
-	}
-	if n := f.hits.Load(); n != 0 {
-		t.Fatalf("API server saw %d requests", n)
-	}
-}
-
 func TestTokenOnlyGoesToConfiguredServer(t *testing.T) {
 	f := newFakeAPI(t, nil)
 	other := newFakeAPI(t, nil)
-	c, _ := newTestClient(t, f, "")
+	c, _ := newTestClient(t, f)
 	resp, err := c.http.Get(other.srv.URL + "/apis/apps/v1/namespaces/tenant-a-uat/deployments/web")
 	if resp != nil {
 		_ = resp.Body.Close()
@@ -281,33 +422,12 @@ func TestTokenOnlyGoesToConfiguredServer(t *testing.T) {
 	}
 }
 
-func TestRequestsOutsidePrefixRefused(t *testing.T) {
-	f := newFakeAPI(t, nil)
-	c, _ := newTestClient(t, f, "/k8s/clusters/c-1")
-	for _, p := range []string{"/apis/apps/v1/namespaces/a/deployments/web", "/k8s/clusters/c-10/apis/apps/v1/x", "/k8s/clusters/c-1/../c-2/apis"} {
-		resp, err := c.http.Get(f.srv.URL + p)
-		if resp != nil {
-			_ = resp.Body.Close()
-		}
-		if !errors.Is(err, ErrPathDenied) {
-			t.Errorf("%q: err = %v", p, err)
-		}
-	}
-	var o obj
-	if err := c.Get(context.Background(), "/apis/apps/v1/namespaces/a/deployments/web", nil, &o); err != nil {
-		t.Fatal(err)
-	}
-	if f.paths[0] != "GET /k8s/clusters/c-1/apis/apps/v1/namespaces/a/deployments/web" {
-		t.Fatalf("path = %q", f.paths[0])
-	}
-}
-
 func TestStatusErrorsAndCodes(t *testing.T) {
 	const leak = "provider path /very/private/thing"
 	cases := []struct {
 		name     string
 		handler  http.HandlerFunc
-		wantCode string
+		wantCode contract.ErrorCode
 	}{
 		{"object not found", func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(404)
@@ -338,12 +458,12 @@ func TestStatusErrorsAndCodes(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeAPI(t, tc.handler)
 			tokFile := writeToken(t, t.TempDir(), "tok")
-			c, err := New(Config{Server: f.srv.URL, CAFile: f.caFile(t), TokenFile: tokFile, MaxBodyBytes: 1024})
+			c, err := New(Config{Server: f.srv.URL, CAFile: f.caFile(t), TokenFile: tokFile, MaxBodyBytes: 1024, GET: testGET})
 			if err != nil {
 				t.Fatal(err)
 			}
 			var o obj
-			err = c.Get(context.Background(), "/apis/apps/v1/namespaces/a/deployments/web", nil, &o)
+			_, err = c.Get(context.Background(), "/apis/apps/v1/namespaces/a/deployments/web", nil, &o)
 			if err == nil {
 				t.Fatal("no error")
 			}
@@ -363,12 +483,12 @@ func TestStatusErrorsAndCodes(t *testing.T) {
 func TestTLSVerificationFailure(t *testing.T) {
 	f := newFakeAPI(t, nil)
 	tokFile := writeToken(t, t.TempDir(), "tok")
-	c, err := New(Config{Server: f.srv.URL, TokenFile: tokFile}) // system roots only
+	c, err := New(Config{Server: f.srv.URL, TokenFile: tokFile, GET: testGET}) // system roots only
 	if err != nil {
 		t.Fatal(err)
 	}
 	var o obj
-	err = c.Get(context.Background(), "/apis/apps/v1/namespaces/a/deployments/web", nil, &o)
+	_, err = c.Get(context.Background(), "/apis/apps/v1/namespaces/a/deployments/web", nil, &o)
 	if got := ErrorCode(err); got != "tls_verification_failed" {
 		t.Fatalf("ErrorCode = %q (err %v)", got, err)
 	}
@@ -396,8 +516,14 @@ func TestNewValidatesConfig(t *testing.T) {
 		{"missing token", Config{Server: "https://k8s.example.com", TokenFile: filepath.Join(dir, "none")}, false},
 		{"bad CA", Config{Server: "https://k8s.example.com", TokenFile: tok, CAFile: badCA}, false},
 		{"missing CA", Config{Server: "https://k8s.example.com", TokenFile: tok, CAFile: filepath.Join(dir, "none.crt")}, false},
+		{"path prefix", Config{Server: "https://k8s.example.com/k8s/clusters/c-1", TokenFile: tok}, false},
+		{"no allowlist", Config{Server: "https://k8s.example.com", TokenFile: tok}, false},
+		{"bad pattern", Config{Server: "https://k8s.example.com", TokenFile: tok, GET: []string{"/apis/../x"}}, false},
 	}
 	for _, tc := range cases {
+		if tc.cfg.GET == nil && tc.name != "no allowlist" {
+			tc.cfg.GET = testGET
+		}
 		_, err := New(tc.cfg)
 		if (err == nil) != tc.ok {
 			t.Errorf("%s: err = %v", tc.name, err)

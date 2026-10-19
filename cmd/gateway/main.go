@@ -40,6 +40,7 @@ import (
 
 	"github.com/secrets-bridge/gateway/internal/client"
 	"github.com/secrets-bridge/gateway/internal/connectors"
+	"github.com/secrets-bridge/gateway/internal/connectors/eso"
 	"github.com/secrets-bridge/gateway/internal/connectors/kubeconn"
 	"github.com/secrets-bridge/gateway/internal/connectors/rollout"
 	"github.com/secrets-bridge/gateway/internal/contract"
@@ -126,6 +127,7 @@ func gatewayVersion() string {
 var connectorFactories = func(cfg Config, getenv func(string) (string, bool), logger *slog.Logger) connectors.Factories {
 	kopts := kubeconn.Options{InsecureTransport: cfg.InsecureTransport, Getenv: getenv, Logger: logger}
 	return connectors.Factories{
+		connectors.KindESO:     eso.Factory(kopts),
 		connectors.KindRollout: rollout.Factory(kopts),
 	}
 }

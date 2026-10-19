@@ -381,6 +381,10 @@ func TestSetup_Refusals(t *testing.T) {
 	if err := os.WriteFile(rolloutFile, []byte(`[{"name":"rollout-main","kind":"rollout","settings":{"namespaces":["tenant-a-uat"]}}]`), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	esoFile := filepath.Join(dir, "eso.json")
+	if err := os.WriteFile(esoFile, []byte(`[{"name":"eso-main","kind":"eso","settings":{"namespaces":["tenant-a-uat"]}}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	looseID := filepath.Join(dir, "identity.json")
 	if err := os.WriteFile(looseID, []byte(`{"gateway_id":"gw","gateway_secret":"`+testSecret+`"}`), 0o600); err != nil {
 		t.Fatal(err)
@@ -401,6 +405,7 @@ func TestSetup_Refusals(t *testing.T) {
 		{"loose identity file", func(f *bootFixture) { f.env = envMap(nil); f.cfg.IdentityFile = looseID }, "not be readable by other users"},
 		{"connector kind not in this build", func(f *bootFixture) { f.cfg.ConnectorsFile = argoFile }, "not supported by this build"},
 		{"rollout outside a cluster without a server", func(f *bootFixture) { f.cfg.ConnectorsFile = rolloutFile }, "not running in a cluster"},
+		{"eso outside a cluster without a server", func(f *bootFixture) { f.cfg.ConnectorsFile = esoFile }, "not running in a cluster"},
 		{"gateway id is not a uuid", func(f *bootFixture) {
 			f.env = envMap(map[string]string{"SB_GATEWAY_ID": "gw-tenant-a-uat", "SB_GATEWAY_SECRET": testSecret})
 		}, "UUID"},

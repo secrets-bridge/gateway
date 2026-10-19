@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -50,7 +49,8 @@ type Server struct {
 }
 
 // ValidateLoopback refuses any listen address whose host is not a
-// loopback IP or "localhost". An empty host ("":8091) binds every
+// literal loopback IP. "localhost" is refused, because what it resolves
+// to depends on the resolver and /etc/hosts. An empty host ("":8091) binds every
 // interface and is refused too. The Gateway has no inbound listener
 // except this one, and it stays on loopback.
 func ValidateLoopback(addr string) error {
@@ -60,9 +60,6 @@ func ValidateLoopback(addr string) error {
 	}
 	if port == "" {
 		return fmt.Errorf("local address %q has no port", addr)
-	}
-	if strings.EqualFold(host, "localhost") {
-		return nil
 	}
 	ip := net.ParseIP(host)
 	if ip == nil || !ip.IsLoopback() {

@@ -9,7 +9,8 @@ import (
 	"net/url"
 	"os"
 	"strings"
-	"time"
+
+	"github.com/secrets-bridge/gateway/internal/client"
 )
 
 // validateEndpoint enforces the transit-security posture:
@@ -27,14 +28,14 @@ func validateEndpoint(endpoint string, insecure bool) (*url.URL, error) {
 	}
 	u, err := url.Parse(endpoint)
 	if err != nil {
-		// url.Parse errors quote the whole raw URL, userinfo included;
-		// keep only the reason so the startup error log can't carry a
-		// credential embedded in SB_CP_ENDPOINT.
-		var uerr *url.Error
-		if errors.As(err, &uerr) {
-			err = uerr.Err
-		}
-		return nil, fmt.Errorf("SB_CP_ENDPOINT is not a valid URL: %w", err)
+		// url.Parse errors quote the raw URL, and even the inner reason
+		// can quote part of it: "https://gw:pa/ss@cp.example.com" fails
+		// with `invalid port ":pa"`, a piece of the password. No part of
+		// the parse error is kept.
+		return nil, errors.New("SB_CP_ENDPOINT is not a valid URL")
+	}
+	if u.User != nil {
+		return nil, errors.New("SB_CP_ENDPOINT must not carry userinfo; the gateway credential comes from the identity file")
 	}
 	scheme := strings.ToLower(u.Scheme)
 	switch scheme {
@@ -64,26 +65,7 @@ func buildHTTPClient(cfg Config) (*http.Client, error) {
 		return nil, err
 	}
 
-	transport := &http.Transport{
-		TLSClientConfig:       tlsCfg,
-		ResponseHeaderTimeout: 30 * time.Second,
-		IdleConnTimeout:       60 * time.Second,
-		MaxIdleConns:          16,
-	}
-	return &http.Client{
-		Timeout:       30 * time.Second,
-		Transport:     transport,
-		CheckRedirect: refuseRedirect,
-	}, nil
-}
-
-// refuseRedirect stops the Gateway's HTTP client from following any
-// redirect. Go re-sends custom headers such as the gateway secret
-// to the Location host, including an https -> http downgrade to another
-// host, so a 3xx from the CP is returned to the caller as-is and treated
-// as an error there.
-func refuseRedirect(*http.Request, []*http.Request) error {
-	return http.ErrUseLastResponse
+	return client.NewHTTPClient(tlsCfg), nil
 }
 
 // buildTLSConfig returns the *tls.Config to install on the HTTP

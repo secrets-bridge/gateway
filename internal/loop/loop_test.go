@@ -722,3 +722,69 @@ func TestNewReplicaID(t *testing.T) {
 		t.Fatalf("replica ids %q %q", a, b)
 	}
 }
+
+// TestLoop_OverPrivilegeAddedAfterStart: a connector that passed its
+// self-check is checked again every PrivilegeRecheckInterval. A Secrets
+// grant added after start makes the replica not ready, stops claiming,
+// reports over_privileged and logs the reason.
+func TestLoop_OverPrivilegeAddedAfterStart(t *testing.T) {
+	var granted atomic.Bool
+	var checks atomic.Int32
+	rollout := okConn("rollout-main", connectors.KindRollout)
+	rollout.check = func() error {
+		checks.Add(1)
+		if granted.Load() {
+			return fmt.Errorf("can patch secrets: %w", connectors.ErrOverPrivileged)
+		}
+		return nil
+	}
+	h := newHarness(t, func(c *Config) { c.PrivilegeRecheckInterval = 20 * time.Millisecond },
+		okConn("eso-main", connectors.KindESO), rollout)
+	h.start()
+	waitFor(t, "ready and claiming", func() bool { return h.ready.ready.Load() && h.cp.snapshot().claimCalls > 0 })
+	// Passing connectors are checked again, not only the failed ones.
+	before := checks.Load()
+	waitFor(t, "periodic recheck of a passing connector", func() bool { return checks.Load() > before+1 })
+
+	granted.Store(true)
+	select {
+	case err := <-h.done:
+		h.done <- err
+		if !errors.Is(err, connectors.ErrOverPrivileged) {
+			t.Fatalf("Run err = %v, want ErrOverPrivileged", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("loop kept running after a Secrets grant was added")
+	}
+	if h.ready.ready.Load() {
+		t.Fatal("ready with an over-privileged connector")
+	}
+	claims := h.cp.snapshot().claimCalls
+	time.Sleep(100 * time.Millisecond)
+	snap := h.cp.snapshot()
+	if snap.claimCalls != claims {
+		t.Fatalf("claiming continued: %d then %d", claims, snap.claimCalls)
+	}
+	if len(snap.heartbeats) == 0 || snap.heartbeats[len(snap.heartbeats)-1]["status"] != "over_privileged" {
+		t.Fatalf("last heartbeat = %v", snap.heartbeats[len(snap.heartbeats)-1])
+	}
+	logs := h.logs.String()
+	if !strings.Contains(logs, "over-privileged credential") || !strings.Contains(logs, "rollout-main") {
+		t.Fatalf("reason not logged: %s", logs)
+	}
+}
+
+// With the default interval a passing connector is not checked before
+// every heartbeat.
+func TestLoop_PassingConnectorNotRecheckedEveryHeartbeat(t *testing.T) {
+	var checks atomic.Int32
+	rollout := okConn("rollout-main", connectors.KindRollout)
+	rollout.check = func() error { checks.Add(1); return nil }
+	h := newHarness(t, nil, okConn("eso-main", connectors.KindESO), rollout)
+	h.start()
+	waitFor(t, "ready", func() bool { return h.ready.ready.Load() })
+	waitFor(t, "several heartbeats", func() bool { return len(h.cp.snapshot().heartbeats) > 5 })
+	if n := checks.Load(); n != 1 {
+		t.Fatalf("passing connector checked %d times, want 1", n)
+	}
+}

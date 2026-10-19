@@ -416,22 +416,39 @@ func (r *Registry) Catalog() []CatalogEntry {
 // over-privileged, and otherwise ErrPrivilegeUnproven if any connector
 // could not prove it cannot read Secrets: both refuse the boot.
 func (r *Registry) Check(ctx context.Context, timeout time.Duration) error {
-	return r.check(ctx, timeout, false)
+	return r.check(ctx, timeout, checkBoot)
 }
 
 // Recheck runs the self-check again for connectors whose last check did
 // not pass, and returns ErrOverPrivileged if any of them now is.
 func (r *Registry) Recheck(ctx context.Context, timeout time.Duration) error {
-	return r.check(ctx, timeout, true)
+	return r.check(ctx, timeout, checkFailed)
 }
 
-func (r *Registry) check(ctx context.Context, timeout time.Duration, onlyFailed bool) error {
+// RecheckAll runs the self-check again for every connector, including
+// those whose last check passed, so a Secrets grant added after start is
+// found. It returns ErrOverPrivileged if any connector now is. A check
+// that cannot prove the absence of Secrets access leaves the connector
+// degraded (not ready) until a later check passes.
+func (r *Registry) RecheckAll(ctx context.Context, timeout time.Duration) error {
+	return r.check(ctx, timeout, checkAll)
+}
+
+type checkMode int
+
+const (
+	checkBoot checkMode = iota
+	checkFailed
+	checkAll
+)
+
+func (r *Registry) check(ctx context.Context, timeout time.Duration, mode checkMode) error {
 	var over, unproven error
 	for _, n := range r.Names() {
 		r.mu.Lock()
 		last := r.health[n]
 		r.mu.Unlock()
-		if onlyFailed && last == HealthOK {
+		if mode == checkFailed && last == HealthOK {
 			continue
 		}
 		if last == HealthOverPrivileged {
@@ -461,7 +478,7 @@ func (r *Registry) check(ctx context.Context, timeout time.Duration, onlyFailed 
 	if over != nil {
 		return over
 	}
-	if !onlyFailed {
+	if mode == checkBoot {
 		// At boot an unproven check refuses the start. A recheck leaves
 		// the connector degraded, so the replica stays not ready.
 		return unproven

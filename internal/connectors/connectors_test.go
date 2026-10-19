@@ -416,3 +416,45 @@ func TestOutcomesMatchSchema(t *testing.T) {
 		t.Fatal("verified is a valid stage outcome")
 	}
 }
+
+// RecheckAll checks every connector again, including those that passed,
+// so a Secrets grant added after start is found. An unproven result
+// leaves the connector degraded without failing the call.
+func TestRegistry_RecheckAll(t *testing.T) {
+	var granted, unproven bool
+	a := &fakeConnector{name: "rollout-main", kind: KindRollout, check: func() error {
+		if granted {
+			return fmt.Errorf("x: %w", ErrOverPrivileged)
+		}
+		return nil
+	}}
+	b := &fakeConnector{name: "eso-main", kind: KindESO, check: func() error {
+		if unproven {
+			return fmt.Errorf("x: %w", ErrPrivilegeUnproven)
+		}
+		return nil
+	}}
+	r, err := NewRegistry(a, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Check(context.Background(), time.Second); err != nil {
+		t.Fatal(err)
+	}
+	granted, unproven = true, true
+	if err := r.Recheck(context.Background(), time.Second); err != nil || a.checks != 1 {
+		t.Fatalf("Recheck err = %v, checks = %d: passing connectors must not be rechecked", err, a.checks)
+	}
+	if err := r.RecheckAll(context.Background(), time.Second); !errors.Is(err, ErrOverPrivileged) {
+		t.Fatalf("RecheckAll err = %v, want ErrOverPrivileged", err)
+	}
+	if a.checks != 2 || b.checks != 2 {
+		t.Fatalf("checks = %d, %d", a.checks, b.checks)
+	}
+	want := map[string]HealthStatus{"rollout-main": HealthOverPrivileged, "eso-main": HealthDegraded}
+	for _, h := range r.Health() {
+		if h.Status != want[h.Connector] {
+			t.Fatalf("%s = %s, want %s", h.Connector, h.Status, want[h.Connector])
+		}
+	}
+}

@@ -52,6 +52,7 @@ type Connectors interface {
 	Catalog() []connectors.CatalogEntry
 	Health() []connectors.Health
 	Recheck(ctx context.Context, timeout time.Duration) error
+	RecheckAll(ctx context.Context, timeout time.Duration) error
 }
 
 // Readiness is the readiness gate (*local.Probes).
@@ -71,6 +72,9 @@ const (
 	DefaultDrainTimeout      = 10 * time.Second
 	DefaultCallTimeout       = 10 * time.Second
 	DefaultMinStageBudget    = time.Second
+	// DefaultPrivilegeRecheckInterval is how often every connector's
+	// self-check, including the over-privilege check, is run again.
+	DefaultPrivilegeRecheckInterval = 5 * time.Minute
 
 	maxBackoff          = 60 * time.Second
 	minHeartbeatSeconds = 5
@@ -110,6 +114,11 @@ type Config struct {
 	// MinStageBudget: a stage is not started with less time than this
 	// left in the pass.
 	MinStageBudget time.Duration
+	// PrivilegeRecheckInterval is how often the self-check of every
+	// connector is run again, including connectors whose last check
+	// passed, so a Secrets grant added after start is found. Connectors
+	// whose last check failed are rechecked before every heartbeat.
+	PrivilegeRecheckInterval time.Duration
 	// ResultRetry is the wait before each retry of a result post after a
 	// network error or a 5xx. Default 1s, 2s, 4s.
 	ResultRetry []time.Duration
@@ -181,6 +190,7 @@ func New(cfg Config) (*Loop, error) {
 	def(&cfg.DrainTimeout, DefaultDrainTimeout)
 	def(&cfg.CallTimeout, DefaultCallTimeout)
 	def(&cfg.MinStageBudget, DefaultMinStageBudget)
+	def(&cfg.PrivilegeRecheckInterval, DefaultPrivilegeRecheckInterval)
 	if cfg.ClaimIdleMax < cfg.ClaimInterval {
 		cfg.ClaimIdleMax = cfg.ClaimInterval
 	}
@@ -421,14 +431,29 @@ func (l *Loop) catVersion() string {
 func (l *Loop) heartbeatLoop(ctx context.Context) {
 	interval := l.cfg.HeartbeatInterval
 	backoff := time.Second
+	// The boot self-check ran just before the loop started.
+	lastFull := l.startedAt
 	for {
 		// Self-checks that did not pass are retried before each
-		// heartbeat, so the reported health is current.
-		if err := l.cfg.Connectors.Recheck(ctx, l.cfg.CallTimeout); errors.Is(err, connectors.ErrOverPrivileged) {
+		// heartbeat, so the reported health is current. Every
+		// PrivilegeRecheckInterval all connectors are checked again,
+		// including those that passed, so a Secrets grant added after
+		// start is found.
+		recheck := l.cfg.Connectors.Recheck
+		if now := l.cfg.Now(); now.Sub(lastFull) >= l.cfg.PrivilegeRecheckInterval {
+			recheck = l.cfg.Connectors.RecheckAll
+			lastFull = now
+		}
+		err := recheck(ctx, l.cfg.CallTimeout)
+		if errors.Is(err, connectors.ErrOverPrivileged) {
+			l.cfg.Ready.SetReady(false)
+			l.log.Error("connector self-check found an over-privileged credential; not ready, claiming stopped, gateway stopping",
+				"error", err)
 			l.reportOverPrivileged()
 			l.fail(err)
 			return
 		}
+		l.updateReady()
 		status := client.ReplicaOK
 		if !l.connectorsHealthy() {
 			status = client.ReplicaDegraded

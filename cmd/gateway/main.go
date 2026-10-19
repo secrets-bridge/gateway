@@ -40,6 +40,7 @@ import (
 
 	"github.com/secrets-bridge/gateway/internal/client"
 	"github.com/secrets-bridge/gateway/internal/connectors"
+	"github.com/secrets-bridge/gateway/internal/connectors/argocd"
 	"github.com/secrets-bridge/gateway/internal/connectors/eso"
 	"github.com/secrets-bridge/gateway/internal/connectors/kubeconn"
 	"github.com/secrets-bridge/gateway/internal/connectors/rollout"
@@ -129,6 +130,7 @@ var connectorFactories = func(cfg Config, getenv func(string) (string, bool), lo
 	return connectors.Factories{
 		connectors.KindESO:     eso.Factory(kopts),
 		connectors.KindRollout: rollout.Factory(kopts),
+		connectors.KindArgoCD:  argocd.NewFactory(argocd.Options{AllowInsecureHTTP: cfg.InsecureTransport}),
 	}
 }
 

@@ -13,7 +13,7 @@
 
 **Optional, outbound-only observation plane for [Secrets Bridge](https://github.com/secrets-bridge).** A Gateway runs inside a customer security boundary, reads local integrations (External Secrets Operator, Kubernetes rollout state, ArgoCD) without changing anything, and reports metadata-only evidence that an approved secret change actually reached the workloads.
 
-> **Status: early implementation.** The design is [ADR 0001: Gateway as an outbound-only observation plane](docs/adr/0001-gateway-observation-plane.md) (status: Accepted), with detail in [`docs/design/`](docs/design/) and the wire schemas in [`schemas/`](schemas/). The implementation is in progress on draft pull requests and is not usable yet. The current code boots, loads its identity and locally bound connectors, and serves loopback health and metrics. It heartbeats to the control plane, uploads its catalog and claims observation tasks. The only connector kind so far is `argocd`, which reports ArgoCD Application status as context. ESO and rollout connectors are not in this build, so tasks that name them are refused with `unknown_connector`.
+> **Status: early implementation.** The design is [ADR 0001: Gateway as an outbound-only observation plane](docs/adr/0001-gateway-observation-plane.md) (status: Accepted), with detail in [`docs/design/`](docs/design/) and the wire schemas in [`schemas/`](schemas/). The implementation is in progress on draft pull requests and is not usable yet. The current code boots, loads its identity and locally bound connectors, and serves loopback health and metrics. It heartbeats to the control plane, uploads its catalog and claims observation tasks. It can read ExternalSecret status and Deployment rollout state through bound `eso` and `rollout` connectors. The ArgoCD connector is not in this build yet.
 
 ## How it fits
 
@@ -43,20 +43,25 @@ Control Plane (api, worker, Postgres)
 | `internal/contract` | Go structs for the v1 ObservationTask and EvidenceResult, with validation that matches the JSON schemas vendored under `internal/contract/testdata`. `StageEvidence` is the one evidence model every connector returns |
 | `internal/loop` | Heartbeat loop with connector health and the catalog upload, and the claim loop: jittered polling with idle backoff, bounded concurrency, one pass per lease that ends before the lease runs out, `attempt_id` echoed on every call, refusal of any task that names a connector or target not configured locally, the change marker passed to each connector, and stage linkage derived from the facts |
 | `internal/connectors` | Connector interface (targets, self-check, observe), the registry of locally bound connectors and their targets, and the loader for the connectors file |
-| `internal/connectors/argocd` | Read-only ArgoCD connector. One `GET /api/v1/applications/{name}` per observation and `GET /api/v1/session/userinfo` for the self-check. The token is read from a file. Results are context only: at most `observed`, confidence `low`, linkage `none` |
+| `internal/connectors/eso` | ESO connector. Reads one ExternalSecret by name (`external-secrets.io/v1`, falling back to `v1beta1` when `v1` is not served) and proposes an `eso_sync` outcome. It compares the remote keys and pinned versions with the task inside the Gateway and reports only the comparison result. It never reads the target Secret or the condition message |
+| `internal/connectors/rollout` | Rollout connector. Reads one `apps/v1` Deployment and the ReplicaSets it owns and proposes a `workload_rollout` outcome. It derives the consumption mode by comparing the Secret names in the pod template with the ExternalSecret target name, and reports only the mode. It does not read pods, logs, events or Secrets |
+| `internal/connectors/kubeconn` | What the Kubernetes connectors share: settings, the per-connector client, and the boot self-check |
+| `internal/kube` | Minimal Kubernetes REST client on `net/http` and `internal/readonly`. Each connector gets its own client with its own path and query allowlist. It uses the in-cluster service account or an explicit server, CA and token file, re-reads the token file when it rotates, and never puts a URL, namespace, object name or label selector in an error |
 | `internal/readonly` | The only transport for connector clients. Per client it allowlists GET path patterns and query keys, allows POST only to the two Kubernetes self-review paths with a JSON body, and refuses opaque or non-canonical URLs, upgrades, exec, attach, portforward, proxy and log paths, and Kubernetes Secret paths before a request leaves the process |
 | `internal/identity` | Loads the gateway id and secret from env vars or a JSON file. Read-only, with no enrollment and no keypair. The secret is redacted in every fmt, JSON and slog output |
 | `internal/local` | Loopback-only `/healthz`, `/readyz` and `/metrics` server |
 | `internal/observability` | JSON structured logger |
 | `internal/guard` | Guard tests for the module graph and source tree (see Development) |
+| `deploy/rbac-example.yaml` | Example namespaced Role and RoleBinding: `get` on externalsecrets and deployments, `list` on replicasets. There is no ClusterRole. A test fails on any cluster-scoped kind, secrets resource, wildcard or write verb |
 
-Planned next: the ESO and rollout connectors, and `enroll` and `healthcheck` subcommands.
+Planned next: the ArgoCD connector, and `enroll` and `healthcheck` subcommands.
 
 Runtime behaviour:
 
 - Readiness needs a recent accepted heartbeat, an accepted catalog and a passing self-check on every connector. Claiming starts only after the first heartbeat and catalog are accepted.
 - A 401 from the control plane, or an unsupported contract version, stops claiming and leaves the process up and not ready, with the reason in the logs, so the pod does not restart-loop.
-- A connector whose credential can read Kubernetes Secrets (or write) refuses the boot, and no setting overrides that.
+- At boot each Kubernetes connector runs a self-check in every allowed namespace: a SelfSubjectRulesReview, a SelfSubjectAccessReview for `get`, `list` and `watch` on `secrets` (for every verb, `create`, `update`, `patch`, `delete`, `deletecollection` and `*` included, when the rules review is incomplete), and a SelfSubjectAccessReview for each verb the connector needs. If any `secrets` verb is allowed, or a review call fails, the Gateway refuses to start, and no setting overrides that. A failed review call includes a 401 on the pod's service account token: unlike a 401 from the control plane, it makes the pod restart-loop by design, with the reason in the log, because the Gateway must not run without proving it cannot read Secrets.
+- The self-check of every connector runs again every 5 minutes. A `secrets` grant added after start makes the replica not ready, stops claiming, logs the reason and stops the Gateway. A missing required verb keeps the replica not ready. These two review creations are the only non-GET Kubernetes requests the transport lets through.
 - The Gateway proposes stage outcomes only. It never sends a verdict, and it reports `version_pinned` only when the ExternalSecret pins a version that matches the provider version the agent reported.
 
 ## Configuration
@@ -84,49 +89,35 @@ Each variable also has a flag; run `gateway -h` for the list.
 
 `SB_CP_ENDPOINT` must not carry userinfo. The Gateway ignores `HTTP_PROXY` and `HTTPS_PROXY` for every connection, to the control plane and to connectors, so a bearer credential never reaches a proxy.
 
-The connectors file is a JSON array. Each entry has a `name` (a DNS label that the control plane binds to), a `kind` (`eso`, `rollout` or `argocd`) and kind-specific `settings`. The loader refuses unknown kinds, duplicate names and unknown fields, and its errors never repeat settings content. This build implements the `argocd` kind. It refuses `eso` and `rollout` entries at boot as not supported.
+The connectors file is a JSON array. Each entry has a `name` (a DNS label that the control plane binds to), a `kind` (`eso`, `rollout` or `argocd`) and kind-specific `settings`. The loader refuses unknown kinds, duplicate names and unknown fields, and its errors never repeat settings content. This build implements the `eso` and `rollout` kinds and refuses `argocd` at boot as not supported.
 
 ```json
 [
   {
-    "name": "argocd-main",
-    "kind": "argocd",
+    "name": "eso-main",
+    "kind": "eso",
     "settings": {
-      "base_url": "https://argocd.example.com",
-      "token_file": "/etc/secrets-bridge/gateway/argocd/argocd-main/token",
-      "ca_file": "/etc/secrets-bridge/gateway/argocd/argocd-main/ca.crt",
-      "timeout": "10s",
-      "allowed_projects": ["tenant-a"],
-      "applications": [
-        {"id": "payments", "name": "payments-api", "app_namespace": ""}
-      ]
+      "namespaces": ["tenant-a-uat"],
+      "targets": [{"id": "payments-api", "namespace": "tenant-a-uat", "external_secret": "payments-env"}]
+    }
+  },
+  {
+    "name": "rollout-main",
+    "kind": "rollout",
+    "settings": {
+      "namespaces": ["tenant-a-uat"],
+      "targets": [{"id": "payments-api", "namespace": "tenant-a-uat", "deployment": "payments-api"}]
     }
   }
 ]
 ```
 
-ArgoCD settings:
+The control plane names only a connector and a target id. The namespace and object name stay in this file, and a target whose namespace is not in `namespaces` is refused at boot. Without a `kubernetes` block a connector uses the pod's service account. To reach another cluster, add `"kubernetes": {"server": "https://k8s.example.com:6443", "ca_file": "/etc/gateway/k8s-ca.crt", "token_file": "/etc/gateway/k8s-token"}`. The server must be an `https://` origin with no path, unless `SB_INSECURE_TRANSPORT=true`.
 
-- `base_url` must be `https://` (`http://` only with `SB_INSECURE_TRANSPORT=true`, for development). It may not carry credentials, a query, a fragment or percent-encoding, and its path may only hold plain lower-case segments.
-- `token_file` is read on each request and again whenever the file changes, so a rotated token needs no restart. There is no inline token setting.
-- `ca_file`, when set, is the only trust anchor. `tls_server_name` overrides the server name.
-- `applications` maps the target ids the control plane may bind to ArgoCD Applications. The catalog advertises each id with the Application name and app namespace, for display only. A task that names any other target id is refused with `unbound_target` before anything is read.
-- `allowed_projects` lists the AppProjects the connector may report on. An Application in any other project comes back `unverifiable`, with sync and health reported as `Unknown`.
+What the Kubernetes connectors propose (the control plane recomputes every outcome from the facts):
 
-The read-only transport admits exactly `GET <base>/api/v1/applications/<name>`, with `appNamespace` as the only query key, and `GET <base>/api/v1/session/userinfo`. It refuses every other method, path and query key before the request leaves the process: the application list, `resource-tree`, `managed-resources`, `manifests`, and `refresh`, which would make ArgoCD patch the Application.
-
-ArgoCD outcomes (stage `argocd_context`, never part of a verdict):
-
-| ArgoCD state | Outcome | Caveats besides `argocd_health_not_proof` |
-|---|---|---|
-| Healthy, Synced, no operation or `Succeeded`, reconciled after the change | `observed`, confidence `low` | none |
-| The same, reconciled before the change or with no reconcile time | `not_observed` | `observed_before_not_before` |
-| Operation `Failed` or `Error` | `not_observed` | `argocd_operation_unrelated` |
-| Anything else (OutOfSync, Progressing, Degraded, Running) | `not_observed` | none |
-| Application outside `allowed_projects` | `unverifiable` | none |
-| Read failed (401, 403, 404, timeout, TLS, size) | `error` with `connector_unauthorized`, `connector_forbidden`, `resource_not_found` and so on | none |
-
-`error` and `not_observed` are not terminal, so the control plane looks again; a rotated or revoked token does not close the stage. Health and operation messages, sources and Helm values are never decoded.
+- `eso_sync` is `observed` when the ExternalSecret is `Ready=True` with reason `SecretSynced`, a `remoteRef.key` equals the changed secret, and `refreshTime` is strictly after `executed_at` plus skew and the measured API server offset. It is `failed` when `Ready=False` changed after that bound, and `unverifiable` when the key does not match, `dataFrom` uses `find`, the version is pinned to something else, or no timer refresh can happen before the deadline.
+- `workload_rollout` is `observed` when the current ReplicaSet was created after the ESO refresh of the same pass (or the revision rose above the control plane's baseline) and the rollout is complete by the `kubectl rollout status` rules. It is `failed` on `ProgressDeadlineExceeded` for such a rollout, `not_applicable` for a volume consumer with no restart trigger, and `unverifiable` for `subPath` mounts, paused or zero-replica Deployments, and env consumers with no reload mechanism.
 
 ## Development
 

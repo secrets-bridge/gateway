@@ -59,6 +59,10 @@ type fakeCP struct {
 	catVersion string        // the stored catalog version heartbeats return
 	cpSkew     time.Duration // CP clock minus real clock, for the Date header
 	noDate     bool          // omit the Date header (offset unknown)
+	// hbDelay holds every heartbeat except shutting_down this long
+	// before it is recorded and answered, so one is in flight when the
+	// loop halts or shuts down.
+	hbDelay time.Duration
 
 	heartbeats []map[string]any
 	catalogs   []map[string]any
@@ -104,6 +108,18 @@ func write(w http.ResponseWriter, r reply) {
 
 func (f *fakeCP) serve(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
+	if strings.HasSuffix(r.URL.Path, "/heartbeat") {
+		var hb struct {
+			Status string `json:"status"`
+		}
+		_ = json.Unmarshal(body, &hb)
+		f.mu.Lock()
+		d := f.hbDelay
+		f.mu.Unlock()
+		if hb.Status != "shutting_down" && d > 0 {
+			time.Sleep(d)
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.noDate {

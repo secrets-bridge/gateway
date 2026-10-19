@@ -217,6 +217,7 @@ func TestObserve_ThroughRegistry(t *testing.T) {
 	t.Run("healthy is observed with low confidence and the health caveat", func(t *testing.T) {
 		g := &fakeClient{app: healthyApp()}
 		r, _ := connectors.NewRegistry(newFakeConnector(g))
+		_ = r.Check(ctx, time.Second)
 		obs, err := r.Observe(ctx, "argocd-main", target("payments"))
 		if err != nil {
 			t.Fatal(err)
@@ -243,6 +244,7 @@ func TestObserve_ThroughRegistry(t *testing.T) {
 	t.Run("target not in applications is refused without a read", func(t *testing.T) {
 		g := &fakeClient{app: healthyApp()}
 		r, _ := connectors.NewRegistry(newFakeConnector(g))
+		_ = r.Check(ctx, time.Second)
 		_, err := r.Observe(ctx, "argocd-main", target("orders"))
 		if !errors.Is(err, connectors.ErrUnboundTarget) || g.calls.Load() != 0 {
 			t.Fatalf("err = %v, calls = %d", err, g.calls.Load())
@@ -256,6 +258,7 @@ func TestObserve_ThroughRegistry(t *testing.T) {
 	t.Run("app namespace from settings", func(t *testing.T) {
 		g := &fakeClient{app: with(func(a *Application) { a.Name = "billing-api"; a.Namespace = "tenant-a-uat" })}
 		r, _ := connectors.NewRegistry(newFakeConnector(g))
+		_ = r.Check(ctx, time.Second)
 		obs, _ := r.Observe(ctx, "argocd-main", target("billing"))
 		if obs.Outcome != connectors.OutcomeObserved || g.ns != "tenant-a-uat" {
 			t.Fatalf("obs = %+v ns = %q", obs, g.ns)
@@ -269,6 +272,7 @@ func TestObserve_ThroughRegistry(t *testing.T) {
 		} {
 			g := &fakeClient{app: app}
 			r, _ := connectors.NewRegistry(newFakeConnector(g))
+			_ = r.Check(ctx, time.Second)
 			id := "payments"
 			if name == "other namespace" {
 				id = "billing"
@@ -290,6 +294,7 @@ func TestObserve_ThroughRegistry(t *testing.T) {
 		} {
 			g := &fakeClient{err: err}
 			r, _ := connectors.NewRegistry(newFakeConnector(g))
+			_ = r.Check(ctx, time.Second)
 			obs, oerr := r.Observe(ctx, "argocd-main", target("payments"))
 			if oerr != nil || obs.Outcome != connectors.OutcomeError || obs.Evidence.ErrorCode != code {
 				t.Fatalf("%v: obs = %+v err = %v", err, obs, oerr)

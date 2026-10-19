@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -55,8 +56,8 @@ func TestSelfCheckPasses(t *testing.T) {
 	if err != nil || rep.WriteVerbs {
 		t.Fatalf("SelfCheck = %+v, %v", rep, err)
 	}
-	// Per namespace: three secrets reviews, one rules review, then one
-	// review per required access.
+	// Per namespace: one rules review, three secrets reviews (the rules
+	// review is complete), then one review per required access.
 	var ssar, ssrr int
 	for _, r := range s.Requests() {
 		switch r {
@@ -168,6 +169,96 @@ func TestSelfCheckBranches(t *testing.T) {
 			}
 			if strings.Contains(err.Error(), "tenant-") || strings.Contains(err.Error(), s.URL()) {
 				t.Fatalf("error names a namespace or the server: %v", err)
+			}
+		})
+	}
+}
+
+var allSecretVerbs = []string{"get", "list", "watch", "create", "update", "patch", "delete", "deletecollection", "*"}
+
+func incomplete(string) (int, any) {
+	return 200, map[string]any{"resourceRules": []any{}, "incomplete": true}
+}
+
+// Every verb on secrets, read or write, is over-privilege. With an
+// incomplete rules review it is found by an access review for that verb.
+func TestSelfCheckIncompleteRulesAnySecretsVerb(t *testing.T) {
+	for _, verb := range allSecretVerbs {
+		t.Run(verb, func(t *testing.T) {
+			s := kubetest.New(t)
+			s.Rules = incomplete
+			s.Access = func(r kubetest.Review) (bool, int) {
+				if r.Resource == readonly.SecretsResource {
+					return r.Verb == verb && r.Namespace == "tenant-b-uat", 0
+				}
+				return true, 0
+			}
+			_, err := run(t, s)
+			if !errors.Is(err, connectors.ErrOverPrivileged) {
+				t.Fatalf("err = %v, want ErrOverPrivileged", err)
+			}
+			if !strings.Contains(err.Error(), "may "+verb+" secrets") {
+				t.Fatalf("err = %v does not name the verb", err)
+			}
+		})
+	}
+}
+
+// With a complete rules review, a secrets rule with any verb is
+// over-privilege.
+func TestSelfCheckRulesAnySecretsVerb(t *testing.T) {
+	for _, verb := range allSecretVerbs {
+		t.Run(verb, func(t *testing.T) {
+			s := kubetest.New(t)
+			s.Rules = rules(rule([]string{""}, []string{"secrets"}, []string{verb}))
+			if _, err := run(t, s); !errors.Is(err, connectors.ErrOverPrivileged) {
+				t.Fatalf("err = %v, want ErrOverPrivileged", err)
+			}
+		})
+	}
+}
+
+// An incomplete rules review makes the check ask about every secrets
+// verb in every namespace; each must answer or the check fails closed.
+func TestSelfCheckIncompleteRulesAsksEveryVerb(t *testing.T) {
+	s := kubetest.New(t)
+	s.Rules = incomplete
+	var mu sync.Mutex
+	asked := map[string]bool{}
+	s.Access = func(r kubetest.Review) (bool, int) {
+		if r.Resource == readonly.SecretsResource {
+			mu.Lock()
+			asked[r.Namespace+" "+r.Verb] = true
+			mu.Unlock()
+			return false, 0
+		}
+		return true, 0
+	}
+	if _, err := run(t, s); err != nil {
+		t.Fatalf("err = %v, want pass", err)
+	}
+	for _, ns := range namespaces {
+		for _, verb := range allSecretVerbs {
+			if !asked[ns+" "+verb] {
+				t.Errorf("no access review for %s on secrets", verb)
+			}
+		}
+	}
+	for _, verb := range allSecretVerbs {
+		t.Run("fails closed "+verb, func(t *testing.T) {
+			s := kubetest.New(t)
+			s.Rules = incomplete
+			s.Access = func(r kubetest.Review) (bool, int) {
+				if r.Resource == readonly.SecretsResource {
+					if r.Verb == verb {
+						return false, 500
+					}
+					return false, 0
+				}
+				return true, 0
+			}
+			if _, err := run(t, s); !errors.Is(err, connectors.ErrPrivilegeUnproven) {
+				t.Fatalf("err = %v, want ErrPrivilegeUnproven", err)
 			}
 		})
 	}

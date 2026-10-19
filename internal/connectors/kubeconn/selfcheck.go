@@ -19,10 +19,16 @@ type Access struct {
 	Resource string
 }
 
-// secretVerbs are the verbs the self-check asks about on core secrets.
-// Any of them allowed is over-privilege, because get, list and watch all
-// return Secret data.
-var secretVerbs = []string{"get", "list", "watch"}
+// secretReadVerbs are asked about on core secrets with an access review
+// in every namespace, whatever the rules review says, because get, list
+// and watch all return Secret data.
+var secretReadVerbs = []string{"get", "list", "watch"}
+
+// secretAllVerbs are asked about on core secrets with an access review
+// when the rules review is incomplete (for example with a webhook
+// authorizer), so a grant the rules list cannot show is still found.
+// Any verb on secrets, read or write, is over-privilege.
+var secretAllVerbs = []string{"get", "list", "watch", "create", "update", "patch", "delete", "deletecollection", "*"}
 
 // writeVerbs are reported as a warning when a rules review shows them on
 // a resource the connector reads (runtime design 5.3 step 4).
@@ -45,40 +51,32 @@ type Report struct {
 // SelfCheck is the boot self-check of runtime design section 5.3, run
 // for each allowed namespace:
 //
-//  1. A SelfSubjectAccessReview for get, list and watch on core secrets.
-//     Any allowed answer is over-privilege.
-//  2. A SelfSubjectRulesReview. A rule that covers secrets (directly or
-//     through "*") is over-privilege. An incomplete review is decided by
-//     the access reviews of step 1, which must all have answered.
+//  1. A SelfSubjectRulesReview. A rule that grants any verb on secrets
+//     or a secrets subresource (directly or through "*") is
+//     over-privilege.
+//  2. A SelfSubjectAccessReview on core secrets for get, list and watch,
+//     or, when the rules review is incomplete, for every verb: get,
+//     list, watch, create, update, patch, delete, deletecollection and
+//     "*". Any allowed answer is over-privilege, and every review must
+//     answer.
 //  3. A SelfSubjectAccessReview for each required access. A missing one
 //     fails the check without over-privilege, so the connector is not
 //     ready.
 //
-// A review call that fails in step 1 or 2 fails closed with
+// The check is run at boot and again on every runtime recheck, so a
+// grant added after start is found. A review call that fails in step 1
+// or 2 fails closed with
 // connectors.ErrPrivilegeUnproven. There is no override (ADR 0001
 // section 11). Errors name the verb and resource, never the namespace.
 func SelfCheck(ctx context.Context, rv Reviewer, namespaces []string, required []Access) (Report, error) {
 	var rep Report
 	for _, ns := range namespaces {
-		for _, verb := range secretVerbs {
-			allowed, err := accessReview(ctx, rv, ns, Access{Verb: verb, Resource: readonly.SecretsResource})
-			if err != nil {
-				return rep, fmt.Errorf("%w: access review for %s on secrets failed: %w", connectors.ErrPrivilegeUnproven, verb, reviewCause(err))
-			}
-			if allowed {
-				return rep, fmt.Errorf("%w: the service account may %s secrets", connectors.ErrOverPrivileged, verb)
-			}
-		}
-	}
-	for _, ns := range namespaces {
 		rules, err := rulesReview(ctx, rv, ns)
 		if err != nil {
 			return rep, fmt.Errorf("%w: rules review failed: %w", connectors.ErrPrivilegeUnproven, reviewCause(err))
 		}
-		// When rules.incomplete is true the access reviews above decide;
-		// every one of them answered "not allowed", or this point is not
-		// reached. A complete or incomplete list that still shows a
-		// secrets rule is over-privilege either way.
+		// A complete or incomplete list that shows a secrets rule is
+		// over-privilege either way.
 		for _, r := range rules.ResourceRules {
 			if len(r.Verbs) > 0 && coversCore(r.APIGroups) && coversSecrets(r.Resources) {
 				return rep, fmt.Errorf("%w: a role grants %s on secrets", connectors.ErrOverPrivileged, verbList(r.Verbs))
@@ -87,6 +85,21 @@ func SelfCheck(ctx context.Context, rv Reviewer, namespaces []string, required [
 				if coversGroup(r.APIGroups, a.Group) && coversResource(r.Resources, a.Resource) && hasWrite(r.Verbs) {
 					rep.WriteVerbs = true
 				}
+			}
+		}
+		// An incomplete list cannot prove the absence of a grant, so
+		// every verb is then asked about directly.
+		verbs := secretReadVerbs
+		if rules.Incomplete {
+			verbs = secretAllVerbs
+		}
+		for _, verb := range verbs {
+			allowed, err := accessReview(ctx, rv, ns, Access{Verb: verb, Resource: readonly.SecretsResource})
+			if err != nil {
+				return rep, fmt.Errorf("%w: access review for %s on secrets failed: %w", connectors.ErrPrivilegeUnproven, verbList([]string{verb}), reviewCause(err))
+			}
+			if allowed {
+				return rep, fmt.Errorf("%w: the service account may %s secrets", connectors.ErrOverPrivileged, verbList([]string{verb}))
 			}
 		}
 	}

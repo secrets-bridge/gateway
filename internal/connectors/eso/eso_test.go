@@ -351,6 +351,9 @@ func TestAPIErrors(t *testing.T) {
 			f := newFixture(t, v1Path, nil)
 			tc.setup(f.api)
 			reg, _ := connectors.NewRegistry(f.connector(t))
+			if err := reg.Check(context.Background(), 5*time.Second); err != nil {
+				t.Fatalf("self-check: %v", err)
+			}
 			obs, err := reg.Observe(context.Background(), "eso-main", target(version))
 			if err != nil {
 				t.Fatal(err)

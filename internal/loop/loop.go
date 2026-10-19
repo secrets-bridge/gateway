@@ -53,6 +53,9 @@ type Connectors interface {
 	Health() []connectors.Health
 	Recheck(ctx context.Context, timeout time.Duration) error
 	RecheckAll(ctx context.Context, timeout time.Duration) error
+	// Verified reports whether every connector's last self-check proved
+	// that its credential cannot read Secrets.
+	Verified() bool
 }
 
 // Readiness is the readiness gate (*local.Probes).
@@ -554,9 +557,26 @@ func (l *Loop) claimLoop(runCtx, workCtx context.Context) {
 	}
 	base := l.cfg.ClaimInterval
 	interval := base
+	paused := false
 	for {
 		if !sleepCtx(runCtx, l.cfg.Jitter(interval, 0.5, 1.5)) {
 			return
+		}
+		// Fail closed: while a recheck has not proven that every
+		// connector's credential cannot read Secrets, claim nothing. Not
+		// ready alone does not stop work in a pod that is not behind a
+		// Service. Claiming resumes after a passing recheck.
+		if !l.cfg.Connectors.Verified() {
+			if !paused {
+				paused = true
+				l.log.Warn("a connector self-check has not proven the credential cannot read secrets; claiming paused")
+			}
+			interval = base
+			continue
+		}
+		if paused {
+			paused = false
+			l.log.Info("connector self-checks passed; claiming resumed")
 		}
 		select {
 		case l.sem <- struct{}{}:

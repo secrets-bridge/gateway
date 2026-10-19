@@ -559,6 +559,9 @@ func TestAPIErrors(t *testing.T) {
 			f := newFixture(t)
 			f.dep, f.rs = tc.dep, tc.rs
 			reg, _ := connectors.NewRegistry(f.connector(t))
+			if err := reg.Check(context.Background(), 5*time.Second); err != nil {
+				t.Fatalf("self-check: %v", err)
+			}
 			obs, err := reg.Observe(context.Background(), "rollout-main", target())
 			if err != nil {
 				t.Fatal(err)

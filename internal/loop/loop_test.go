@@ -788,3 +788,67 @@ func TestLoop_PassingConnectorNotRecheckedEveryHeartbeat(t *testing.T) {
 		t.Fatalf("passing connector checked %d times, want 1", n)
 	}
 }
+
+// TestLoop_UnverifiedConnectorStopsWork: when a periodic recheck cannot
+// prove that a connector's credential cannot read Secrets (a review call
+// failed), the replica turns not ready, stops claiming and refuses to
+// observe through that connector. Not ready alone does not stop work in
+// a pod that is not behind a Service. A later passing recheck resumes
+// claiming.
+func TestLoop_UnverifiedConnectorStopsWork(t *testing.T) {
+	var unproven atomic.Bool
+	rollout := okConn("rollout-main", connectors.KindRollout)
+	rollout.check = func() error {
+		if unproven.Load() {
+			return fmt.Errorf("rules review failed: %w", connectors.ErrPrivilegeUnproven)
+		}
+		return nil
+	}
+	h := newHarness(t, func(c *Config) { c.PrivilegeRecheckInterval = 10 * time.Millisecond },
+		okConn("eso-main", connectors.KindESO), rollout)
+	h.start()
+	waitFor(t, "ready and claiming", func() bool { return h.ready.ready.Load() && h.cp.snapshot().claimCalls > 2 })
+
+	unproven.Store(true)
+	waitFor(t, "not ready after a failing recheck", func() bool { return !h.ready.ready.Load() })
+	before := h.cp.snapshot().claimCalls
+	// A task queued now must not be claimed while the connector is
+	// unverified.
+	h.cp.push(taskBody(t, taskOpts{n: 1, refs: []contract.ConnectorRef{
+		{ConnectorID: "rollout-main", TargetID: "payments-api", Stage: contract.StageWorkloadRollout},
+	}}))
+	time.Sleep(300 * time.Millisecond)
+	after := h.cp.snapshot()
+	// One claim may have been in flight when readiness dropped.
+	if after.claimCalls > before+1 {
+		t.Fatalf("claiming continued while unverified: %d -> %d claim calls", before, after.claimCalls)
+	}
+	if len(after.results) != 0 {
+		t.Fatalf("a task was run while unverified: %d results", len(after.results))
+	}
+	if h.ready.ready.Load() {
+		t.Fatal("ready with an unverified connector")
+	}
+	calls := rollout.calls.Load()
+	_, err := h.loop.cfg.Connectors.Observe(context.Background(), "rollout-main",
+		connectors.Target{ID: "payments-api", Stage: contract.StageWorkloadRollout})
+	if !errors.Is(err, connectors.ErrConnectorUnverified) {
+		t.Fatalf("Observe through an unverified connector: err = %v, want ErrConnectorUnverified", err)
+	}
+	if rollout.calls.Load() != calls {
+		t.Fatal("the unverified connector was read")
+	}
+	if !strings.Contains(h.logs.String(), "claiming paused") {
+		t.Fatal("pause not logged")
+	}
+
+	unproven.Store(false)
+	waitFor(t, "ready again after a passing recheck", h.ready.ready.Load)
+	res := decodeResult(t, h.waitResults(1)[0])
+	if res["attempt_status"] != "completed" || rollout.calls.Load() != calls+1 {
+		t.Fatalf("result after resume = %v (rollout calls %d)", res, rollout.calls.Load())
+	}
+	if h.cp.snapshot().claimCalls <= after.claimCalls {
+		t.Fatal("claiming did not resume")
+	}
+}

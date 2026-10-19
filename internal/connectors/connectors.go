@@ -242,8 +242,13 @@ var (
 	// credential cannot read Kubernetes Secrets (a review call failed,
 	// or a rules review was incomplete with no access review answer).
 	// The check fails closed: at boot the Gateway refuses to start, and
-	// later the connector stays not ready.
+	// later the connector stays not ready and unverified.
 	ErrPrivilegeUnproven = errors.New("connectors: self-check could not prove the credential cannot read secrets")
+	// ErrConnectorUnverified: Observe refused because the connector's
+	// last self-check did not prove that its credential cannot read
+	// Secrets, or no self-check has run yet. Nothing is read through it
+	// until a later check passes.
+	ErrConnectorUnverified = errors.New("connectors: connector self-check has not proven the credential cannot read secrets")
 	// ErrCheckUnauthorized: the integration refused the credential.
 	ErrCheckUnauthorized = errors.New("connectors: credential refused by the integration")
 	// ErrCheckUnreachable: the integration could not be reached.
@@ -302,6 +307,11 @@ type Registry struct {
 
 	mu     sync.Mutex
 	health map[string]HealthStatus
+	// verified is true for a connector whose last self-check proved,
+	// as far as its kind can, that the credential cannot read Secrets:
+	// the check returned neither ErrOverPrivileged nor
+	// ErrPrivilegeUnproven. It is false before the first check.
+	verified map[string]bool
 }
 
 // NewRegistry builds a registry. Names must be valid and unique, each
@@ -309,10 +319,11 @@ type Registry struct {
 // valid, unique ids and display names.
 func NewRegistry(cs ...Connector) (*Registry, error) {
 	r := &Registry{
-		byName:  make(map[string]Connector, len(cs)),
-		targets: make(map[string]map[string]struct{}, len(cs)),
-		health:  make(map[string]HealthStatus, len(cs)),
-		now:     time.Now,
+		byName:   make(map[string]Connector, len(cs)),
+		targets:  make(map[string]map[string]struct{}, len(cs)),
+		health:   make(map[string]HealthStatus, len(cs)),
+		verified: make(map[string]bool, len(cs)),
+		now:      time.Now,
 	}
 	for _, c := range cs {
 		if c == nil {
@@ -429,7 +440,8 @@ func (r *Registry) Recheck(ctx context.Context, timeout time.Duration) error {
 // those whose last check passed, so a Secrets grant added after start is
 // found. It returns ErrOverPrivileged if any connector now is. A check
 // that cannot prove the absence of Secrets access leaves the connector
-// degraded (not ready) until a later check passes.
+// degraded (not ready) and unverified until a later check passes: Observe
+// refuses it and Verified is false, so the loop claims nothing.
 func (r *Registry) RecheckAll(ctx context.Context, timeout time.Duration) error {
 	return r.check(ctx, timeout, checkAll)
 }
@@ -470,6 +482,7 @@ func (r *Registry) check(ctx context.Context, timeout time.Duration, mode checkM
 		}
 		r.mu.Lock()
 		r.health[n] = st
+		r.verified[n] = st != HealthOverPrivileged && !errors.Is(cerr, ErrPrivilegeUnproven)
 		r.mu.Unlock()
 		if st == HealthOverPrivileged {
 			over = fmt.Errorf("%w: connector %q", ErrOverPrivileged, n)
@@ -486,6 +499,26 @@ func (r *Registry) check(ctx context.Context, timeout time.Duration, mode checkM
 	return nil
 }
 
+// Verified reports whether every connector's last self-check proved that
+// its credential cannot read Secrets. While any connector is unverified
+// the loop claims no tasks (runtime design 5.3).
+func (r *Registry) Verified() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for n := range r.byName {
+		if !r.verified[n] {
+			return false
+		}
+	}
+	return true
+}
+
+func (r *Registry) isVerified(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.verified[name]
+}
+
 // Health returns the last self-check status of every connector, sorted
 // by name.
 func (r *Registry) Health() []Health {
@@ -499,7 +532,9 @@ func (r *Registry) Health() []Health {
 }
 
 // Observe runs one observation through the connector bound under name
-// and checks the result against the contract. A result that breaks the
+// and checks the result against the contract. It refuses, before any
+// read, a connector whose last self-check did not pass the Secrets
+// check (ErrConnectorUnverified). A result that breaks the
 // contract is replaced by an error outcome; it is never passed on. An
 // error outcome keeps the connector's error code when it is a v1 code.
 func (r *Registry) Observe(ctx context.Context, name string, target Target) (Observation, error) {
@@ -516,6 +551,11 @@ func (r *Registry) Observe(ctx context.Context, name string, target Target) (Obs
 	stage, _ := StageFor(c.Kind())
 	if target.Stage != stage {
 		return Observation{}, fmt.Errorf("%w: connector %q", ErrStageNotSupported, name)
+	}
+	if !r.isVerified(name) {
+		// Fail closed: nothing is read through a credential that has not
+		// been proven unable to read Secrets.
+		return Observation{}, fmt.Errorf("%w: connector %q", ErrConnectorUnverified, name)
 	}
 
 	obs, err := c.Observe(ctx, target)

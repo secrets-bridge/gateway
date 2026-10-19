@@ -10,18 +10,28 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/secrets-bridge/gateway/internal/connectors"
+	"github.com/secrets-bridge/gateway/internal/contract"
 )
 
 var allowed = map[string]struct{}{"tenant-a": {}}
 
+// Times used by the decision tests: the change bound is before the
+// reconcile of the healthy fixture.
+var (
+	testNotBefore  = time.Date(2026, 10, 1, 11, 0, 5, 0, time.UTC)
+	testReconciled = time.Date(2026, 10, 1, 11, 2, 0, 0, time.UTC)
+)
+
 func healthyApp() *Application {
-	return &Application{Name: "payments-api", Project: "tenant-a", SyncStatus: "Synced", HealthStatus: "Healthy", SyncRevision: "4f2a9c1"}
+	return &Application{Name: "payments-api", Namespace: "argocd", Project: "tenant-a", SyncStatus: "Synced",
+		HealthStatus: "Healthy", SyncRevision: "4f2a9c1", ReconciledAt: testReconciled}
 }
 
 func with(mut func(*Application)) *Application {
@@ -30,73 +40,121 @@ func with(mut func(*Application)) *Application {
 	return a
 }
 
+// stageFor builds the stage the loop would send for d, so a test can
+// check it against the argocd_context schema variant.
+func stageFor(d Decision) contract.StageObservation {
+	s := contract.StageObservation{
+		Stage:      contract.StageArgoCDContext,
+		Source:     contract.Source{ConnectorID: "argocd-main", TargetID: "payments", API: contract.APIArgoCD},
+		ObservedAt: testReconciled,
+		Outcome:    d.Outcome,
+		Confidence: d.Evidence.Confidence,
+		Caveats:    d.Evidence.Caveats,
+		Linkage:    contract.LinkageNone,
+		ErrorCode:  d.Evidence.ErrorCode,
+		Resource:   d.Evidence.Resource,
+	}
+	if d.Evidence.Facts != nil {
+		s.Facts = d.Evidence.Facts
+	}
+	if d.Outcome == connectors.OutcomeError {
+		s.Confidence = contract.ConfidenceNone
+		s.Caveats = []contract.Caveat{contract.CaveatArgoCDHealthNotProof}
+	}
+	return s
+}
+
 // The mapping is ported from the worker's decideTerminalState and
-// narrowed to Gateway outcomes. The "worker" column records what the
-// worker would have concluded, so the change in meaning is explicit.
+// narrowed to the argocd_context schema variant. The "worker" column
+// records what the worker would have concluded, so the change in
+// meaning is explicit.
 func TestDecide(t *testing.T) {
+	notProof := contract.CaveatArgoCDHealthNotProof
 	cases := []struct {
-		name    string
-		app     *Application
-		err     error
-		worker  string // applied / failed / "" in the worker poller
-		outcome connectors.Outcome
-		reason  string
-		caveats []connectors.Caveat
-		facts   bool
+		name      string
+		app       *Application
+		err       error
+		notBefore time.Time
+		worker    string // applied / failed / "" in the worker poller
+		outcome   connectors.Outcome
+		code      contract.ErrorCode
+		caveats   []contract.Caveat
 	}{
-		{"healthy synced no operation", healthyApp(), nil, "applied", connectors.OutcomeObserved, "", nil, true},
-		{"healthy synced succeeded", with(func(a *Application) { a.OperationPhase = "Succeeded" }), nil, "applied", connectors.OutcomeObserved, "", nil, true},
-		{"operation failed", with(func(a *Application) { a.OperationPhase = "Failed"; a.HealthStatus = "Degraded" }), nil, "failed",
-			connectors.OutcomeError, ReasonOperationFailed, []connectors.Caveat{connectors.CaveatArgoCDOperationUnrelated}, true},
-		{"operation error while healthy", with(func(a *Application) { a.OperationPhase = "Error" }), nil, "failed",
-			connectors.OutcomeError, ReasonOperationFailed, []connectors.Caveat{connectors.CaveatArgoCDOperationUnrelated}, true},
-		{"operation running", with(func(a *Application) { a.OperationPhase = "Running" }), nil, "", connectors.OutcomeNotObserved, ReasonOperationRunning, nil, true},
-		{"operation terminating", with(func(a *Application) { a.OperationPhase = "Terminating" }), nil, "", connectors.OutcomeNotObserved, ReasonOperationRunning, nil, true},
-		{"out of sync", with(func(a *Application) { a.SyncStatus = "OutOfSync" }), nil, "", connectors.OutcomeNotObserved, ReasonOutOfSync, nil, true},
-		{"progressing", with(func(a *Application) { a.HealthStatus = "Progressing" }), nil, "", connectors.OutcomeNotObserved, ReasonNotHealthy, nil, true},
-		{"degraded alone is context not failure", with(func(a *Application) { a.HealthStatus = "Degraded" }), nil, "", connectors.OutcomeNotObserved, ReasonNotHealthy, nil, true},
-		{"health missing", with(func(a *Application) { a.HealthStatus = "Missing" }), nil, "", connectors.OutcomeNotObserved, ReasonNotHealthy, nil, true},
-		{"unknown sync string normalized", with(func(a *Application) { a.SyncStatus = "Synced; rm -rf" }), nil, "", connectors.OutcomeNotObserved, ReasonOutOfSync, nil, true},
-		{"unknown phase dropped", with(func(a *Application) { a.OperationPhase = "Weird" }), nil, "", connectors.OutcomeObserved, "", nil, true},
-		{"multiple sources", with(func(a *Application) { a.SourceCount = 2 }), nil, "applied", connectors.OutcomeObserved, "", []connectors.Caveat{connectors.CaveatArgoCDMultipleSources}, true},
-		{"project not allowed", with(func(a *Application) { a.Project = "tenant-b" }), nil, "applied", connectors.OutcomeUnverifiable, ReasonProjectNotAllowed, nil, false},
-		{"empty project not allowed", with(func(a *Application) { a.Project = "" }), nil, "applied", connectors.OutcomeUnverifiable, ReasonProjectNotAllowed, nil, false},
-		{"missing app", nil, ErrNotFound, "", connectors.OutcomeNotObserved, ReasonNotFound, nil, false},
-		{"unauthorized", nil, ErrUnauthorized, "", connectors.OutcomeUnverifiable, ReasonUnauthorized, nil, false},
-		{"forbidden", nil, ErrForbidden, "", connectors.OutcomeUnverifiable, ReasonForbidden, nil, false},
-		{"no token", nil, ErrNoToken, "", connectors.OutcomeUnverifiable, ReasonCredentialMissing, nil, false},
-		{"timeout", nil, ErrTimeout, "", connectors.OutcomeError, ReasonTimeout, nil, false},
-		{"tls", nil, ErrTLS, "", connectors.OutcomeError, ReasonTLS, nil, false},
-		{"too large", nil, ErrResponseTooLarge, "", connectors.OutcomeError, ReasonTooLarge, nil, false},
-		{"rate limited", nil, ErrRateLimited, "", connectors.OutcomeError, ReasonRateLimited, nil, false},
-		{"unreachable", nil, ErrUnreachable, "", connectors.OutcomeError, ReasonUnreachable, nil, false},
-		{"redirect", nil, ErrRedirectRefused, "", connectors.OutcomeError, ReasonUnreachable, nil, false},
-		{"bad response", nil, fmt.Errorf("%w: HTTP 500", ErrBadResponse), "", connectors.OutcomeError, ReasonInternal, nil, false},
-		{"nil app no error", nil, nil, "", connectors.OutcomeError, ReasonInternal, nil, false},
+		{"healthy synced no operation", healthyApp(), nil, testNotBefore, "applied", connectors.OutcomeObserved, "", []contract.Caveat{notProof}},
+		{"healthy synced succeeded", with(func(a *Application) { a.OperationPhase = "Succeeded" }), nil, testNotBefore, "applied", connectors.OutcomeObserved, "", []contract.Caveat{notProof}},
+		{"healthy but reconciled before the change", healthyApp(), nil, testReconciled, "applied",
+			connectors.OutcomeNotObserved, "", []contract.Caveat{notProof, contract.CaveatObservedBeforeNotBefore}},
+		{"healthy with no reconcile time", with(func(a *Application) { a.ReconciledAt = time.Time{} }), nil, testNotBefore, "applied",
+			connectors.OutcomeNotObserved, "", []contract.Caveat{notProof, contract.CaveatObservedBeforeNotBefore}},
+		{"healthy with no change bound", healthyApp(), nil, time.Time{}, "applied",
+			connectors.OutcomeNotObserved, "", []contract.Caveat{notProof, contract.CaveatObservedBeforeNotBefore}},
+		{"operation failed", with(func(a *Application) { a.OperationPhase = "Failed"; a.HealthStatus = "Degraded" }), nil, testNotBefore, "failed",
+			connectors.OutcomeNotObserved, "", []contract.Caveat{notProof, contract.CaveatArgoCDOperationUnrelated}},
+		{"operation error while healthy", with(func(a *Application) { a.OperationPhase = "Error" }), nil, testNotBefore, "failed",
+			connectors.OutcomeNotObserved, "", []contract.Caveat{notProof, contract.CaveatArgoCDOperationUnrelated}},
+		{"operation running", with(func(a *Application) { a.OperationPhase = "Running" }), nil, testNotBefore, "", connectors.OutcomeNotObserved, "", []contract.Caveat{notProof}},
+		{"operation terminating", with(func(a *Application) { a.OperationPhase = "Terminating" }), nil, testNotBefore, "", connectors.OutcomeNotObserved, "", []contract.Caveat{notProof}},
+		{"out of sync", with(func(a *Application) { a.SyncStatus = "OutOfSync" }), nil, testNotBefore, "", connectors.OutcomeNotObserved, "", []contract.Caveat{notProof}},
+		{"progressing", with(func(a *Application) { a.HealthStatus = "Progressing" }), nil, testNotBefore, "", connectors.OutcomeNotObserved, "", []contract.Caveat{notProof}},
+		{"degraded alone is context not failure", with(func(a *Application) { a.HealthStatus = "Degraded" }), nil, testNotBefore, "", connectors.OutcomeNotObserved, "", []contract.Caveat{notProof}},
+		{"health missing", with(func(a *Application) { a.HealthStatus = "Missing" }), nil, testNotBefore, "", connectors.OutcomeNotObserved, "", []contract.Caveat{notProof}},
+		{"unknown sync string normalized", with(func(a *Application) { a.SyncStatus = "Synced; rm -rf" }), nil, testNotBefore, "", connectors.OutcomeNotObserved, "", []contract.Caveat{notProof}},
+		{"unknown phase dropped", with(func(a *Application) { a.OperationPhase = "Weird" }), nil, testNotBefore, "", connectors.OutcomeObserved, "", []contract.Caveat{notProof}},
+		{"multiple sources", with(func(a *Application) { a.SourceCount = 2 }), nil, testNotBefore, "applied", connectors.OutcomeObserved, "",
+			[]contract.Caveat{notProof, contract.CaveatArgoCDAppHasMultipleSources}},
+		{"project not allowed", with(func(a *Application) { a.Project = "tenant-b" }), nil, testNotBefore, "applied", connectors.OutcomeUnverifiable, "", []contract.Caveat{notProof}},
+		{"empty project not allowed", with(func(a *Application) { a.Project = "" }), nil, testNotBefore, "applied", connectors.OutcomeUnverifiable, "", []contract.Caveat{notProof}},
+		{"namespace the schema cannot carry", with(func(a *Application) { a.Namespace = "" }), nil, testNotBefore, "", connectors.OutcomeError, contract.ErrorInternal, nil},
+		{"missing app", nil, ErrNotFound, testNotBefore, "", connectors.OutcomeError, contract.ErrorResourceNotFound, nil},
+		{"unauthorized", nil, ErrUnauthorized, testNotBefore, "", connectors.OutcomeError, contract.ErrorConnectorUnauthorized, nil},
+		{"forbidden", nil, ErrForbidden, testNotBefore, "", connectors.OutcomeError, contract.ErrorConnectorForbidden, nil},
+		{"no token", nil, ErrNoToken, testNotBefore, "", connectors.OutcomeError, contract.ErrorConnectorUnauthorized, nil},
+		{"timeout", nil, ErrTimeout, testNotBefore, "", connectors.OutcomeError, contract.ErrorConnectorTimeout, nil},
+		{"tls", nil, ErrTLS, testNotBefore, "", connectors.OutcomeError, contract.ErrorTLSVerificationFailed, nil},
+		{"too large", nil, ErrResponseTooLarge, testNotBefore, "", connectors.OutcomeError, contract.ErrorResponseTooLarge, nil},
+		{"rate limited", nil, ErrRateLimited, testNotBefore, "", connectors.OutcomeError, contract.ErrorRateLimited, nil},
+		{"unreachable", nil, ErrUnreachable, testNotBefore, "", connectors.OutcomeError, contract.ErrorConnectorUnreachable, nil},
+		{"redirect", nil, ErrRedirectRefused, testNotBefore, "", connectors.OutcomeError, contract.ErrorConnectorUnreachable, nil},
+		{"refused by the transport", nil, ErrRequestRefused, testNotBefore, "", connectors.OutcomeError, contract.ErrorInternal, nil},
+		{"bad response", nil, fmt.Errorf("%w: HTTP 500", ErrBadResponse), testNotBefore, "", connectors.OutcomeError, contract.ErrorInternal, nil},
+		{"nil app no error", nil, nil, testNotBefore, "", connectors.OutcomeError, contract.ErrorInternal, nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			d := Decide(tc.app, tc.err, allowed)
-			if d.Outcome != tc.outcome || d.Reason != tc.reason {
-				t.Fatalf("Decide = %s/%q, want %s/%q (worker: %q)", d.Outcome, d.Reason, tc.outcome, tc.reason, tc.worker)
+			d := Decide(tc.app, tc.err, allowed, tc.notBefore)
+			if d.Outcome != tc.outcome || d.Evidence.ErrorCode != tc.code {
+				t.Fatalf("Decide = %s/%q, want %s/%q (worker: %q)", d.Outcome, d.Evidence.ErrorCode, tc.outcome, tc.code, tc.worker)
 			}
-			if d.Outcome == connectors.OutcomeVerified {
-				t.Fatal("ArgoCD produced verified")
+			switch d.Outcome {
+			case connectors.OutcomeFailed, connectors.OutcomeNotApplicable, "verified":
+				t.Fatalf("ArgoCD produced %s", d.Outcome)
 			}
-			var want connectors.CaveatSet
-			for _, c := range tc.caveats {
-				want = want.With(c)
+			if !slices.Equal(d.Evidence.Caveats, tc.caveats) {
+				t.Fatalf("caveats = %v, want %v", d.Evidence.Caveats, tc.caveats)
 			}
-			if d.Caveats != want {
-				t.Fatalf("caveats = %v, want %v", d.Caveats.Codes(), want.Codes())
+			if d.Outcome != connectors.OutcomeError {
+				if d.Evidence.Resource == nil || d.Evidence.Facts == nil {
+					t.Fatalf("non-error decision without resource or facts: %+v", d.Evidence)
+				}
+				if c := d.Evidence.Confidence; c != contract.ConfidenceLow && c != contract.ConfidenceNone {
+					t.Fatalf("confidence = %q", c)
+				}
 			}
-			if d.Facts.IsZero() == tc.facts {
-				t.Fatalf("facts present = %v, want %v", !d.Facts.IsZero(), tc.facts)
-			}
-			if tc.facts && (!connectors.ValidArgoCDSyncStatus(d.Facts.SyncStatus) || !connectors.ValidArgoCDHealthStatus(d.Facts.HealthStatus)) {
-				t.Fatalf("facts not normalized: %+v", d.Facts)
+			st := stageFor(d)
+			if err := st.Validate(); err != nil {
+				t.Fatalf("stage breaks the argocd_context schema: %v", err)
 			}
 		})
+	}
+}
+
+// An Application outside the allowed AppProjects reports none of its
+// status.
+func TestDecide_ProjectNotAllowedHidesStatus(t *testing.T) {
+	d := Decide(with(func(a *Application) { a.Project = "tenant-b"; a.OperationPhase = "Failed" }), nil, allowed, testNotBefore)
+	f, _ := d.Evidence.Facts.(*contract.ArgoCDFacts)
+	if f == nil || *f != (contract.ArgoCDFacts{SyncStatus: "Unknown", HealthStatus: "Unknown"}) || d.Evidence.Confidence != contract.ConfidenceNone {
+		t.Fatalf("evidence = %+v facts = %+v", d.Evidence, f)
 	}
 }
 
@@ -105,27 +163,35 @@ func TestFactsFrom_DropsInvalidRevision(t *testing.T) {
 	if f.SyncRevision != "" {
 		t.Fatalf("revision = %q", f.SyncRevision)
 	}
-	f = factsFrom(with(func(a *Application) { a.SyncRevision = "1.4.2+build.7" }))
-	if f.SyncRevision != "1.4.2+build.7" {
-		t.Fatalf("chart version dropped: %q", f.SyncRevision)
+	for _, rev := range []string{"1.4.2+build.7", "sha256:0123abcd", strings.Repeat("a", 128)} {
+		if f := factsFrom(with(func(a *Application) { a.SyncRevision = rev })); f.SyncRevision != rev {
+			t.Fatalf("revision %q dropped", rev)
+		}
+	}
+	if f := factsFrom(with(func(a *Application) { a.SyncRevision = strings.Repeat("a", 129) })); f.SyncRevision != "" {
+		t.Fatal("over-long revision kept")
 	}
 }
 
-type fakeGetter struct {
-	app   *Application
-	err   error
-	calls atomic.Int32
-	name  string
-	ns    string
+type fakeClient struct {
+	app     *Application
+	err     error
+	info    UserInfo
+	infoErr error
+	calls   atomic.Int32
+	name    string
+	ns      string
 }
 
-func (f *fakeGetter) GetApplication(_ context.Context, name, ns string) (*Application, error) {
+func (f *fakeClient) GetApplication(_ context.Context, name, ns string) (*Application, error) {
 	f.calls.Add(1)
 	f.name, f.ns = name, ns
 	return f.app, f.err
 }
 
-func newFakeConnector(g appGetter) *Connector {
+func (f *fakeClient) GetUserInfo(context.Context) (UserInfo, error) { return f.info, f.infoErr }
+
+func newFakeConnector(g appClient) *Connector {
 	return &Connector{
 		name:     "argocd-main",
 		client:   g,
@@ -134,6 +200,10 @@ func newFakeConnector(g appGetter) *Connector {
 			"payments": {ID: "payments", Name: "payments-api"},
 			"billing":  {ID: "billing", Name: "billing-api", AppNamespace: "tenant-a-uat"},
 		},
+		targets: []connectors.TargetInfo{
+			{ID: "billing", Namespace: "tenant-a-uat", Name: "billing-api"},
+			{ID: "payments", Name: "payments-api"},
+		},
 		now: func() time.Time { return time.Date(2026, 10, 1, 12, 0, 0, 0, time.FixedZone("x", 3600)) },
 	}
 }
@@ -141,21 +211,26 @@ func newFakeConnector(g appGetter) *Connector {
 func TestObserve_ThroughRegistry(t *testing.T) {
 	ctx := context.Background()
 	target := func(id string) connectors.Target {
-		return connectors.Target{ID: id, Stage: connectors.StageArgoCDContext}
+		return connectors.Target{ID: id, Stage: connectors.StageArgoCDContext, NotBefore: testNotBefore}
 	}
 
-	t.Run("healthy is observed with the health caveat", func(t *testing.T) {
-		g := &fakeGetter{app: healthyApp()}
+	t.Run("healthy is observed with low confidence and the health caveat", func(t *testing.T) {
+		g := &fakeClient{app: healthyApp()}
 		r, _ := connectors.NewRegistry(newFakeConnector(g))
 		obs, err := r.Observe(ctx, "argocd-main", target("payments"))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if obs.Outcome != connectors.OutcomeObserved || !obs.Caveats.Has(connectors.CaveatArgoCDHealthNotProof) {
+		if obs.Outcome != connectors.OutcomeObserved || obs.Evidence.Confidence != contract.ConfidenceLow ||
+			!slices.Contains(obs.Evidence.Caveats, contract.CaveatArgoCDHealthNotProof) {
 			t.Fatalf("obs = %+v", obs)
 		}
-		if obs.ArgoCD.SyncStatus != "Synced" || obs.ArgoCD.SyncRevision != "4f2a9c1" {
-			t.Fatalf("facts = %+v", obs.ArgoCD)
+		f := obs.Evidence.Facts.(*contract.ArgoCDFacts)
+		if f.SyncStatus != "Synced" || f.SyncRevision != "4f2a9c1" {
+			t.Fatalf("facts = %+v", f)
+		}
+		if res := obs.Evidence.Resource; res.Kind != "Application" || res.APIVersion != "argoproj.io/v1alpha1" || res.Namespace != "argocd" || res.Name != "payments-api" {
+			t.Fatalf("resource = %+v", res)
 		}
 		if obs.ObservedAt.Location() != time.UTC {
 			t.Fatal("observed_at not UTC")
@@ -165,20 +240,21 @@ func TestObserve_ThroughRegistry(t *testing.T) {
 		}
 	})
 
-	t.Run("target not in applications is unverifiable without a read", func(t *testing.T) {
-		g := &fakeGetter{app: healthyApp()}
+	t.Run("target not in applications is refused without a read", func(t *testing.T) {
+		g := &fakeClient{app: healthyApp()}
 		r, _ := connectors.NewRegistry(newFakeConnector(g))
-		obs, err := r.Observe(ctx, "argocd-main", target("orders"))
-		if err != nil {
-			t.Fatal(err)
+		_, err := r.Observe(ctx, "argocd-main", target("orders"))
+		if !errors.Is(err, connectors.ErrUnboundTarget) || g.calls.Load() != 0 {
+			t.Fatalf("err = %v, calls = %d", err, g.calls.Load())
 		}
-		if obs.Outcome != connectors.OutcomeUnverifiable || obs.Reason != ReasonTargetNotAllowed || g.calls.Load() != 0 {
-			t.Fatalf("obs = %+v, calls = %d", obs, g.calls.Load())
+		// The connector refuses it too, if called directly.
+		if _, err := newFakeConnector(g).Observe(ctx, target("orders")); !errors.Is(err, connectors.ErrUnboundTarget) || g.calls.Load() != 0 {
+			t.Fatalf("direct: err = %v, calls = %d", err, g.calls.Load())
 		}
 	})
 
 	t.Run("app namespace from settings", func(t *testing.T) {
-		g := &fakeGetter{app: with(func(a *Application) { a.Name = "billing-api"; a.Namespace = "tenant-a-uat" })}
+		g := &fakeClient{app: with(func(a *Application) { a.Name = "billing-api"; a.Namespace = "tenant-a-uat" })}
 		r, _ := connectors.NewRegistry(newFakeConnector(g))
 		obs, _ := r.Observe(ctx, "argocd-main", target("billing"))
 		if obs.Outcome != connectors.OutcomeObserved || g.ns != "tenant-a-uat" {
@@ -186,30 +262,93 @@ func TestObserve_ThroughRegistry(t *testing.T) {
 		}
 	})
 
-	t.Run("answer for another application is an error", func(t *testing.T) {
-		g := &fakeGetter{app: with(func(a *Application) { a.Name = "other-app" })}
-		r, _ := connectors.NewRegistry(newFakeConnector(g))
-		obs, _ := r.Observe(ctx, "argocd-main", target("payments"))
-		if obs.Outcome != connectors.OutcomeError || obs.Reason != ReasonApplicationChanged || !obs.ArgoCD.IsZero() {
-			t.Fatalf("obs = %+v", obs)
+	t.Run("answer for another application is an internal error", func(t *testing.T) {
+		for name, app := range map[string]*Application{
+			"other name":      with(func(a *Application) { a.Name = "other-app" }),
+			"other namespace": with(func(a *Application) { a.Name = "billing-api"; a.Namespace = "tenant-b" }),
+		} {
+			g := &fakeClient{app: app}
+			r, _ := connectors.NewRegistry(newFakeConnector(g))
+			id := "payments"
+			if name == "other namespace" {
+				id = "billing"
+			}
+			obs, _ := r.Observe(ctx, "argocd-main", target(id))
+			if obs.Outcome != connectors.OutcomeError || obs.Evidence.ErrorCode != contract.ErrorInternal || obs.Evidence.Facts != nil {
+				t.Fatalf("%s: obs = %+v", name, obs)
+			}
 		}
 	})
 
-	t.Run("auth failure is unverifiable", func(t *testing.T) {
-		g := &fakeGetter{err: ErrUnauthorized}
-		r, _ := connectors.NewRegistry(newFakeConnector(g))
-		obs, err := r.Observe(ctx, "argocd-main", target("payments"))
-		if err != nil || obs.Outcome != connectors.OutcomeUnverifiable || obs.Reason != ReasonUnauthorized {
-			t.Fatalf("obs = %+v err = %v", obs, err)
+	// An auth failure is a retryable error, not a terminal outcome: one
+	// rotated token must not close the stage for good.
+	t.Run("auth failures are retryable errors", func(t *testing.T) {
+		for err, code := range map[error]contract.ErrorCode{
+			ErrUnauthorized: contract.ErrorConnectorUnauthorized,
+			ErrNoToken:      contract.ErrorConnectorUnauthorized,
+			ErrForbidden:    contract.ErrorConnectorForbidden,
+		} {
+			g := &fakeClient{err: err}
+			r, _ := connectors.NewRegistry(newFakeConnector(g))
+			obs, oerr := r.Observe(ctx, "argocd-main", target("payments"))
+			if oerr != nil || obs.Outcome != connectors.OutcomeError || obs.Evidence.ErrorCode != code {
+				t.Fatalf("%v: obs = %+v err = %v", err, obs, oerr)
+			}
 		}
 	})
 
 	t.Run("wrong stage refused", func(t *testing.T) {
-		c := newFakeConnector(&fakeGetter{app: healthyApp()})
+		c := newFakeConnector(&fakeClient{app: healthyApp()})
 		if _, err := c.Observe(ctx, connectors.Target{ID: "payments", Stage: connectors.StageESOSync}); !errors.Is(err, connectors.ErrStageNotSupported) {
 			t.Fatalf("err = %v", err)
 		}
 	})
+}
+
+func TestCheck(t *testing.T) {
+	cases := []struct {
+		name string
+		info UserInfo
+		err  error
+		want error
+	}{
+		{"logged in", UserInfo{LoggedIn: true}, nil, nil},
+		{"not logged in", UserInfo{}, nil, connectors.ErrCheckUnauthorized},
+		{"unauthorized", UserInfo{}, ErrUnauthorized, connectors.ErrCheckUnauthorized},
+		{"forbidden", UserInfo{}, ErrForbidden, connectors.ErrCheckUnauthorized},
+		{"no token", UserInfo{}, ErrNoToken, connectors.ErrCheckUnauthorized},
+		{"unreachable", UserInfo{}, ErrUnreachable, connectors.ErrCheckUnreachable},
+		{"timeout", UserInfo{}, ErrTimeout, connectors.ErrCheckUnreachable},
+		{"tls", UserInfo{}, ErrTLS, connectors.ErrCheckUnreachable},
+		{"bad response", UserInfo{}, ErrBadResponse, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := newFakeConnector(&fakeClient{info: tc.info, infoErr: tc.err}).Check(context.Background())
+			switch {
+			case tc.want == nil && tc.err == nil && err != nil:
+				t.Fatalf("err = %v", err)
+			case tc.want != nil && !errors.Is(err, tc.want):
+				t.Fatalf("err = %v, want %v", err, tc.want)
+			case tc.err != nil && err == nil:
+				t.Fatal("failure passed the self-check")
+			case errors.Is(err, connectors.ErrOverPrivileged):
+				t.Fatal("ArgoCD self-check reported over-privilege")
+			}
+		})
+	}
+}
+
+func TestTargets(t *testing.T) {
+	c := newFakeConnector(&fakeClient{})
+	got := c.Targets()
+	if len(got) != 2 || got[1] != (connectors.TargetInfo{ID: "payments", Name: "payments-api"}) {
+		t.Fatalf("targets = %+v", got)
+	}
+	got[0].ID = "changed"
+	if c.Targets()[0].ID != "billing" {
+		t.Fatal("Targets returned the internal slice")
+	}
 }
 
 // --- settings, factory and an end-to-end read against a test server ---
@@ -231,11 +370,14 @@ func newArgoServer(t *testing.T, app map[string]any) *argoServer {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		if r.URL.Path != "/api/v1/applications/payments-api" {
+		switch r.URL.Path {
+		case "/api/v1/session/userinfo":
+			appJSON(w, map[string]any{"loggedIn": true, "username": "gateway", "iss": "argocd"})
+		case "/api/v1/applications/payments-api":
+			appJSON(w, app)
+		default:
 			w.WriteHeader(http.StatusNotFound)
-			return
 		}
-		appJSON(w, app)
 	}))
 	t.Cleanup(a.srv.Close)
 	a.caPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: a.srv.Certificate().Raw})
@@ -268,6 +410,7 @@ func TestFactory_EndToEnd(t *testing.T) {
 			"health":         map[string]string{"status": "Healthy", "message": "db password=hunter2 ok"},
 			"sync":           map[string]string{"status": "Synced", "revision": "4f2a9c1"},
 			"operationState": map[string]string{"phase": "Succeeded", "message": "token abc"},
+			"reconciledAt":   time.Now().UTC().Format(time.RFC3339),
 		},
 	})
 	dir := t.TempDir()
@@ -290,16 +433,26 @@ func TestFactory_EndToEnd(t *testing.T) {
 	if srv.hits.Load() != 0 {
 		t.Fatal("ArgoCD was called while loading settings")
 	}
+	if err := reg.Check(context.Background(), 5*time.Second); err != nil {
+		t.Fatalf("self-check: %v", err)
+	}
+	if h := reg.Health(); len(h) != 1 || h[0].Status != connectors.HealthOK {
+		t.Fatalf("health = %+v", h)
+	}
+	if cat := reg.Catalog(); len(cat) != 1 || len(cat[0].Targets) != 1 || cat[0].Targets[0].ID != "payments" || cat[0].Targets[0].Name != "payments-api" {
+		t.Fatalf("catalog = %+v", cat)
+	}
 
-	target := connectors.Target{ID: "payments", Stage: connectors.StageArgoCDContext}
+	target := connectors.Target{ID: "payments", Stage: connectors.StageArgoCDContext, NotBefore: time.Now().Add(-time.Minute)}
 	obs, err := reg.Observe(context.Background(), "argocd-main", target)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if obs.Outcome != connectors.OutcomeObserved || obs.ArgoCD.HealthStatus != "Healthy" || obs.ArgoCD.OperationPhase != "Succeeded" {
+	f, _ := obs.Evidence.Facts.(*contract.ArgoCDFacts)
+	if obs.Outcome != connectors.OutcomeObserved || f == nil || f.HealthStatus != "Healthy" || f.OperationPhase != "Succeeded" {
 		t.Fatalf("obs = %+v", obs)
 	}
-	if dump := fmt.Sprintf("%+v %v", obs, obs.Caveats.Codes()); strings.Contains(dump, "hunter2") || strings.Contains(dump, testToken) || strings.Contains(dump, "abc") {
+	if dump := fmt.Sprintf("%+v %+v %+v", obs, *f, *obs.Evidence.Resource); strings.Contains(dump, "hunter2") || strings.Contains(dump, testToken) || strings.Contains(dump, "abc") {
 		t.Fatalf("observation carries free text or the token: %s", dump)
 	}
 
@@ -317,7 +470,8 @@ func TestFactory_EndToEnd(t *testing.T) {
 		t.Fatalf("Authorization after rotation = %v", got)
 	}
 
-	// A token the server rejects is unverifiable, not an error with text.
+	// A token the server rejects is a retryable error with a code and no
+	// text, and the self-check reports it.
 	if err := os.WriteFile(tokenPath+".new", []byte("revoked-token"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -325,17 +479,23 @@ func TestFactory_EndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	obs, err = reg.Observe(context.Background(), "argocd-main", target)
-	if err != nil || obs.Outcome != connectors.OutcomeUnverifiable || obs.Reason != ReasonUnauthorized {
+	if err != nil || obs.Outcome != connectors.OutcomeError || obs.Evidence.ErrorCode != contract.ErrorConnectorUnauthorized {
 		t.Fatalf("revoked token: obs = %+v err = %v", obs, err)
 	}
+	if err := reg.Check(context.Background(), 5*time.Second); err != nil {
+		t.Fatalf("check returned %v for an unauthorized token", err)
+	}
+	if h := reg.Health(); h[0].Status != connectors.HealthUnauthorized {
+		t.Fatalf("health after revocation = %+v", h)
+	}
 
-	// A missing token file is unverifiable and sends nothing.
+	// A missing token file is a retryable error and sends nothing.
 	if err := os.Remove(tokenPath); err != nil {
 		t.Fatal(err)
 	}
 	before := srv.hits.Load()
 	obs, _ = reg.Observe(context.Background(), "argocd-main", target)
-	if obs.Outcome != connectors.OutcomeUnverifiable || obs.Reason != ReasonCredentialMissing || srv.hits.Load() != before {
+	if obs.Outcome != connectors.OutcomeError || obs.Evidence.ErrorCode != contract.ErrorConnectorUnauthorized || srv.hits.Load() != before {
 		t.Fatalf("missing token file: obs = %+v", obs)
 	}
 }

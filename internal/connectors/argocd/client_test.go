@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -295,6 +296,11 @@ func TestTransport_OnlySingleApplicationGet(t *testing.T) {
 		{"clusters", http.MethodGet, "/api/v1/clusters"},
 		{"repositories", http.MethodGet, "/api/v1/repositories"},
 		{"session", http.MethodGet, "/api/v1/session"},
+		{"post userinfo", http.MethodPost, "/api/v1/session/userinfo"},
+		{"userinfo child", http.MethodGet, "/api/v1/session/userinfo/x"},
+		{"account can-i", http.MethodGet, "/api/v1/account/can-i/applications/sync/tenant-a/app"},
+		{"app events", http.MethodGet, "/api/v1/applications/app/events"},
+		{"pod logs", http.MethodGet, "/api/v1/applications/app/logs"},
 		{"root", http.MethodGet, "/"},
 	}
 	for _, tc := range cases {
@@ -317,12 +323,142 @@ func TestTransport_OnlySingleApplicationGet(t *testing.T) {
 		t.Fatalf("%d refused requests reached the server", hits.Load())
 	}
 
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/api/v1/applications/app", http.NoBody)
+	for _, p := range []string{"/api/v1/applications/app", "/api/v1/session/userinfo"} {
+		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+p, http.NoBody)
+		resp, err := c.hc.Do(req)
+		if err != nil {
+			t.Fatalf("GET %s refused: %v", p, err)
+		}
+		_ = resp.Body.Close()
+	}
+}
+
+// The only query key that may leave the process is appNamespace.
+// GET /api/v1/applications/<name>?refresh=hard makes ArgoCD patch the
+// Application with only "applications, get", so refresh in particular
+// must never be sent, whatever code builds the request.
+func TestTransport_QueryKeyAllowlist(t *testing.T) {
+	var hits atomic.Int32
+	c, srv := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		appJSON(w, map[string]any{"metadata": map[string]any{"name": "app", "namespace": "argocd"}})
+	})
+	for _, q := range []string{
+		"refresh=hard",
+		"refresh=normal",
+		"refresh",
+		"appNamespace=tenant-a&refresh=hard",
+		"refresh=hard&appNamespace=tenant-a",
+		"project=tenant-a",
+		"resourceVersion=1",
+		"AppNamespace=tenant-a",
+		"appnamespace=tenant-a",
+		"appNamespace=tenant-a;refresh=hard",
+	} {
+		t.Run(q, func(t *testing.T) {
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/api/v1/applications/app?"+q, http.NoBody)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := c.hc.Do(req)
+			if err == nil {
+				_ = resp.Body.Close()
+				t.Fatalf("query %q was sent", q)
+			}
+			if !errors.Is(classifyTransportError(context.Background(), err), ErrRequestRefused) {
+				t.Fatalf("err = %v, want a read-only refusal", err)
+			}
+		})
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("%d refused requests reached the server", hits.Load())
+	}
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/api/v1/applications/app?appNamespace=tenant-a", http.NoBody)
 	resp, err := c.hc.Do(req)
 	if err != nil {
-		t.Fatalf("single application GET refused: %v", err)
+		t.Fatalf("appNamespace refused: %v", err)
 	}
 	_ = resp.Body.Close()
+	// userinfo takes no query in practice, but the policy is per client,
+	// so the same key set applies; refresh is refused there too.
+	req, _ = http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/api/v1/session/userinfo?refresh=hard", http.NoBody)
+	if resp, err := c.hc.Do(req); err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("refresh on userinfo was sent")
+	}
+}
+
+// The transport judges the request exactly as it is sent: an opaque URL,
+// an encoded slash or a dot segment is refused, not cleaned.
+func TestTransport_JudgesWireForm(t *testing.T) {
+	var hits atomic.Int32
+	c, srv := newTestClient(t, func(http.ResponseWriter, *http.Request) { hits.Add(1) })
+	host := strings.TrimPrefix(srv.URL, "https://")
+	cases := map[string]*url.URL{
+		"opaque":        {Scheme: "https", Host: host, Opaque: "/api/v1/applications/app/manifests"},
+		"encoded slash": {Scheme: "https", Host: host, Path: "/api/v1/applications/app/manifests", RawPath: "/api/v1/applications/app%2Fmanifests"},
+		"dot segment":   {Scheme: "https", Host: host, Path: "/api/v1/applications/./app"},
+		"double slash":  {Scheme: "https", Host: host, Path: "/api/v1//applications/app"},
+		"trailing":      {Scheme: "https", Host: host, Path: "/api/v1/applications/app/"},
+	}
+	for name, u := range cases {
+		t.Run(name, func(t *testing.T) {
+			req := &http.Request{Method: http.MethodGet, URL: u, Header: http.Header{}, Host: host}
+			resp, err := c.hc.Do(req.WithContext(context.Background()))
+			if err == nil {
+				_ = resp.Body.Close()
+				t.Fatal("request was sent")
+			}
+			if !errors.Is(classifyTransportError(context.Background(), err), ErrRequestRefused) {
+				t.Fatalf("err = %v, want a read-only refusal", err)
+			}
+		})
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("%d refused requests reached the server", hits.Load())
+	}
+}
+
+// Proxy environment variables are ignored: with HTTPS_PROXY or
+// HTTP_PROXY set, ArgoCD egress must not go through a proxy, where the
+// bearer token would be exposed (in clear with the dev http flag).
+func TestClient_IgnoresProxyEnvironment(t *testing.T) {
+	var proxyHits atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		proxyHits.Add(1)
+		appJSON(w, map[string]any{"metadata": map[string]any{"name": "app", "namespace": "argocd"}})
+	}))
+	t.Cleanup(proxy.Close)
+	t.Setenv("HTTPS_PROXY", proxy.URL)
+	t.Setenv("HTTP_PROXY", proxy.URL)
+	t.Setenv("NO_PROXY", "")
+
+	// argocd.invalid never resolves, so only a proxy could answer.
+	for _, base := range []string{"http://argocd.invalid", "https://argocd.invalid"} {
+		c, err := New(Config{BaseURL: base, Token: staticToken(testToken), AllowInsecureHTTP: true, Timeout: 2 * time.Second})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.GetApplication(context.Background(), "app", ""); err == nil {
+			t.Fatalf("%s: request succeeded through a proxy", base)
+		}
+	}
+	if proxyHits.Load() != 0 {
+		t.Fatalf("%d request(s) went through the proxy", proxyHits.Load())
+	}
+}
+
+func TestGetUserInfo(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/session/userinfo" || r.URL.RawQuery != "" {
+			t.Errorf("request = %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+		}
+		appJSON(w, map[string]any{"loggedIn": true, "username": "gateway", "groups": []string{"tenant-a"}})
+	})
+	info, err := c.GetUserInfo(context.Background())
+	if err != nil || !info.LoggedIn {
+		t.Fatalf("info = %+v err = %v", info, err)
+	}
 }
 
 func TestTransport_BasePathPrefix(t *testing.T) {
@@ -363,6 +499,11 @@ func TestNew_Refusals(t *testing.T) {
 		{"query", Config{BaseURL: "https://argocd.example.com/?token=x", Token: staticToken("t")}, "query or fragment"},
 		{"no token source", Config{BaseURL: "https://argocd.example.com"}, "token source"},
 		{"timeout too long", Config{BaseURL: "https://argocd.example.com", Token: staticToken("t"), Timeout: time.Hour}, "timeout"},
+		{"encoded base path", Config{BaseURL: "https://argocd.example.com/argo%2Fcd", Token: staticToken("t")}, "plain lower-case segments"},
+		{"wildcard base path", Config{BaseURL: "https://argocd.example.com/*", Token: staticToken("t")}, "plain lower-case segments"},
+		{"dot base path", Config{BaseURL: "https://argocd.example.com/a/../b", Token: staticToken("t")}, "plain lower-case segments"},
+		{"upper-case base path", Config{BaseURL: "https://argocd.example.com/ArgoCD", Token: staticToken("t")}, "plain lower-case segments"},
+		{"double slash base path", Config{BaseURL: "https://argocd.example.com/a//b", Token: staticToken("t")}, "plain lower-case segments"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

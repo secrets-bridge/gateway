@@ -388,7 +388,6 @@ func (s *syncBuffer) String() string {
 
 func newHarness(t *testing.T, mutate func(*Config), conns ...*fakeConn) *harness {
 	t.Helper()
-	cp := newFakeCP(t)
 	if conns == nil {
 		conns = []*fakeConn{
 			okConn("eso-main", connectors.KindESO),
@@ -402,6 +401,14 @@ func newHarness(t *testing.T, mutate func(*Config), conns ...*fakeConn) *harness
 		cs = append(cs, c)
 		byName[c.name] = c
 	}
+	return newHarnessFrom(t, mutate, cs, byName)
+}
+
+// newHarnessFrom wires a Loop to a fake CP and a registry of any
+// connectors, real ones included.
+func newHarnessFrom(t *testing.T, mutate func(*Config), cs []connectors.Connector, byName map[string]*fakeConn) *harness {
+	t.Helper()
+	cp := newFakeCP(t)
 	reg, err := connectors.NewRegistry(cs...)
 	if err != nil {
 		t.Fatal(err)

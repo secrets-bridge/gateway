@@ -144,6 +144,20 @@ func TestRegistry_ObserveChecksContract(t *testing.T) {
 			func(t Target) (Observation, error) { return goodObs(argo, t, "verified"), nil }, ErrInvalidObservation, OutcomeError, true},
 		{"argocd failed refused", argo, "argocd-main", argoTarget,
 			func(t Target) (Observation, error) { return goodObs(argo, t, OutcomeFailed), nil }, ErrOutcomeNotAllowed, OutcomeError, true},
+		{"argocd not_applicable refused", argo, "argocd-main", argoTarget,
+			func(t Target) (Observation, error) { return goodObs(argo, t, OutcomeNotApplicable), nil }, ErrOutcomeNotAllowed, OutcomeError, true},
+		{"argocd high confidence refused", argo, "argocd-main", argoTarget,
+			func(t Target) (Observation, error) {
+				o := goodObs(argo, t, OutcomeObserved)
+				o.Evidence.Confidence = contract.ConfidenceHigh
+				return o, nil
+			}, ErrOutcomeNotAllowed, OutcomeError, true},
+		{"argocd medium confidence refused", argo, "argocd-main", argoTarget,
+			func(t Target) (Observation, error) {
+				o := goodObs(argo, t, OutcomeObserved)
+				o.Evidence.Confidence = contract.ConfidenceMedium
+				return o, nil
+			}, ErrOutcomeNotAllowed, OutcomeError, true},
 		{"argocd observed passes", argo, "argocd-main", argoTarget,
 			func(t Target) (Observation, error) { return goodObs(argo, t, OutcomeObserved), nil }, nil, OutcomeObserved, true},
 		{"wrong stage refused before call", eso, "eso-main", Target{ID: "payments-api", Stage: StageWorkloadRollout}, nil, ErrStageNotSupported, "", false},

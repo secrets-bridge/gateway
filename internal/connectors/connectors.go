@@ -517,7 +517,7 @@ func (r *Registry) errorObservation(c Connector, t Target, code contract.ErrorCo
 
 // checkObservation checks what the registry can check without the task:
 // identity fields, the outcome enum, the time, and that ArgoCD never
-// reports failed. The loop validates the evidence against the contract.
+// reports failed or not_applicable or more than low confidence. The loop validates the evidence against the contract.
 func checkObservation(c Connector, t Target, o Observation) error {
 	switch {
 	case o.Connector != c.Name(), o.Kind != c.Kind(), o.TargetID != t.ID, o.Stage != t.Stage:
@@ -526,9 +526,15 @@ func checkObservation(c Connector, t Target, o Observation) error {
 		return fmt.Errorf("%w: unknown outcome", ErrInvalidObservation)
 	case o.ObservedAt.IsZero():
 		return fmt.Errorf("%w: observed_at is missing", ErrInvalidObservation)
-	case c.Kind() == KindArgoCD && o.Outcome == OutcomeFailed:
+	case c.Kind() == KindArgoCD && (o.Outcome == OutcomeFailed || o.Outcome == OutcomeNotApplicable):
 		// ArgoCD is context only: Degraded or a failed operation is
-		// never a failure of the secret change (ADR 0001 section 2.3).
+		// never a failure of the secret change (ADR 0001 section 2.3),
+		// and the argocd_context schema variant has neither outcome.
+		return ErrOutcomeNotAllowed
+	case c.Kind() == KindArgoCD && o.Evidence.Confidence != "" &&
+		o.Evidence.Confidence != contract.ConfidenceLow && o.Evidence.Confidence != contract.ConfidenceNone:
+		// ArgoCD context is never more than low confidence. An empty
+		// confidence is sent as none.
 		return ErrOutcomeNotAllowed
 	case o.Evidence.ErrorCode != "":
 		return fmt.Errorf("%w: error code on a non-error outcome", ErrInvalidObservation)

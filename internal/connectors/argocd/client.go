@@ -70,17 +70,34 @@ type Config struct {
 
 // Client is the read-only ArgoCD HTTP client.
 //
-// The http.Client is built on internal/readonly: only GET leaves the
-// process, and a path allowlist admits only the single-application
-// endpoint. List, resource-tree, managed-resources and manifests are
-// refused in the transport, because the last two can return rendered
-// resource bodies and the list reads every application the token sees.
+// The http.Client is built on internal/readonly with a policy that
+// admits exactly two requests: GET <base>/api/v1/applications/<name>,
+// whose only allowed query key is appNamespace, and GET
+// <base>/api/v1/session/userinfo for the self-check. Every other method,
+// path and query key is refused before the request leaves the process.
+// List, resource-tree, managed-resources and manifests are refused
+// because the last two can return rendered resource bodies and the list
+// reads every application the token sees. A query key such as refresh
+// is refused because GET /api/v1/applications/<name>?refresh=hard makes
+// ArgoCD patch the Application.
+//
+// The transport is readonly.BaseTransport, so proxy environment
+// variables are ignored and the bearer token never goes to a proxy.
 type Client struct {
 	base   *url.URL
 	token  TokenSource
 	hc     *http.Client
 	tlsCfg *tls.Config
 }
+
+// AppNamespaceQueryKey is the only query key the transport admits.
+const AppNamespaceQueryKey = "appNamespace"
+
+// Paths under the base URL. Only these two are in the transport policy.
+const (
+	applicationsPath = "/api/v1/applications"
+	userInfoPath     = "/api/v1/session/userinfo"
+)
 
 // New builds a Client. It fails only on a malformed BaseURL, a scheme
 // that is not allowed, or a missing token source. Errors never quote the
@@ -101,22 +118,26 @@ func New(cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("argocd: timeout must be between 0 and %s", MaxTimeout)
 	}
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: cfg.RootCAs, ServerName: cfg.TLSServerName}
-	hc := &http.Client{
-		Timeout: timeout,
-		// Never follow a redirect: following one would re-send the bearer
-		// token to wherever Location points, including an http://
-		// downgrade or another host. do() reports ErrRedirectRefused.
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-		Transport: readonly.NewTransport(&http.Transport{
-			Proxy:                 http.ProxyFromEnvironment,
-			TLSClientConfig:       tlsCfg,
-			TLSHandshakeTimeout:   timeout,
-			ResponseHeaderTimeout: timeout,
-			IdleConnTimeout:       90 * time.Second,
-			MaxIdleConns:          4,
-		}, allowOnlyApplicationGet(base.Path)),
+	next := readonly.BaseTransport(tlsCfg)
+	next.TLSHandshakeTimeout = timeout
+	next.ResponseHeaderTimeout = timeout
+	next.MaxIdleConns = 4
+	// Redirects are refused by readonly.NewClient: following one would
+	// re-send the bearer token to wherever Location points, including an
+	// http:// downgrade or another host. do() reports ErrRedirectRefused.
+	hc, err := readonly.NewClient(next, policyFor(base.Path), timeout)
+	if err != nil {
+		return nil, errors.New("argocd: base URL path cannot form a request allowlist")
 	}
-	return &Client{base: base, token: cfg.Token, hc: hc, tlsCfg: tlsCfg}, nil
+	return &Client{base: base, token: cfg.Token, hc: hc, tlsCfg: next.TLSClientConfig}, nil
+}
+
+// policyFor is the read-only transport policy for a base path.
+func policyFor(basePath string) readonly.Policy {
+	return readonly.Policy{
+		GET:   []string{basePath + applicationsPath + "/*", basePath + userInfoPath},
+		Query: []string{AppNamespaceQueryKey},
+	}
 }
 
 func parseBaseURL(raw string, allowHTTP bool) (*url.URL, error) {
@@ -145,25 +166,34 @@ func parseBaseURL(raw string, allowHTTP bool) (*url.URL, error) {
 	if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
 		return nil, errors.New("argocd: base URL must not have a query or fragment")
 	}
+	encoded := u.RawPath != "" || u.EscapedPath() != u.Path
 	u.Path = strings.TrimRight(u.Path, "/")
 	u.RawPath = ""
+	if encoded || (u.Path != "" && !validBasePath(u.Path)) {
+		return nil, errors.New("argocd: base URL path must be plain lower-case segments")
+	}
 	return u, nil
 }
 
-// allowOnlyApplicationGet returns a deny hook that admits exactly
-// <basePath>/api/v1/applications/<one segment> and nothing else.
-func allowOnlyApplicationGet(basePath string) readonly.DenyFunc {
-	prefix := readonly.CleanPath(basePath)
-	if prefix == "/" {
-		prefix = ""
+// validBasePath accepts a canonical path of lower-case letters, digits,
+// '-', '_' and '.' segments. It keeps percent-encoding, "..", "*" (a
+// policy wildcard) and empty segments out of the request allowlist.
+func validBasePath(p string) bool {
+	if readonly.CleanPath(p) != p {
+		return false
 	}
-	return func(p string) bool {
-		if !strings.HasPrefix(p, prefix+"/") {
-			return true
+	for _, seg := range strings.Split(strings.TrimPrefix(p, "/"), "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return false
 		}
-		seg := strings.Split(strings.TrimPrefix(p, prefix+"/"), "/")
-		return len(seg) != 4 || seg[0] != "api" || seg[1] != "v1" || seg[2] != "applications" || seg[3] == ""
+		for _, r := range seg {
+			ok := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.'
+			if !ok {
+				return false
+			}
+		}
 	}
+	return true
 }
 
 // Application is the trimmed status the connector uses. Manifests,
@@ -219,12 +249,12 @@ func (c *Client) GetApplication(ctx context.Context, name, appNamespace string) 
 		return nil, ErrInvalidName
 	}
 	u := *c.base
-	u.Path = c.base.Path + "/api/v1/applications/" + name
+	u.Path = c.base.Path + applicationsPath + "/" + name
 	if appNamespace != "" {
-		u.RawQuery = url.Values{"appNamespace": {appNamespace}}.Encode()
+		u.RawQuery = url.Values{AppNamespaceQueryKey: {appNamespace}}.Encode()
 	}
 	var raw rawApplication
-	if err := c.do(ctx, u.String(), &raw); err != nil {
+	if err := c.do(ctx, &u, &raw); err != nil {
 		return nil, err
 	}
 	return appFromRaw(raw), nil
@@ -272,13 +302,34 @@ func validAppName(s string) bool {
 	return true
 }
 
+// UserInfo is the part of GET /api/v1/session/userinfo the self-check
+// uses. The user name, issuer and groups are not decoded.
+type UserInfo struct {
+	LoggedIn bool
+}
+
+// GetUserInfo confirms the token works (runtime design 3.5).
+func (c *Client) GetUserInfo(ctx context.Context) (UserInfo, error) {
+	u := *c.base
+	u.Path = c.base.Path + userInfoPath
+	var raw struct {
+		LoggedIn bool `json:"loggedIn"`
+	}
+	if err := c.do(ctx, &u, &raw); err != nil {
+		return UserInfo{}, err
+	}
+	return UserInfo{LoggedIn: raw.LoggedIn}, nil
+}
+
 // do issues one GET, maps the status code and decodes a bounded body.
-func (c *Client) do(ctx context.Context, target string, out any) error {
+// The request is built from the URL struct, not from a string, so what
+// the transport judges is what is sent.
+func (c *Client) do(ctx context.Context, target *url.URL, out any) error {
 	token, err := c.token()
 	if err != nil || token == "" {
 		return ErrNoToken
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, http.NoBody)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), http.NoBody)
 	if err != nil {
 		return ErrBadResponse
 	}
@@ -339,7 +390,7 @@ func classifyTransportError(ctx context.Context, err error) error {
 		recErr   tls.RecordHeaderError
 	)
 	switch {
-	case errors.Is(err, readonly.ErrMethodNotAllowed), errors.Is(err, readonly.ErrPathDenied):
+	case isReadonlyRefusal(err):
 		return ErrRequestRefused
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(ctx.Err(), context.DeadlineExceeded):
 		return ErrTimeout
@@ -350,4 +401,22 @@ func classifyTransportError(ctx context.Context, err error) error {
 		return ErrTimeout
 	}
 	return ErrUnreachable
+}
+
+// readonlyRefusals are the errors with which the read-only transport
+// refuses a request before it is sent.
+var readonlyRefusals = []error{
+	readonly.ErrMethodNotAllowed, readonly.ErrPathDenied, readonly.ErrPathNotAllowed,
+	readonly.ErrNonCanonicalPath, readonly.ErrOpaqueURL, readonly.ErrUserinfo,
+	readonly.ErrHostOverride, readonly.ErrQueryNotAllowed, readonly.ErrUpgradeRefused,
+	readonly.ErrStreamSubresource, readonly.ErrBodyNotJSON,
+}
+
+func isReadonlyRefusal(err error) bool {
+	for _, r := range readonlyRefusals {
+		if errors.Is(err, r) {
+			return true
+		}
+	}
+	return false
 }

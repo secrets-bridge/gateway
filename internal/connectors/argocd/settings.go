@@ -52,10 +52,15 @@ const maxCAFileSize = 1 << 20
 // name).
 var projectPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$`)
 
+// syncRevisionPattern is the evidence-result schema pattern for
+// argocdFacts.sync_revision. A revision outside it is not reported.
+var syncRevisionPattern = regexp.MustCompile(`^[0-9A-Za-z._+:-]{1,128}$`)
+
 // Options are process-wide switches the factory needs.
 type Options struct {
 	// AllowInsecureHTTP permits http:// base URLs. main sets it from
-	// SB_INSECURE_TRANSPORT (dev only).
+	// SB_INSECURE_TRANSPORT (dev only). The token then crosses the
+	// network in clear; there is never a proxy in between.
 	AllowInsecureHTTP bool
 	// Now overrides the clock in tests.
 	Now func() time.Time
@@ -129,6 +134,7 @@ func build(name string, s Settings, opts Options) (*Connector, error) {
 		return nil, &connectors.SettingsError{Field: "applications", Reason: "must list at least one application"}
 	}
 	apps := make(map[string]AppBinding, len(s.Applications))
+	targets := make([]connectors.TargetInfo, 0, len(s.Applications))
 	for _, a := range s.Applications {
 		if !connectors.ValidName(a.ID) {
 			return nil, &connectors.SettingsError{Field: "applications.id", Reason: "must be a DNS label"}
@@ -143,6 +149,7 @@ func build(name string, s Settings, opts Options) (*Connector, error) {
 			return nil, &connectors.SettingsError{Field: "applications.app_namespace", Reason: "must be a DNS label"}
 		}
 		apps[a.ID] = a
+		targets = append(targets, connectors.TargetInfo{ID: a.ID, Namespace: a.AppNamespace, Name: a.Name})
 	}
 	client, err := New(Config{
 		BaseURL:           s.BaseURL,
@@ -159,7 +166,7 @@ func build(name string, s Settings, opts Options) (*Connector, error) {
 	if now == nil {
 		now = time.Now
 	}
-	return &Connector{name: name, client: client, projects: projects, apps: apps, now: now}, nil
+	return &Connector{name: name, client: client, projects: projects, apps: apps, targets: targets, now: now}, nil
 }
 
 // loadCAFile reads a PEM bundle that becomes the only trust anchor.

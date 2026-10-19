@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -342,6 +343,10 @@ func TestSetup_Refusals(t *testing.T) {
 	if err := os.WriteFile(esoFile, []byte(`[{"name":"eso-main","kind":"eso","settings":{"namespaces":["tenant-a-uat"]}}]`), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	badArgo := filepath.Join(dir, "argocd-bad.json")
+	if err := os.WriteFile(badArgo, []byte(`[{"name":"argocd-main","kind":"argocd","settings":{"base_url":"https://argocd.example.com/?auth=tenant-a-uat","token_file":"/etc/token","allowed_projects":["tenant-a"],"applications":[{"id":"payments","name":"payments-api"}]}}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	looseID := filepath.Join(dir, "identity.json")
 	if err := os.WriteFile(looseID, []byte(`{"gateway_id":"gw","gateway_secret":"`+testSecret+`"}`), 0o600); err != nil {
 		t.Fatal(err)
@@ -361,6 +366,7 @@ func TestSetup_Refusals(t *testing.T) {
 		{"no identity", func(f *bootFixture) { f.env = envMap(nil); f.cfg.IdentityFile = "" }, "no credential"},
 		{"loose identity file", func(f *bootFixture) { f.env = envMap(nil); f.cfg.IdentityFile = looseID }, "not be readable by other users"},
 		{"connector kind not in this build", func(f *bootFixture) { f.cfg.ConnectorsFile = esoFile }, "not supported by this build"},
+		{"invalid argocd settings", func(f *bootFixture) { f.cfg.ConnectorsFile = badArgo }, "base_url"},
 		{"gateway id is not a uuid", func(f *bootFixture) {
 			f.env = envMap(map[string]string{"SB_GATEWAY_ID": "gw-tenant-a-uat", "SB_GATEWAY_SECRET": testSecret})
 		}, "UUID"},
@@ -402,4 +408,56 @@ func waitFor(t *testing.T, cond func() bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("condition not met within 5s")
+}
+
+// TestSetup_BindsArgoCDConnector: the argocd kind is bound at boot, its
+// self-check reads only GET /api/v1/session/userinfo, and no
+// Application is read before a task asks for one.
+func TestSetup_BindsArgoCDConnector(t *testing.T) {
+	var mu sync.Mutex
+	var calls []string
+	argo := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls = append(calls, r.Method+" "+r.URL.Path)
+		mu.Unlock()
+		_, _ = io.WriteString(w, `{"loggedIn":true}`)
+	}))
+	t.Cleanup(argo.Close)
+	dir := t.TempDir()
+	token := filepath.Join(dir, "token")
+	if err := os.WriteFile(token, []byte("argocd-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ca := filepath.Join(dir, "ca.crt")
+	if err := os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: argo.Certificate().Raw}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "connectors.json")
+	body := `[{"name":"argocd-main","kind":"argocd","settings":{"base_url":"` + argo.URL + `","token_file":"` + token +
+		`","ca_file":"` + ca + `","allowed_projects":["tenant-a"],"applications":[{"id":"payments","name":"payments-api"}]}}]`
+	if err := os.WriteFile(file, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	f := newFixture(t)
+	f.cfg.ConnectorsFile = file
+	var deps loopDeps
+	orig := newLoop
+	newLoop = func(d loopDeps) cpLoop { deps = d; return &fakeLoop{stopCh: make(chan struct{})} }
+	t.Cleanup(func() { newLoop = orig })
+
+	if _, err := f.setup(); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	if got := deps.Registry.Names(); len(got) != 1 || got[0] != "argocd-main" {
+		t.Fatalf("bound connectors = %v", got)
+	}
+	if h := deps.Registry.Health(); h[0].Status != connectors.HealthOK {
+		t.Fatalf("health = %+v", h)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(calls) != 1 || calls[0] != "GET /api/v1/session/userinfo" {
+		t.Fatalf("ArgoCD calls during boot = %v", calls)
+	}
 }

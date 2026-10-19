@@ -61,7 +61,7 @@ func parseConfig(args []string, getenv func(string) (string, bool), stderr io.Wr
 	fs.BoolVar(&cfg.InsecureTransport, "insecure-transport", cfg.InsecureTransport, "allow plain http:// to the control plane, DEV ONLY (also SB_INSECURE_TRANSPORT)")
 	fs.StringVar(&cfg.CAFile, "cp-ca-file", cfg.CAFile, "PEM bundle that replaces the system roots for the control plane (also SB_CP_CA_FILE)")
 	fs.StringVar(&cfg.TLSServerName, "cp-tls-server-name", cfg.TLSServerName, "TLS server name override for the control plane (also SB_CP_TLS_SERVER_NAME)")
-	fs.StringVar(&cfg.IdentityFile, "identity-file", cfg.IdentityFile, "JSON {gateway_id, gateway_secret}, mode 0600 or 0400; ignored when SB_GATEWAY_ID and SB_GATEWAY_SECRET are set (also SB_GATEWAY_IDENTITY_FILE)")
+	fs.StringVar(&cfg.IdentityFile, "identity-file", cfg.IdentityFile, "JSON {gateway_id, gateway_secret}, mode 0400, 0600 or 0440 (no other bits, no group write); ignored when SB_GATEWAY_ID and SB_GATEWAY_SECRET are set (also SB_GATEWAY_IDENTITY_FILE)")
 	fs.StringVar(&cfg.LocalAddr, "local-addr", cfg.LocalAddr, "loopback address for /healthz /readyz /metrics (also SB_GATEWAY_LOCAL_ADDR)")
 	fs.StringVar(&cfg.ConnectorsFile, "connectors-file", cfg.ConnectorsFile, "JSON list of locally bound connectors; empty binds none (also SB_GATEWAY_CONNECTORS_FILE)")
 	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "debug, info, warn or error (also SB_LOG_LEVEL)")

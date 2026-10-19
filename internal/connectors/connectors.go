@@ -15,7 +15,10 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"sync"
 	"time"
+
+	"github.com/secrets-bridge/gateway/internal/contract"
 )
 
 // Kind is a connector type.
@@ -37,14 +40,15 @@ func (k Kind) Known() bool {
 	return false
 }
 
-// Stage is the step of a rollout a connector observes.
-type Stage string
+// Stage is the step of a rollout a connector observes. It is the
+// contract type, so connectors and the wire share one vocabulary.
+type Stage = contract.Stage
 
 // Stages, one per connector kind.
 const (
-	StageESOSync         Stage = "eso_sync"
-	StageWorkloadRollout Stage = "workload_rollout"
-	StageArgoCDContext   Stage = "argocd_context"
+	StageESOSync         = contract.StageESOSync
+	StageWorkloadRollout = contract.StageWorkloadRollout
+	StageArgoCDContext   = contract.StageArgoCDContext
 )
 
 // StageFor returns the only stage a kind may observe.
@@ -60,81 +64,137 @@ func StageFor(k Kind) (Stage, bool) {
 	return "", false
 }
 
-// Outcome is the stage outcome a connector proposes. The set is exactly
-// $defs.outcome in schemas/evidence-result.schema.json. There is no
-// "verified": a verdict is computed by the control plane only (ADR 0001
-// section 2.4), and the Gateway never proposes one.
-type Outcome string
+// Outcome is the stage outcome a connector proposes. It is the contract
+// type, whose set is exactly $defs.outcome in
+// schemas/evidence-result.schema.json. There is no "verified": a verdict
+// is computed by the control plane only (ADR 0001 section 2.4), and the
+// Gateway never proposes one.
+type Outcome = contract.Outcome
 
 // Outcomes. A connector reports what it saw and nothing stronger.
 const (
 	// OutcomeObserved: the resource state is consistent with the change
-	// and ordered after it. The linkage says how.
-	OutcomeObserved Outcome = "observed"
+	// and ordered after it.
+	OutcomeObserved = contract.OutcomeObserved
 	// OutcomeNotObserved: the resource was read and does not (yet)
 	// reflect the change. Non-terminal.
-	OutcomeNotObserved Outcome = "not_observed"
+	OutcomeNotObserved = contract.OutcomeNotObserved
 	// OutcomeNotApplicable: the stage cannot apply to this target, for
 	// example a volume-mounted consumer with no restart expected.
-	OutcomeNotApplicable Outcome = "not_applicable"
+	OutcomeNotApplicable = contract.OutcomeNotApplicable
 	// OutcomeUnverifiable: the resource can be read but cannot carry the
 	// needed link, or will not change before the deadline.
-	OutcomeUnverifiable Outcome = "unverifiable"
+	OutcomeUnverifiable = contract.OutcomeUnverifiable
 	// OutcomeFailed: positive evidence of failure after the change. Never
 	// for ArgoCD, whose state is context only.
-	OutcomeFailed Outcome = "failed"
+	OutcomeFailed = contract.OutcomeFailed
 	// OutcomeError: the connector could not read the resource.
 	// Non-terminal.
-	OutcomeError Outcome = "error"
+	OutcomeError = contract.OutcomeError
 )
 
 // Outcomes lists every defined outcome, in schema order.
-func Outcomes() []Outcome {
-	return []Outcome{OutcomeObserved, OutcomeNotObserved, OutcomeNotApplicable, OutcomeUnverifiable, OutcomeFailed, OutcomeError}
-}
+func Outcomes() []Outcome { return contract.Outcomes() }
 
-// Valid reports whether o is a defined outcome.
-func (o Outcome) Valid() bool {
-	switch o {
-	case OutcomeObserved, OutcomeNotObserved, OutcomeNotApplicable, OutcomeUnverifiable, OutcomeFailed, OutcomeError:
-		return true
-	}
-	return false
-}
-
-// namePattern is the DNS-label rule for connector names, target ids and
-// reason codes' building blocks. It cannot hold a URL, a path, a
-// namespace separator or a credential.
+// namePattern is the DNS-label rule for connector names and target ids.
+// It cannot hold a URL, a path, a namespace separator or a credential.
 var namePattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 
-// reasonPattern restricts reason codes to short machine identifiers so
-// a connector cannot pass free text (condition messages, paths, values)
-// through an Observation.
-var reasonPattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
+// objectNamePattern is the Kubernetes object name (DNS subdomain) rule,
+// used for the display-only names in the catalog.
+var objectNamePattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$`)
 
 // ValidName reports whether s is a valid connector name or target id.
 func ValidName(s string) bool { return namePattern.MatchString(s) }
 
-// Target names what to observe. It holds only a local target id that
-// the connector resolves through its own local settings, and the stage
-// requested. It never carries coordinates.
+// Target is what one Observe call is about. It holds the local target
+// id, which the connector resolves through its own local settings, the
+// stage, and the change marker the loop built from the task. It never
+// carries coordinates: no URL, namespace, object name or credential.
 type Target struct {
 	ID    string
 	Stage Stage
+	// NotBefore is the strict lower bound an event must be after to count
+	// as following the change, already rounded up to a whole second:
+	//   - eso_sync: executed_at plus skew;
+	//   - workload_rollout: the ESO refresh_time observed in this pass
+	//     plus skew when the task expects eso_sync (the earlier of that
+	//     refresh and rollout_baseline.observed_at, both after the
+	//     change), else executed_at plus skew;
+	//   - argocd_context: executed_at plus skew (context only).
+	// The skew in it is the task margin plus the measured control-plane
+	// offset. A Kubernetes connector adds the API server offset it
+	// measured in the same pass.
+	NotBefore time.Time
+	// Change is the rest of the change marker.
+	Change Change
+}
+
+// Change is the change marker of a task, as the connectors need it. It
+// identifies the change; it holds nothing that could be dialled.
+type Change struct {
+	// RemoteKey is expected_change.secret_ref.name, the provider path the
+	// ExternalSecret should reference. It is compared inside the Gateway,
+	// never dialled, logged or reported.
+	RemoteKey string
+	// ProviderVersionID is the provider version the agent reported, or
+	// empty when the task has none. A pinned-version link needs it.
+	ProviderVersionID string
+	// ExecutedAt is expected_change.executed_at (control-plane clock).
+	ExecutedAt time.Time
+	// DeadlineAt is the task deadline (control-plane clock).
+	DeadlineAt time.Time
+	// Skew is the margin plus the measured control-plane offset.
+	Skew time.Duration
+	// ESOExpected is true when the task also names an eso_sync stage, so
+	// a rollout must follow the ESO refresh, not only the write.
+	ESOExpected bool
+	// ESORefreshTime is the refresh_time of the eso_sync stage of this
+	// pass when that stage was observed; zero otherwise. Set for
+	// workload_rollout only.
+	ESORefreshTime time.Time
+	// ESOTargetName is the ExternalSecret spec.target.name read in this
+	// pass, for the rollout consumption mode. Set for workload_rollout
+	// only, and only compared, never reported.
+	ESOTargetName string
+	// Baseline is task.rollout_baseline, when the control plane has one.
+	Baseline *contract.RolloutBaseline
+}
+
+// TargetInfo is one locally configured target as the catalog (E3)
+// advertises it. Namespace and Name are for admin display only (ADR 0001
+// section 11); tasks never match on them.
+type TargetInfo struct {
+	ID        string
+	Namespace string
+	Name      string
+	// RefreshIntervalSeconds is set for eso targets.
+	RefreshIntervalSeconds *int
+	// ProgressDeadlineSeconds is set for rollout targets.
+	ProgressDeadlineSeconds *int
 }
 
 // Observation is the metadata-only result of one Observe call. It has no
 // free-form fields: no maps, no raw API responses, no messages, and no
-// secret values or hashes of values. Typed per-kind facts are added
-// alongside each connector.
+// secret values or hashes of values. Evidence is the shared contract
+// model that every connector kind fills.
 type Observation struct {
 	Connector  string
 	Kind       Kind
 	TargetID   string
 	Stage      Stage
 	Outcome    Outcome
-	Reason     string // optional machine code, reasonPattern
 	ObservedAt time.Time
+	// Evidence holds the resource read, its typed facts, the confidence,
+	// the caveats and, for an error outcome, the error code. A non-error
+	// outcome without a resource and facts cannot be reported and is
+	// sent as an error stage with error_code internal.
+	Evidence contract.StageEvidence
+	// APIServerOffset is Gateway clock minus API server clock, from the
+	// Date header of the Kubernetes responses of this observation, when
+	// APIServerOffsetKnown.
+	APIServerOffset      time.Duration
+	APIServerOffsetKnown bool
 }
 
 // Connector is a read-only integration bound in local configuration.
@@ -143,6 +203,15 @@ type Connector interface {
 	Name() string
 	// Kind is the connector type.
 	Kind() Kind
+	// Targets lists the locally configured targets. The list is fixed
+	// for the life of the process.
+	Targets() []TargetInfo
+	// Check is the self-check (runtime design 5.3 and 3.5). It returns
+	// nil when the connector can read what it needs and nothing more. It
+	// wraps ErrOverPrivileged when the credential can read Kubernetes
+	// Secrets or write, ErrCheckUnauthorized when the credential is
+	// refused, and ErrCheckUnreachable when the API cannot be reached.
+	Check(ctx context.Context) error
 	// Observe performs one bounded, read-only pass for target. It must
 	// not retry internally, watch, or keep state between calls.
 	Observe(ctx context.Context, target Target) (Observation, error)
@@ -152,30 +221,93 @@ type Connector interface {
 // at most, never settings.
 var (
 	ErrUnknownConnector   = errors.New("connectors: connector is not bound in local configuration")
+	ErrUnboundTarget      = errors.New("connectors: target is not configured in this connector")
 	ErrInvalidReference   = errors.New("connectors: reference is not a valid local name")
 	ErrStageNotSupported  = errors.New("connectors: stage is not supported by this connector kind")
 	ErrInvalidObservation = errors.New("connectors: connector returned an invalid observation")
 	ErrOutcomeNotAllowed  = errors.New("connectors: this connector kind may not report this outcome")
 	ErrDuplicateConnector = errors.New("connectors: duplicate connector name")
+	ErrInvalidTarget      = errors.New("connectors: invalid target in local configuration")
 	ErrUnknownKind        = errors.New("connectors: unknown connector kind")
 	ErrKindNotSupported   = errors.New("connectors: connector kind is not supported by this build")
 	ErrInvalidSettings    = errors.New("connectors: invalid connector settings")
 	ErrInvalidConfigFile  = errors.New("connectors: invalid connectors file")
 	errNilConnector       = errors.New("connectors: nil connector")
+
+	// ErrOverPrivileged: the connector's credential can do more than
+	// read (any verb on Kubernetes secrets, or a write). The Gateway
+	// refuses to start; there is no override (ADR 0001 section 11).
+	ErrOverPrivileged = errors.New("connectors: credential is over-privileged")
+	// ErrCheckUnauthorized: the integration refused the credential.
+	ErrCheckUnauthorized = errors.New("connectors: credential refused by the integration")
+	// ErrCheckUnreachable: the integration could not be reached.
+	ErrCheckUnreachable = errors.New("connectors: integration unreachable")
 )
 
-// Registry holds the connectors bound in local configuration. It is
-// built once at boot and read-only afterwards, so it is safe for
-// concurrent use.
-type Registry struct {
-	byName map[string]Connector
-	now    func() time.Time
+// HealthStatus is a connector status in the heartbeat (control-plane
+// design 4.3). It is an enum; there is never a message.
+type HealthStatus string
+
+// Health statuses.
+const (
+	HealthOK             HealthStatus = "ok"
+	HealthDegraded       HealthStatus = "degraded"
+	HealthUnreachable    HealthStatus = "unreachable"
+	HealthUnauthorized   HealthStatus = "unauthorized"
+	HealthOverPrivileged HealthStatus = "over_privileged"
+)
+
+// healthFor maps a Check error to a status.
+func healthFor(err error) HealthStatus {
+	switch {
+	case err == nil:
+		return HealthOK
+	case errors.Is(err, ErrOverPrivileged):
+		return HealthOverPrivileged
+	case errors.Is(err, ErrCheckUnauthorized):
+		return HealthUnauthorized
+	case errors.Is(err, ErrCheckUnreachable):
+		return HealthUnreachable
+	}
+	return HealthDegraded
 }
 
-// NewRegistry builds a registry. Names must be valid and unique, and
-// each connector's kind must be known.
+// Health is one connector's last self-check result.
+type Health struct {
+	Connector string
+	Kind      Kind
+	Status    HealthStatus
+}
+
+// CatalogEntry is one connector as the catalog advertises it.
+type CatalogEntry struct {
+	Connector string
+	Kind      Kind
+	Targets   []TargetInfo
+}
+
+// Registry holds the connectors bound in local configuration. The set of
+// connectors and targets is fixed at boot; only the self-check results
+// change. Safe for concurrent use.
+type Registry struct {
+	byName  map[string]Connector
+	targets map[string]map[string]struct{}
+	now     func() time.Time
+
+	mu     sync.Mutex
+	health map[string]HealthStatus
+}
+
+// NewRegistry builds a registry. Names must be valid and unique, each
+// connector's kind must be known, and each connector's targets must have
+// valid, unique ids and display names.
 func NewRegistry(cs ...Connector) (*Registry, error) {
-	r := &Registry{byName: make(map[string]Connector, len(cs)), now: time.Now}
+	r := &Registry{
+		byName:  make(map[string]Connector, len(cs)),
+		targets: make(map[string]map[string]struct{}, len(cs)),
+		health:  make(map[string]HealthStatus, len(cs)),
+		now:     time.Now,
+	}
 	for _, c := range cs {
 		if c == nil {
 			return nil, errNilConnector
@@ -190,9 +322,37 @@ func NewRegistry(cs ...Connector) (*Registry, error) {
 		if _, dup := r.byName[name]; dup {
 			return nil, fmt.Errorf("%w: %q", ErrDuplicateConnector, name)
 		}
+		ids := make(map[string]struct{})
+		for i, t := range c.Targets() {
+			if err := validTargetInfo(t); err != nil {
+				return nil, fmt.Errorf("%w: connector %q target %d: %s", ErrInvalidTarget, name, i, err)
+			}
+			if _, dup := ids[t.ID]; dup {
+				return nil, fmt.Errorf("%w: connector %q: duplicate target id %q", ErrInvalidTarget, name, t.ID)
+			}
+			ids[t.ID] = struct{}{}
+		}
 		r.byName[name] = c
+		r.targets[name] = ids
+		r.health[name] = HealthDegraded // until the first self-check passes
 	}
 	return r, nil
+}
+
+// validTargetInfo returns a fixed reason, never the offending value.
+func validTargetInfo(t TargetInfo) error {
+	switch {
+	case !ValidName(t.ID):
+		return errors.New("id must be a DNS label")
+	case t.Namespace != "" && !ValidName(t.Namespace):
+		return errors.New("namespace must be a namespace name")
+	case t.Name != "" && (len(t.Name) > 253 || !objectNamePattern.MatchString(t.Name)):
+		return errors.New("name must be an object name")
+	case t.RefreshIntervalSeconds != nil && *t.RefreshIntervalSeconds < 0,
+		t.ProgressDeadlineSeconds != nil && *t.ProgressDeadlineSeconds < 0:
+		return errors.New("intervals must not be negative")
+	}
+	return nil
 }
 
 // Len returns the number of bound connectors.
@@ -222,9 +382,86 @@ func (r *Registry) Lookup(name string) (Connector, error) {
 	return c, nil
 }
 
+// HasTarget reports whether the connector bound under name has a local
+// target with this id.
+func (r *Registry) HasTarget(name, targetID string) bool {
+	if !ValidName(name) || !ValidName(targetID) {
+		return false
+	}
+	_, ok := r.targets[name][targetID]
+	return ok
+}
+
+// Catalog returns every connector and its targets, sorted by name, for
+// the catalog upload. It holds ids, kinds and display names only.
+func (r *Registry) Catalog() []CatalogEntry {
+	out := make([]CatalogEntry, 0, len(r.byName))
+	for _, n := range r.Names() {
+		c := r.byName[n]
+		ts := append([]TargetInfo(nil), c.Targets()...)
+		sort.Slice(ts, func(i, j int) bool { return ts[i].ID < ts[j].ID })
+		out = append(out, CatalogEntry{Connector: n, Kind: c.Kind(), Targets: ts})
+	}
+	return out
+}
+
+// Check runs every connector's self-check, each bounded by timeout, and
+// records the results. It returns ErrOverPrivileged if any connector is
+// over-privileged.
+func (r *Registry) Check(ctx context.Context, timeout time.Duration) error {
+	return r.check(ctx, timeout, false)
+}
+
+// Recheck runs the self-check again for connectors whose last check did
+// not pass, and returns ErrOverPrivileged if any of them now is.
+func (r *Registry) Recheck(ctx context.Context, timeout time.Duration) error {
+	return r.check(ctx, timeout, true)
+}
+
+func (r *Registry) check(ctx context.Context, timeout time.Duration, onlyFailed bool) error {
+	var over error
+	for _, n := range r.Names() {
+		r.mu.Lock()
+		last := r.health[n]
+		r.mu.Unlock()
+		if onlyFailed && last == HealthOK {
+			continue
+		}
+		if last == HealthOverPrivileged {
+			// Sticky: an over-privileged credential is never re-trusted
+			// without a restart.
+			over = fmt.Errorf("%w: connector %q", ErrOverPrivileged, n)
+			continue
+		}
+		cctx, cancel := context.WithTimeout(ctx, timeout)
+		st := healthFor(r.byName[n].Check(cctx))
+		cancel()
+		r.mu.Lock()
+		r.health[n] = st
+		r.mu.Unlock()
+		if st == HealthOverPrivileged {
+			over = fmt.Errorf("%w: connector %q", ErrOverPrivileged, n)
+		}
+	}
+	return over
+}
+
+// Health returns the last self-check status of every connector, sorted
+// by name.
+func (r *Registry) Health() []Health {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]Health, 0, len(r.byName))
+	for _, n := range r.Names() {
+		out = append(out, Health{Connector: n, Kind: r.byName[n].Kind(), Status: r.health[n]})
+	}
+	return out
+}
+
 // Observe runs one observation through the connector bound under name
 // and checks the result against the contract. A result that breaks the
-// contract is replaced by an error outcome; it is never passed on.
+// contract is replaced by an error outcome; it is never passed on. An
+// error outcome keeps the connector's error code when it is a v1 code.
 func (r *Registry) Observe(ctx context.Context, name string, target Target) (Observation, error) {
 	c, err := r.Lookup(name)
 	if err != nil {
@@ -233,22 +470,40 @@ func (r *Registry) Observe(ctx context.Context, name string, target Target) (Obs
 	if !ValidName(target.ID) {
 		return Observation{}, ErrInvalidReference
 	}
+	if !r.HasTarget(name, target.ID) {
+		return Observation{}, fmt.Errorf("%w: connector %q", ErrUnboundTarget, name)
+	}
 	stage, _ := StageFor(c.Kind())
 	if target.Stage != stage {
 		return Observation{}, fmt.Errorf("%w: connector %q", ErrStageNotSupported, name)
 	}
 
 	obs, err := c.Observe(ctx, target)
-	if err != nil {
-		return r.errorObservation(c, target), err
+	if err != nil || obs.Outcome == OutcomeError {
+		// The code survives a bare error return; anything else the
+		// connector put next to the error is dropped.
+		if obs.Connector != "" && (obs.Connector != c.Name() || obs.TargetID != target.ID) {
+			return r.errorObservation(c, target, contract.ErrorInternal),
+				errors.Join(err, fmt.Errorf("%w: identity fields do not match the request", ErrInvalidObservation))
+		}
+		code := obs.Evidence.ErrorCode
+		if !code.Valid() {
+			code = contract.ErrorInternal
+		}
+		out := r.errorObservation(c, target, code)
+		if !obs.ObservedAt.IsZero() {
+			out.ObservedAt = obs.ObservedAt
+		}
+		out.APIServerOffset, out.APIServerOffsetKnown = obs.APIServerOffset, obs.APIServerOffsetKnown
+		return out, err
 	}
 	if verr := checkObservation(c, target, obs); verr != nil {
-		return r.errorObservation(c, target), verr
+		return r.errorObservation(c, target, contract.ErrorInternal), verr
 	}
 	return obs, nil
 }
 
-func (r *Registry) errorObservation(c Connector, t Target) Observation {
+func (r *Registry) errorObservation(c Connector, t Target, code contract.ErrorCode) Observation {
 	return Observation{
 		Connector:  c.Name(),
 		Kind:       c.Kind(),
@@ -256,23 +511,27 @@ func (r *Registry) errorObservation(c Connector, t Target) Observation {
 		Stage:      t.Stage,
 		Outcome:    OutcomeError,
 		ObservedAt: r.now().UTC(),
+		Evidence:   contract.StageEvidence{ErrorCode: code},
 	}
 }
 
+// checkObservation checks what the registry can check without the task:
+// identity fields, the outcome enum, the time, and that ArgoCD never
+// reports failed. The loop validates the evidence against the contract.
 func checkObservation(c Connector, t Target, o Observation) error {
 	switch {
 	case o.Connector != c.Name(), o.Kind != c.Kind(), o.TargetID != t.ID, o.Stage != t.Stage:
 		return fmt.Errorf("%w: identity fields do not match the request", ErrInvalidObservation)
 	case !o.Outcome.Valid():
 		return fmt.Errorf("%w: unknown outcome", ErrInvalidObservation)
-	case o.Reason != "" && !reasonPattern.MatchString(o.Reason):
-		return fmt.Errorf("%w: reason must be a machine code", ErrInvalidObservation)
 	case o.ObservedAt.IsZero():
 		return fmt.Errorf("%w: observed_at is missing", ErrInvalidObservation)
 	case c.Kind() == KindArgoCD && o.Outcome == OutcomeFailed:
 		// ArgoCD is context only: Degraded or a failed operation is
 		// never a failure of the secret change (ADR 0001 section 2.3).
 		return ErrOutcomeNotAllowed
+	case o.Evidence.ErrorCode != "":
+		return fmt.Errorf("%w: error code on a non-error outcome", ErrInvalidObservation)
 	}
 	return nil
 }

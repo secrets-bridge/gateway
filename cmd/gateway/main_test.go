@@ -3,23 +3,32 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/secrets-bridge/gateway/internal/connectors"
 	"github.com/secrets-bridge/gateway/internal/observability"
 )
 
-const testSecret = "fake-gateway-secret-for-tests"
+const (
+	testSecret    = "fake-gateway-secret-for-tests"
+	testGatewayID = "1f2e3d4c-5b6a-4978-8695-a4b3c2d1e0f9"
+)
 
 func freeLoopbackAddr(t *testing.T) string {
 	t.Helper()
@@ -37,17 +46,54 @@ type bootFixture struct {
 	env    func(string) (string, bool)
 	cpHits *atomic.Int32
 	logs   *bytes.Buffer
+
+	mu       sync.Mutex
+	cpCalls  []string // "METHOD path"
+	badAuth  int
+	statuses []string // heartbeat status values
+	hbStatus int      // when set, heartbeats answer with this status
+}
+
+func (f *bootFixture) calls() ([]string, int, []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.cpCalls...), f.badAuth, append([]string(nil), f.statuses...)
 }
 
 func newFixture(t *testing.T) *bootFixture {
 	t.Helper()
+	f := &bootFixture{}
 	hits := &atomic.Int32{}
-	cp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	cp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
-		w.WriteHeader(http.StatusOK)
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.cpCalls = append(f.cpCalls, r.Method+" "+r.URL.Path)
+		if r.Header.Get("X-Gateway-Secret") != testSecret {
+			f.badAuth++
+		}
+		switch r.URL.Path {
+		case "/api/v1/gateways/" + testGatewayID + "/heartbeat":
+			var body struct {
+				Status string `json:"status"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			f.statuses = append(f.statuses, body.Status)
+			if f.hbStatus != 0 {
+				w.WriteHeader(f.hbStatus)
+				return
+			}
+			_, _ = io.WriteString(w, `{"status":"ok","next_heartbeat_seconds":30,"claim_poll_seconds":5,"contract_version":"1","catalog_version":"c1"}`)
+		case "/api/v1/gateways/" + testGatewayID + "/catalog":
+			_, _ = io.WriteString(w, `{"accepted":0,"targets_stale":0,"catalog_version":"c1"}`)
+		case "/api/v1/gateways/" + testGatewayID + "/tasks/claim":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
 	}))
 	t.Cleanup(cp.Close)
-	return &bootFixture{
+	*f = bootFixture{
 		cfg: Config{
 			CPEndpoint:        cp.URL,
 			InsecureTransport: true,
@@ -56,19 +102,31 @@ func newFixture(t *testing.T) *bootFixture {
 			ShutdownGrace:     2 * time.Second,
 		},
 		env: envMap(map[string]string{
-			"SB_GATEWAY_ID":     "gw-tenant-a-uat",
+			"SB_GATEWAY_ID":     testGatewayID,
 			"SB_GATEWAY_SECRET": testSecret,
 		}),
 		cpHits: hits,
 		logs:   &bytes.Buffer{},
 	}
+	f.cfg.HeartbeatInterval = time.Minute
+	f.cfg.ClaimInterval = 20 * time.Millisecond
+	f.cfg.ClaimIdleMax = 40 * time.Millisecond
+	f.cfg.ClaimConcurrency = 1
+	f.cfg.LeaseMargin = time.Second
+	f.cfg.PassTimeout = 5 * time.Second
+	f.cfg.UnreachableAfter = time.Minute
+	return f
 }
 
 func (f *bootFixture) setup() (*app, error) {
 	return setup(f.cfg, f.env, observability.NewLoggerTo(f.logs, f.cfg.LogLevel), prometheus.NewRegistry())
 }
 
-func TestServe_StandbyBootsWithoutCallingControlPlane(t *testing.T) {
+// TestServe_LoopHeartbeatsAndClaims boots the real loop against a fake
+// control plane: it heartbeats with the gateway secret, turns ready,
+// claims (204, no task), and on shutdown turns not ready and sends a
+// shutting_down heartbeat. It calls nothing but the gateway endpoints.
+func TestServe_LoopHeartbeatsAndClaims(t *testing.T) {
 	f := newFixture(t)
 	a, err := f.setup()
 	if err != nil {
@@ -79,22 +137,19 @@ func TestServe_StandbyBootsWithoutCallingControlPlane(t *testing.T) {
 	go func() { done <- a.serve(ctx) }()
 
 	base := "http://" + f.cfg.LocalAddr
-	waitFor(t, func() bool {
-		resp, err := http.Get(base + "/healthz")
+	status := func(path string) int {
+		resp, err := http.Get(base + path)
 		if err != nil {
-			return false
+			return 0
 		}
 		_ = resp.Body.Close()
-		return resp.StatusCode == http.StatusOK
+		return resp.StatusCode
+	}
+	waitFor(t, func() bool { return status("/readyz") == http.StatusOK })
+	waitFor(t, func() bool {
+		calls, _, _ := f.calls()
+		return slices.Contains(calls, "POST /api/v1/gateways/"+testGatewayID+"/tasks/claim")
 	})
-	resp, err := http.Get(base + "/readyz")
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("standby gateway reports ready: %d", resp.StatusCode)
-	}
 
 	cancel()
 	select {
@@ -105,13 +160,25 @@ func TestServe_StandbyBootsWithoutCallingControlPlane(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("serve did not return after cancel")
 	}
-	if n := f.cpHits.Load(); n != 0 {
-		t.Fatalf("control plane received %d requests; this build must not call it", n)
+	calls, badAuth, statuses := f.calls()
+	if badAuth != 0 {
+		t.Fatalf("%d control-plane calls without the gateway secret", badAuth)
+	}
+	for _, c := range calls {
+		if !strings.HasPrefix(c, "POST /api/v1/gateways/"+testGatewayID+"/") && c != "PUT /api/v1/gateways/"+testGatewayID+"/catalog" {
+			t.Fatalf("unexpected control-plane call %q", c)
+		}
+	}
+	if !slices.Contains(calls, "PUT /api/v1/gateways/"+testGatewayID+"/catalog") {
+		t.Fatalf("no catalog upload in %v", calls)
+	}
+	if len(statuses) < 2 || statuses[0] != "ok" || statuses[len(statuses)-1] != "shutting_down" {
+		t.Fatalf("heartbeat statuses = %v", statuses)
 	}
 	if strings.Contains(f.logs.String(), testSecret) {
 		t.Fatal("logs carry the gateway secret")
 	}
-	if _, err := http.Get(base + "/healthz"); err == nil {
+	if status("/healthz") != 0 {
 		t.Fatal("local server still serving after shutdown")
 	}
 }
@@ -144,8 +211,9 @@ func TestServe_UsesLoopSeam(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fl.deps.Identity.GatewayID != "gw-tenant-a-uat" || fl.deps.Registry == nil || fl.deps.HTTPClient == nil ||
-		fl.deps.Endpoint == nil || fl.deps.Probes == nil || fl.deps.Logger == nil {
+	if fl.deps.Identity.GatewayID != testGatewayID || fl.deps.Registry == nil || fl.deps.HTTPClient == nil ||
+		fl.deps.Endpoint == nil || fl.deps.Probes == nil || fl.deps.Logger == nil || fl.deps.CP == nil ||
+		fl.deps.Registerer == nil || fl.deps.ReplicaID == "" || fl.deps.Version == "" {
 		t.Fatalf("loop deps incomplete: %+v", fl.deps)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -178,6 +246,96 @@ func TestServe_LoopErrorStopsGateway(t *testing.T) {
 	}
 }
 
+// TestServe_UnauthorizedStaysUp: a 401 from the control plane keeps the
+// process up and not ready, with the reason in the logs. It does not
+// exit, so the pod does not restart-loop (runtime design 4).
+func TestServe_UnauthorizedStaysUp(t *testing.T) {
+	f := newFixture(t)
+	f.hbStatus = http.StatusUnauthorized
+	a, err := f.setup()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.serve(ctx) }()
+	base := "http://" + f.cfg.LocalAddr
+	status := func(path string) int {
+		resp, err := http.Get(base + path)
+		if err != nil {
+			return 0
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+	waitFor(t, func() bool { return status("/healthz") == http.StatusOK })
+	waitFor(t, func() bool { _, _, st := f.calls(); return len(st) >= 1 })
+	time.Sleep(300 * time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("serve returned after a 401: %v", err)
+	default:
+	}
+	if status("/healthz") != http.StatusOK || status("/readyz") == http.StatusOK {
+		t.Fatalf("healthz %d readyz %d, want up and not ready", status("/healthz"), status("/readyz"))
+	}
+	calls, _, _ := f.calls()
+	if slices.Contains(calls, "POST /api/v1/gateways/"+testGatewayID+"/tasks/claim") {
+		t.Fatal("claimed after a 401")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serve err = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not return after cancel")
+	}
+	if !strings.Contains(f.logs.String(), "unauthorized") {
+		t.Fatal("reason not logged")
+	}
+}
+
+// overPrivConn is a connector whose self-check reports over-privilege.
+type overPrivConn struct{ name string }
+
+func (c overPrivConn) Name() string                   { return c.name }
+func (overPrivConn) Kind() connectors.Kind            { return connectors.KindRollout }
+func (overPrivConn) Targets() []connectors.TargetInfo { return nil }
+func (overPrivConn) Check(context.Context) error {
+	return fmt.Errorf("selfsubjectaccessreview allows get secrets: %w", connectors.ErrOverPrivileged)
+}
+func (overPrivConn) Observe(context.Context, connectors.Target) (connectors.Observation, error) {
+	return connectors.Observation{}, errors.New("not reached")
+}
+
+// TestSetup_OverPrivilegedRefusesBoot: a connector whose credential can
+// read Kubernetes Secrets refuses the boot. No setting overrides it.
+func TestSetup_OverPrivilegedRefusesBoot(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "connectors.json")
+	if err := os.WriteFile(file, []byte(`[{"name":"rollout-main","kind":"rollout"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	orig := connectorFactories
+	connectorFactories = func() connectors.Factories {
+		return connectors.Factories{connectors.KindRollout: func(name string, _ json.RawMessage) (connectors.Connector, error) {
+			return overPrivConn{name: name}, nil
+		}}
+	}
+	t.Cleanup(func() { connectorFactories = orig })
+	f := newFixture(t)
+	f.cfg.ConnectorsFile = file
+	_, err := f.setup()
+	if !errors.Is(err, connectors.ErrOverPrivileged) || !strings.Contains(err.Error(), "refusing to start") {
+		t.Fatalf("setup err = %v, want an over-privilege refusal", err)
+	}
+	if f.cpHits.Load() != 0 {
+		t.Fatal("control plane was called before the refusal")
+	}
+}
+
 func TestSetup_Refusals(t *testing.T) {
 	dir := t.TempDir()
 	esoFile := filepath.Join(dir, "connectors.json")
@@ -203,6 +361,9 @@ func TestSetup_Refusals(t *testing.T) {
 		{"no identity", func(f *bootFixture) { f.env = envMap(nil); f.cfg.IdentityFile = "" }, "no credential"},
 		{"loose identity file", func(f *bootFixture) { f.env = envMap(nil); f.cfg.IdentityFile = looseID }, "not be readable by other users"},
 		{"connector kind not in this build", func(f *bootFixture) { f.cfg.ConnectorsFile = esoFile }, "not supported by this build"},
+		{"gateway id is not a uuid", func(f *bootFixture) {
+			f.env = envMap(map[string]string{"SB_GATEWAY_ID": "gw-tenant-a-uat", "SB_GATEWAY_SECRET": testSecret})
+		}, "UUID"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -1,0 +1,126 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.26.x"
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - run: go mod download
+      - run: go build ./...
+      - run: go vet ./...
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed on: $unformatted"
+            exit 1
+          fi
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - run: go test -race -count=1 ./...
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7.0.1
+        with:
+          version: v2.14.0
+
+  tidy:
+    name: tidy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - run: |
+          go mod tidy
+          if ! git diff --exit-code -- go.mod go.sum; then
+            echo "::error::go.mod or go.sum is not tidy. Run 'go mod tidy' locally and commit the result."
+            exit 1
+          fi
+
+  # Repository guards (internal/guard): no DB, Redis, KV or ORM driver
+  # and no client-go in go.mod (require and replace, both sides) or
+  # go.sum; no import of a platform module (api, worker, agent,
+  # controller) or database/sql; no http.Transport outside
+  # internal/readonly and internal/client and no default client or proxy
+  # from the environment anywhere; no Kubernetes Secrets path literal in
+  # non-test code. The guards parse Go source, so string concatenation
+  # and path.Join are covered. The second step checks the resolved module
+  # graph, which also lists modules pulled in through a local replace.
+  guards:
+    name: guards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: guard tests
+        run: go test -count=1 -v ./internal/guard/
+      - name: resolved module graph
+        run: |
+          set -e
+          graph="$(go list -m all)"
+          FORBIDDEN_PATTERNS=(
+            "jackc/pgx" "jackc/pgconn" "lib/pq" "go-pg" "go-sql-driver/mysql" "go-mssqldb"
+            "clickhouse-go" "sqlite" "bbolt" "boltdb" "badger" "goleveldb" "pebble" "mongo"
+            "redis" "redigo" "rueidis" "valkey" "mediocregopher/radix" "go.etcd.io/etcd"
+            "gorm" "uptrace/bun" "entgo.io" "xorm"
+            "k8s.io/client-go" "sigs.k8s.io/controller-runtime"
+            "github.com/secrets-bridge/api" "github.com/secrets-bridge/worker"
+            "github.com/secrets-bridge/agent" "github.com/secrets-bridge/controller"
+          )
+          status=0
+          for pat in "${FORBIDDEN_PATTERNS[@]}"; do
+            if printf '%s\n' "$graph" | grep -q -i -F -- "${pat}"; then
+              echo "::error::forbidden module in the resolved graph: ${pat}"
+              status=1
+            fi
+          done
+          exit $status

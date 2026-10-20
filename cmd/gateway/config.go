@@ -27,8 +27,13 @@ type Config struct {
 
 	LocalAddr      string
 	ConnectorsFile string
-	LogLevel       string
-	ShutdownGrace  time.Duration
+	// EnableR2Connectors binds the Release 2 connector kinds (eso and
+	// rollout), which read the Kubernetes API. Off by default: Release 1
+	// is Argo CD rollout-state observation only, and this switch is for
+	// non-production use.
+	EnableR2Connectors bool
+	LogLevel           string
+	ShutdownGrace      time.Duration
 
 	// Control-plane loop settings (runtime design section 6).
 	HeartbeatInterval time.Duration
@@ -39,6 +44,9 @@ type Config struct {
 	PassTimeout       time.Duration
 	UnreachableAfter  time.Duration
 }
+
+// envEnableR2Connectors turns on the Release 2 connector kinds.
+const envEnableR2Connectors = "SB_GATEWAY_ENABLE_R2_CONNECTORS"
 
 const (
 	defaultIdentityFile  = "/etc/secrets-bridge/gateway/identity.json"
@@ -53,22 +61,23 @@ const (
 func parseConfig(args []string, getenv func(string) (string, bool), stderr io.Writer) (Config, error) {
 	e := envReader{getenv: getenv}
 	cfg := Config{
-		CPEndpoint:        e.str("SB_CP_ENDPOINT", ""),
-		InsecureTransport: e.boolean("SB_INSECURE_TRANSPORT", false),
-		CAFile:            e.str("SB_CP_CA_FILE", ""),
-		TLSServerName:     e.str("SB_CP_TLS_SERVER_NAME", ""),
-		IdentityFile:      e.str("SB_GATEWAY_IDENTITY_FILE", defaultIdentityFile),
-		LocalAddr:         e.str("SB_GATEWAY_LOCAL_ADDR", defaultLocalAddr),
-		ConnectorsFile:    e.str("SB_GATEWAY_CONNECTORS_FILE", ""),
-		LogLevel:          e.str("SB_LOG_LEVEL", "info"),
-		ShutdownGrace:     e.duration("SB_GATEWAY_SHUTDOWN_GRACE", defaultShutdownGrace),
-		HeartbeatInterval: e.duration("SB_GATEWAY_HEARTBEAT_INTERVAL", loop.DefaultHeartbeatInterval),
-		ClaimInterval:     e.duration("SB_GATEWAY_CLAIM_INTERVAL", loop.DefaultClaimInterval),
-		ClaimIdleMax:      e.duration("SB_GATEWAY_CLAIM_IDLE_MAX", loop.DefaultClaimIdleMax),
-		ClaimConcurrency:  e.integer("SB_GATEWAY_CLAIM_CONCURRENCY", loop.DefaultConcurrency),
-		LeaseMargin:       e.duration("SB_GATEWAY_LEASE_MARGIN", loop.DefaultLeaseMargin),
-		PassTimeout:       e.duration("SB_GATEWAY_PASS_TIMEOUT", loop.DefaultPassTimeout),
-		UnreachableAfter:  e.duration("SB_GATEWAY_CP_UNREACHABLE_AFTER", loop.DefaultUnreachableAfter),
+		CPEndpoint:         e.str("SB_CP_ENDPOINT", ""),
+		InsecureTransport:  e.boolean("SB_INSECURE_TRANSPORT", false),
+		CAFile:             e.str("SB_CP_CA_FILE", ""),
+		TLSServerName:      e.str("SB_CP_TLS_SERVER_NAME", ""),
+		IdentityFile:       e.str("SB_GATEWAY_IDENTITY_FILE", defaultIdentityFile),
+		LocalAddr:          e.str("SB_GATEWAY_LOCAL_ADDR", defaultLocalAddr),
+		ConnectorsFile:     e.str("SB_GATEWAY_CONNECTORS_FILE", ""),
+		EnableR2Connectors: e.boolean(envEnableR2Connectors, false),
+		LogLevel:           e.str("SB_LOG_LEVEL", "info"),
+		ShutdownGrace:      e.duration("SB_GATEWAY_SHUTDOWN_GRACE", defaultShutdownGrace),
+		HeartbeatInterval:  e.duration("SB_GATEWAY_HEARTBEAT_INTERVAL", loop.DefaultHeartbeatInterval),
+		ClaimInterval:      e.duration("SB_GATEWAY_CLAIM_INTERVAL", loop.DefaultClaimInterval),
+		ClaimIdleMax:       e.duration("SB_GATEWAY_CLAIM_IDLE_MAX", loop.DefaultClaimIdleMax),
+		ClaimConcurrency:   e.integer("SB_GATEWAY_CLAIM_CONCURRENCY", loop.DefaultConcurrency),
+		LeaseMargin:        e.duration("SB_GATEWAY_LEASE_MARGIN", loop.DefaultLeaseMargin),
+		PassTimeout:        e.duration("SB_GATEWAY_PASS_TIMEOUT", loop.DefaultPassTimeout),
+		UnreachableAfter:   e.duration("SB_GATEWAY_CP_UNREACHABLE_AFTER", loop.DefaultUnreachableAfter),
 	}
 	if e.err != nil {
 		return Config{}, e.err
@@ -83,6 +92,7 @@ func parseConfig(args []string, getenv func(string) (string, bool), stderr io.Wr
 	fs.StringVar(&cfg.IdentityFile, "identity-file", cfg.IdentityFile, "JSON {gateway_id, gateway_secret}, mode 0400, 0600 or 0440 (no other bits, no group write); ignored when SB_GATEWAY_ID and SB_GATEWAY_SECRET are set (also SB_GATEWAY_IDENTITY_FILE)")
 	fs.StringVar(&cfg.LocalAddr, "local-addr", cfg.LocalAddr, "loopback address for /healthz /readyz /metrics (also SB_GATEWAY_LOCAL_ADDR)")
 	fs.StringVar(&cfg.ConnectorsFile, "connectors-file", cfg.ConnectorsFile, "JSON list of locally bound connectors; empty binds none (also SB_GATEWAY_CONNECTORS_FILE)")
+	fs.BoolVar(&cfg.EnableR2Connectors, "enable-r2-connectors", cfg.EnableR2Connectors, "bind the Release 2 eso and rollout connector kinds, NOT SUPPORTED FOR PRODUCTION (also "+envEnableR2Connectors+")")
 	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "debug, info, warn or error (also SB_LOG_LEVEL)")
 	fs.DurationVar(&cfg.ShutdownGrace, "shutdown-grace", cfg.ShutdownGrace, "graceful shutdown deadline (also SB_GATEWAY_SHUTDOWN_GRACE)")
 	fs.DurationVar(&cfg.HeartbeatInterval, "heartbeat-interval", cfg.HeartbeatInterval, "heartbeat interval until the control plane suggests one (also SB_GATEWAY_HEARTBEAT_INTERVAL)")

@@ -77,6 +77,8 @@ func TestParse_Refusals(t *testing.T) {
 		{"unknown kind", `[{"name":"vault-main","kind":"vault","settings":{"url":"` + c + `"}}]`, allFactories, ErrUnknownKind},
 		{"empty kind", `[{"name":"x","settings":{"url":"` + c + `"}}]`, allFactories, ErrUnknownKind},
 		{"kind not in build", `[{"name":"argocd-main","kind":"argocd","settings":{"url":"` + c + `"}}]`, Factories{KindESO: fakeFactory(KindESO)}, ErrKindNotSupported},
+		{"eso not enabled", `[{"name":"eso-main","kind":"eso","settings":{"url":"` + c + `"}}]`, Factories{KindArgoCD: fakeFactory(KindArgoCD)}, ErrKindNotEnabled},
+		{"rollout not enabled", `[{"name":"rollout-main","kind":"rollout","settings":{"url":"` + c + `"}}]`, Factories{KindArgoCD: fakeFactory(KindArgoCD)}, ErrKindNotEnabled},
 		{"duplicate names", `[{"name":"eso-main","kind":"eso"},{"name":"eso-main","kind":"rollout","settings":{"url":"` + c + `"}}]`, allFactories, ErrDuplicateConnector},
 		{"bad name url", `[{"name":"https://` + c + `","kind":"eso"}]`, allFactories, ErrInvalidConfigFile},
 		{"bad name upper", `[{"name":"ESO","kind":"eso"}]`, allFactories, ErrInvalidConfigFile},

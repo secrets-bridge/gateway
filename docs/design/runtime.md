@@ -4,6 +4,16 @@ Status: design detail for [ADR 0001](../adr/0001-gateway-observation-plane.md). 
 
 Sources read on `main`: `agent/cmd/agent/{main.go,config.go,transport.go}`, `agent/internal/identity/{identity.go,keypair.go}`, `agent/internal/client/{limits.go,jobs.go}`, `agent/internal/local/local.go`, `agent/internal/executor/patch.go`, `api/pkg/storage/{jobs.go,gitops_observations.go,agent_enrollment_tokens.go,agents.go,argocd_endpoints.go}`, `api/pkg/argocd/client.go`, `core/providers/awssecretsmanager/awssecretsmanager.go`, `core/providers/vault/vault.go`, `worker/internal/sweepers/gitops_poller.go`, `charts/agent/{Chart.yaml,templates/_validation.tpl,templates/_helpers.tpl,templates/deployment.yaml,templates/networkpolicy.yaml}`.
 
+## Release 1 scope
+
+Release 1 of the Gateway covers read-only Argo CD rollout-state observation only ([#12](https://github.com/secrets-bridge/gateway/issues/12), [#15](https://github.com/secrets-bridge/gateway/issues/15)). The Gateway is the only Secrets Bridge component that talks to Argo CD ([#13](https://github.com/secrets-bridge/gateway/issues/13)).
+
+- **Supported kind: `argocd`.** It reports Application sync status and revision, health, the last operation phase and reconcile time, as stage `argocd_context` (section 3.5). This is observed operational state. It is not proof that a secret value reached a running workload: the stage is at most `observed` with confidence `low`, never `failed` or `not_applicable`, has linkage `none`, carries caveat `argocd_health_not_proof` on every non-error observation, and never makes a verdict `verified` or failed (ADR 0001 section 2.3). State reconciled at or before the change is `not_observed`, an unreachable or refusing Argo CD is `error`, and an Application outside the allowed AppProjects is `unverifiable`. None of these is reported as a success.
+- **No Kubernetes API access.** With only `argocd` connectors configured, the Gateway reads no in-cluster configuration, so it needs no service-account token, no `KUBERNETES_SERVICE_HOST` and no RBAC. It builds no Kubernetes client and runs no Kubernetes self-check (section 5.3). The chart can set `automountServiceAccountToken: false` and render no Role.
+- **Release 2 kinds: `eso` and `rollout`.** The code stays in the tree for Release 2, but these kinds are not Release 1 features. The connectors file loader refuses them unless the operator sets `SB_GATEWAY_ENABLE_R2_CONNECTORS=true` (flag `--enable-r2-connectors`). That switch is for non-production use only, and the Gateway logs a WARN at boot saying so whenever it is on. The refusal names the entry index, the connector name and the kind, never settings content. With the switch off no Kubernetes connector factory runs.
+
+Sections 3.3, 3.4 and 5 describe the Release 2 Kubernetes connectors. They apply only when the switch is on.
+
 ## 1. Findings from the code that shape the runtime
 
 1. **Agent enrollment persists a file on a ReadWriteOnce PVC.** `identity.Save`, the chart's `identity-pvc.yaml` and the `maxSurge: 0` strategy make the agent a single-writer workload. A stateless, multi-replica Gateway cannot do that, so it reuses the token model (hash only, single use, expiry, revoke) but enrolls outside the pod (section 4).
@@ -122,7 +132,9 @@ type Connector interface {
 
 `Observe` is a snapshot. The Gateway holds no informer cache and no state between passes. The runner runs `eso_sync` first in a pass so the rollout connector can compare against the `refreshTime` it just read. Repeated observation over time is the CP's job.
 
-### 3.3 ESO connector
+### 3.3 ESO connector (Release 2)
+
+Refused at config load unless `SB_GATEWAY_ENABLE_R2_CONNECTORS=true` (see Release 1 scope).
 
 API version: there is no discovery call at boot, and `GET /apis/external-secrets.io` is not in the allowlist. Each read asks for the object in `v1` first. When the API server answers that the group version is not served (a 404 without a `NotFound` Status), the same read retries in `v1beta1`. The connector remembers the version that last answered and tries it first on the next read. If neither version is served, the `eso_sync` stage reports `error` with `api_version_not_served`. Recent ESO releases serve `v1` and are removing `v1beta1` (verify for the supported range).
 
@@ -143,7 +155,9 @@ Not used: the `reconcile.external-secrets.io/data-hash` annotation on the target
 
 Proposed outcome: the ADR 2.3 `eso_sync` rules, with `T = expected_change.executed_at` and skew from section 9. The refresh check: if not yet observed and `refreshInterval == 0` or `refreshTime + refreshInterval > deadline_at`, propose `unverifiable` with `refresh_interval_exceeds_deadline` on the first pass.
 
-### 3.4 Rollout connector
+### 3.4 Rollout connector (Release 2)
+
+Refused at config load unless `SB_GATEWAY_ENABLE_R2_CONNECTORS=true` (see Release 1 scope).
 
 Read:
 
@@ -174,7 +188,7 @@ Proposed outcome: the ADR 2.3 `workload_rollout` rules. In particular: `volume` 
 
 Pods are not read in MVP.
 
-### 3.5 ArgoCD connector
+### 3.5 ArgoCD connector (Release 1)
 
 Only two requests are possible:
 
@@ -197,7 +211,9 @@ Boot check: `GET /api/v1/session/userinfo` confirms the token works. Optional ne
 - **Rotation.** Not in v1: revoke and re-create, as for agents. A two-hash `gateway_credentials` table is out of v1 (ADR 0001 section 11).
 - **No keypair.** The Gateway never receives wraps or values, so it has no X25519 keypair and no DEK path.
 
-## 5. Kubernetes RBAC
+## 5. Kubernetes RBAC (Release 2)
+
+This section applies only when `eso` or `rollout` connectors are bound, which needs `SB_GATEWAY_ENABLE_R2_CONNECTORS=true`. An Argo CD-only Gateway (Release 1) has no Kubernetes RBAC and runs no Kubernetes self-check.
 
 ### 5.1 Default: namespaced Roles
 

@@ -329,6 +329,7 @@ func TestSetup_OverPrivilegedRefusesBoot(t *testing.T) {
 	t.Cleanup(func() { connectorFactories = orig })
 	f := newFixture(t)
 	f.cfg.ConnectorsFile = file
+	f.cfg.EnableR2Connectors = true
 	_, err := f.setup()
 	if !errors.Is(err, connectors.ErrOverPrivileged) || !strings.Contains(err.Error(), "refusing to start") {
 		t.Fatalf("setup err = %v, want an over-privilege refusal", err)
@@ -363,6 +364,7 @@ func TestSetup_UnprovenSelfCheckRefusesBoot(t *testing.T) {
 	t.Cleanup(func() { connectorFactories = orig })
 	f := newFixture(t)
 	f.cfg.ConnectorsFile = file
+	f.cfg.EnableR2Connectors = true
 	_, err := f.setup()
 	if !errors.Is(err, connectors.ErrPrivilegeUnproven) || !strings.Contains(err.Error(), "refusing to start") {
 		t.Fatalf("setup err = %v, want a fail-closed refusal", err)
@@ -408,8 +410,16 @@ func TestSetup_Refusals(t *testing.T) {
 		{"missing CA file", func(f *bootFixture) { f.cfg.CAFile = filepath.Join(dir, "absent.pem") }, "CA file"},
 		{"no identity", func(f *bootFixture) { f.env = envMap(nil); f.cfg.IdentityFile = "" }, "no credential"},
 		{"loose identity file", func(f *bootFixture) { f.env = envMap(nil); f.cfg.IdentityFile = looseID }, "not be readable by other users"},
-		{"rollout outside a cluster without a server", func(f *bootFixture) { f.cfg.ConnectorsFile = rolloutFile }, "not running in a cluster"},
-		{"eso outside a cluster without a server", func(f *bootFixture) { f.cfg.ConnectorsFile = esoFile }, "not running in a cluster"},
+		{"rollout is refused in Release 1", func(f *bootFixture) { f.cfg.ConnectorsFile = rolloutFile }, "SB_GATEWAY_ENABLE_R2_CONNECTORS"},
+		{"eso is refused in Release 1", func(f *bootFixture) { f.cfg.ConnectorsFile = esoFile }, "Release 2 connector"},
+		{"rollout outside a cluster without a server", func(f *bootFixture) {
+			f.cfg.ConnectorsFile = rolloutFile
+			f.cfg.EnableR2Connectors = true
+		}, "not running in a cluster"},
+		{"eso outside a cluster without a server", func(f *bootFixture) {
+			f.cfg.ConnectorsFile = esoFile
+			f.cfg.EnableR2Connectors = true
+		}, "not running in a cluster"},
 		{"invalid argocd settings", func(f *bootFixture) { f.cfg.ConnectorsFile = badArgo }, "base_url"},
 		{"gateway id is not a uuid", func(f *bootFixture) {
 			f.env = envMap(map[string]string{"SB_GATEWAY_ID": "gw-tenant-a-uat", "SB_GATEWAY_SECRET": testSecret})

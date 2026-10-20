@@ -99,13 +99,10 @@ func (c *Connector) Targets() []connectors.TargetInfo {
 }
 
 // Check implements connectors.Connector with the boot self-check of
-// runtime design 5.3 for every allowed namespace.
+// runtime design 5.3 for every allowed namespace. A write grant on
+// deployments or replicasets is over-privilege, like any grant on secrets.
 func (c *Connector) Check(ctx context.Context) error {
-	rep, err := kubeconn.SelfCheck(ctx, c.api, c.namespaces, requiredAccess)
-	if err == nil && rep.WriteVerbs {
-		c.opts.Log().Warn("rules review shows a write verb on deployments or replicasets; the gateway needs only get and list", "connector_id", c.name)
-	}
-	return err
+	return kubeconn.SelfCheck(ctx, c.api, c.namespaces, requiredAccess)
 }
 
 // Observe implements connectors.Connector.

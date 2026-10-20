@@ -732,3 +732,36 @@ func TestParseSettingsNamespaces(t *testing.T) {
 		t.Fatalf("valid settings refused: %v", err)
 	}
 }
+
+// A write grant on deployments or replicasets is over-privilege
+// (gateway#11), found by the rules review or, when that is incomplete, by
+// an access review.
+func TestCheckRefusesWriteOnObservedResources(t *testing.T) {
+	f := newFixture(t)
+	f.api.Rules = func(string) (int, any) {
+		return 200, map[string]any{"incomplete": false, "resourceRules": []any{
+			map[string]any{"apiGroups": []string{"apps"}, "resources": []string{"deployments", "replicasets"}, "verbs": []string{"get", "list", "update"}},
+		}}
+	}
+	if err := f.connector(t).Check(context.Background()); !errors.Is(err, connectors.ErrOverPrivileged) {
+		t.Fatalf("rules review with update: err = %v, want ErrOverPrivileged", err)
+	}
+
+	f = newFixture(t)
+	f.api.Rules = func(string) (int, any) {
+		return 200, map[string]any{"incomplete": true, "resourceRules": []any{}}
+	}
+	f.api.Access = func(r kubetest.Review) (bool, int) {
+		switch r.Resource {
+		case "deployments":
+			return r.Verb == "get", 0
+		case "replicasets":
+			return r.Verb == "list" || r.Verb == "delete", 0
+		}
+		return false, 0
+	}
+	err := f.connector(t).Check(context.Background())
+	if !errors.Is(err, connectors.ErrOverPrivileged) || !strings.Contains(err.Error(), "may delete replicasets") {
+		t.Fatalf("incomplete rules, delete allowed: err = %v, want ErrOverPrivileged naming the verb", err)
+	}
+}

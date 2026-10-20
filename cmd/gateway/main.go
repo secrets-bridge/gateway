@@ -22,6 +22,10 @@
 //   - The only writes go to the gateway endpoints of the control plane
 //     (internal/client refuses any other method or path).
 //
+// `gateway healthcheck` is the client side of the exec probes: one GET
+// to the loopback /readyz (or /healthz with --live), exit 0 on 200 and 1
+// otherwise.
+//
 // This build wires configuration, identity, the connector registry, the
 // loopback server and the control-plane loop (internal/loop): heartbeat,
 // claim, one bounded pass over the locally bound connectors a task
@@ -176,6 +180,9 @@ func main() {
 }
 
 func run(args []string, getenv func(string) (string, bool)) error {
+	if len(args) > 0 && args[0] == healthcheckCommand {
+		return runHealthcheck(context.Background(), args[1:], getenv, os.Stderr)
+	}
 	cfg, err := parseConfig(args, getenv, os.Stderr)
 	if err != nil {
 		return err

@@ -26,7 +26,7 @@ func client(t *testing.T, s *kubetest.Server) *kubeconn.Settings {
 	return &kubeconn.Settings{Server: s.URL(), CAFile: s.CAFile, TokenFile: s.TokenFile}
 }
 
-func run(t *testing.T, s *kubetest.Server) (kubeconn.Report, error) {
+func run(t *testing.T, s *kubetest.Server) error {
 	t.Helper()
 	c, err := kubeconn.NewClient(client(t, s), kubeconn.Options{}, []string{"/apis/apps/v1/namespaces/*/deployments/*"}, nil)
 	if err != nil {
@@ -52,9 +52,8 @@ func rule(groups, resources, verbs []string) map[string]any {
 func TestSelfCheckPasses(t *testing.T) {
 	s := kubetest.New(t)
 	s.Rules = rules(rule([]string{"apps"}, []string{"deployments"}, []string{"get"}), rule([]string{"apps"}, []string{"replicasets"}, []string{"list"}))
-	rep, err := run(t, s)
-	if err != nil || rep.WriteVerbs {
-		t.Fatalf("SelfCheck = %+v, %v", rep, err)
+	if err := run(t, s); err != nil {
+		t.Fatalf("SelfCheck = %v", err)
 	}
 	// Per namespace: one rules review, three secrets reviews (the rules
 	// review is complete), then one review per required access.
@@ -151,7 +150,7 @@ func TestSelfCheckBranches(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			s := kubetest.New(t)
 			tc.setup(s)
-			_, err := run(t, s)
+			err := run(t, s)
 			if tc.passes {
 				if err != nil {
 					t.Fatalf("err = %v, want pass", err)
@@ -191,9 +190,9 @@ func TestSelfCheckIncompleteRulesAnySecretsVerb(t *testing.T) {
 				if r.Resource == readonly.SecretsResource {
 					return r.Verb == verb && r.Namespace == "tenant-b-uat", 0
 				}
-				return true, 0
+				return kubetest.ReadOnly(r), 0
 			}
-			_, err := run(t, s)
+			err := run(t, s)
 			if !errors.Is(err, connectors.ErrOverPrivileged) {
 				t.Fatalf("err = %v, want ErrOverPrivileged", err)
 			}
@@ -211,7 +210,7 @@ func TestSelfCheckRulesAnySecretsVerb(t *testing.T) {
 		t.Run(verb, func(t *testing.T) {
 			s := kubetest.New(t)
 			s.Rules = rules(rule([]string{""}, []string{"secrets"}, []string{verb}))
-			if _, err := run(t, s); !errors.Is(err, connectors.ErrOverPrivileged) {
+			if err := run(t, s); !errors.Is(err, connectors.ErrOverPrivileged) {
 				t.Fatalf("err = %v, want ErrOverPrivileged", err)
 			}
 		})
@@ -232,9 +231,9 @@ func TestSelfCheckIncompleteRulesAsksEveryVerb(t *testing.T) {
 			mu.Unlock()
 			return false, 0
 		}
-		return true, 0
+		return kubetest.ReadOnly(r), 0
 	}
-	if _, err := run(t, s); err != nil {
+	if err := run(t, s); err != nil {
 		t.Fatalf("err = %v, want pass", err)
 	}
 	for _, ns := range namespaces {
@@ -255,9 +254,9 @@ func TestSelfCheckIncompleteRulesAsksEveryVerb(t *testing.T) {
 					}
 					return false, 0
 				}
-				return true, 0
+				return kubetest.ReadOnly(r), 0
 			}
-			if _, err := run(t, s); !errors.Is(err, connectors.ErrPrivilegeUnproven) {
+			if err := run(t, s); !errors.Is(err, connectors.ErrPrivilegeUnproven) {
 				t.Fatalf("err = %v, want ErrPrivilegeUnproven", err)
 			}
 		})
@@ -282,7 +281,7 @@ func TestSelfCheckReviewWithoutStatus(t *testing.T) {
 		t.Run("access review "+tc.name, func(t *testing.T) {
 			s := kubetest.New(t)
 			s.AccessBody = func(kubetest.Review) any { return tc.body }
-			if _, err := run(t, s); !errors.Is(err, connectors.ErrPrivilegeUnproven) {
+			if err := run(t, s); !errors.Is(err, connectors.ErrPrivilegeUnproven) {
 				t.Fatalf("err = %v, want ErrPrivilegeUnproven", err)
 			}
 		})
@@ -296,7 +295,7 @@ func TestSelfCheckReviewWithoutStatus(t *testing.T) {
 				}
 				return tc.body
 			}
-			if _, err := run(t, s); err == nil {
+			if err := run(t, s); err == nil {
 				t.Fatal("self-check passed with a required review that did not answer")
 			}
 		})
@@ -313,19 +312,122 @@ func TestSelfCheckReviewWithoutStatus(t *testing.T) {
 		t.Run("rules review "+tc.name, func(t *testing.T) {
 			s := kubetest.New(t)
 			s.RulesBody = func(string) any { return tc.body }
-			if _, err := run(t, s); !errors.Is(err, connectors.ErrPrivilegeUnproven) {
+			if err := run(t, s); !errors.Is(err, connectors.ErrPrivilegeUnproven) {
 				t.Fatalf("err = %v, want ErrPrivilegeUnproven", err)
 			}
 		})
 	}
 }
 
-func TestSelfCheckReportsWriteVerbs(t *testing.T) {
+var writeVerbs = []string{"create", "update", "patch", "delete", "deletecollection", "*"}
+
+// A write verb on a resource the connector reads is over-privilege, like
+// any verb on secrets (gateway#11): the gateway only observes.
+func TestSelfCheckRulesWriteVerbOnObservedResource(t *testing.T) {
+	type grant struct{ groups, resources []string }
+	grants := map[string]grant{
+		"deployments":         {[]string{"apps"}, []string{"deployments"}},
+		"replicasets":         {[]string{"apps"}, []string{"replicasets"}},
+		"deployments/scale":   {[]string{"apps"}, []string{"deployments/scale"}},
+		"every apps resource": {[]string{"apps"}, []string{"*"}},
+		"every group":         {[]string{"*"}, []string{"replicasets"}},
+	}
+	for name, g := range grants {
+		for _, verb := range writeVerbs {
+			t.Run(name+" "+verb, func(t *testing.T) {
+				s := kubetest.New(t)
+				s.Rules = rules(rule([]string{"apps"}, []string{"deployments"}, []string{"get"}), rule(g.groups, g.resources, []string{"get", verb}))
+				err := run(t, s)
+				if !errors.Is(err, connectors.ErrOverPrivileged) {
+					t.Fatalf("err = %v, want ErrOverPrivileged", err)
+				}
+				if !strings.Contains(err.Error(), "grants "+verb+" on ") {
+					t.Fatalf("err = %v does not name the verb", err)
+				}
+				if strings.Contains(err.Error(), "tenant-") || strings.Contains(err.Error(), s.URL()) {
+					t.Fatalf("error names a namespace or the server: %v", err)
+				}
+			})
+		}
+	}
+	// Writes on a resource the connector does not read stay out of scope.
 	s := kubetest.New(t)
-	s.Rules = rules(rule([]string{"apps"}, []string{"deployments"}, []string{"get", "patch"}))
-	rep, err := run(t, s)
-	if err != nil || !rep.WriteVerbs {
-		t.Fatalf("SelfCheck = %+v, %v; want a pass with a write-verb warning", rep, err)
+	s.Rules = rules(rule([]string{""}, []string{"configmaps"}, []string{"patch"}), rule([]string{"batch"}, []string{"jobs"}, []string{"*"}))
+	if err := run(t, s); err != nil {
+		t.Fatalf("write on an unobserved resource: err = %v, want pass", err)
+	}
+}
+
+// With an incomplete rules review, every write verb on every resource the
+// connector reads is asked about in every namespace, and an allowed,
+// failed or unanswered review fails closed.
+func TestSelfCheckIncompleteRulesAsksWriteVerbs(t *testing.T) {
+	s := kubetest.New(t)
+	s.Rules = incomplete
+	var mu sync.Mutex
+	asked := map[string]bool{}
+	s.Access = func(r kubetest.Review) (bool, int) {
+		mu.Lock()
+		asked[r.Namespace+" "+r.Group+" "+r.Resource+" "+r.Verb] = true
+		mu.Unlock()
+		return kubetest.ReadOnly(r), 0
+	}
+	if err := run(t, s); err != nil {
+		t.Fatalf("read-only account: err = %v, want pass", err)
+	}
+	for _, ns := range namespaces {
+		for _, res := range []string{"deployments", "replicasets"} {
+			for _, verb := range writeVerbs {
+				if !asked[ns+" apps "+res+" "+verb] {
+					t.Errorf("no access review for %s on %s", verb, res)
+				}
+			}
+		}
+	}
+	for _, res := range []string{"deployments", "replicasets"} {
+		for _, verb := range writeVerbs {
+			hit := func(r kubetest.Review) bool {
+				return r.Group == "apps" && r.Resource == res && r.Verb == verb && r.Namespace == "tenant-b-uat"
+			}
+			t.Run("allowed "+verb+" on "+res, func(t *testing.T) {
+				s := kubetest.New(t)
+				s.Rules = incomplete
+				s.Access = func(r kubetest.Review) (bool, int) { return kubetest.ReadOnly(r) || hit(r), 0 }
+				err := run(t, s)
+				if !errors.Is(err, connectors.ErrOverPrivileged) {
+					t.Fatalf("err = %v, want ErrOverPrivileged", err)
+				}
+				if !strings.Contains(err.Error(), "may "+verb+" "+res) {
+					t.Fatalf("err = %v does not name the verb and resource", err)
+				}
+			})
+			t.Run("failed review "+verb+" on "+res, func(t *testing.T) {
+				s := kubetest.New(t)
+				s.Rules = incomplete
+				s.Access = func(r kubetest.Review) (bool, int) {
+					if hit(r) {
+						return false, 500
+					}
+					return kubetest.ReadOnly(r), 0
+				}
+				if err := run(t, s); !errors.Is(err, connectors.ErrPrivilegeUnproven) {
+					t.Fatalf("err = %v, want ErrPrivilegeUnproven", err)
+				}
+			})
+			t.Run("unanswered review "+verb+" on "+res, func(t *testing.T) {
+				s := kubetest.New(t)
+				s.Rules = incomplete
+				s.AccessBody = func(r kubetest.Review) any {
+					if hit(r) {
+						return map[string]any{"status": map[string]any{"reason": "x"}}
+					}
+					return map[string]any{"status": map[string]any{"allowed": kubetest.ReadOnly(r)}}
+				}
+				if err := run(t, s); !errors.Is(err, connectors.ErrPrivilegeUnproven) {
+					t.Fatalf("err = %v, want ErrPrivilegeUnproven", err)
+				}
+			})
+		}
 	}
 }
 
@@ -350,6 +452,39 @@ func TestRegistryFailsClosed(t *testing.T) {
 	}
 }
 
+// A write grant refuses the boot, and one added after a clean start is
+// found by the next recheck of every connector and stays over-privileged.
+func TestRegistryWriteGrantRefusesBootAndRecheck(t *testing.T) {
+	writeRule := func(string) (int, any) {
+		return 200, map[string]any{"resourceRules": []any{rule([]string{"apps"}, []string{"deployments"}, []string{"get", "patch"})}, "incomplete": false}
+	}
+	s := kubetest.New(t)
+	s.Rules = writeRule
+	reg, err := connectors.NewRegistry(checkConn{s: s, t: t})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Check(context.Background(), 10*time.Second); !errors.Is(err, connectors.ErrOverPrivileged) {
+		t.Fatalf("boot Check = %v, want ErrOverPrivileged", err)
+	}
+
+	s = kubetest.New(t)
+	reg, err = connectors.NewRegistry(checkConn{s: s, t: t})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Check(context.Background(), 10*time.Second); err != nil {
+		t.Fatalf("clean boot Check = %v", err)
+	}
+	s.Rules = writeRule
+	if err := reg.RecheckAll(context.Background(), 10*time.Second); !errors.Is(err, connectors.ErrOverPrivileged) {
+		t.Fatalf("RecheckAll = %v, want ErrOverPrivileged", err)
+	}
+	if h := reg.Health(); h[0].Status != connectors.HealthOverPrivileged {
+		t.Fatalf("health = %+v", h)
+	}
+}
+
 type checkConn struct {
 	s *kubetest.Server
 	t *testing.T
@@ -363,8 +498,7 @@ func (c checkConn) Check(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	_, err = kubeconn.SelfCheck(ctx, cl, namespaces, required)
-	return err
+	return kubeconn.SelfCheck(ctx, cl, namespaces, required)
 }
 func (checkConn) Observe(context.Context, connectors.Target) (connectors.Observation, error) {
 	return connectors.Observation{}, errors.New("not used")

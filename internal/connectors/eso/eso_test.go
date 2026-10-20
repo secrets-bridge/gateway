@@ -502,3 +502,32 @@ func TestParseSettingsNamespaces(t *testing.T) {
 		t.Fatalf("err = %v, want a targets.namespace refusal", err)
 	}
 }
+
+// A write grant on externalsecrets is over-privilege (gateway#11), found
+// by the rules review or, when that is incomplete, by an access review.
+func TestCheckRefusesWriteOnExternalSecrets(t *testing.T) {
+	f := newFixture(t, v1Path, nil)
+	f.api.Rules = func(string) (int, any) {
+		return 200, map[string]any{"incomplete": false, "resourceRules": []any{
+			map[string]any{"apiGroups": []string{"external-secrets.io"}, "resources": []string{"externalsecrets"}, "verbs": []string{"get", "patch"}},
+		}}
+	}
+	if err := f.connector(t).Check(context.Background()); !errors.Is(err, connectors.ErrOverPrivileged) {
+		t.Fatalf("rules review with patch: err = %v, want ErrOverPrivileged", err)
+	}
+
+	f = newFixture(t, v1Path, nil)
+	f.api.Rules = func(string) (int, any) {
+		return 200, map[string]any{"incomplete": true, "resourceRules": []any{}}
+	}
+	f.api.Access = func(r kubetest.Review) (bool, int) {
+		if r.Resource != "externalsecrets" {
+			return false, 0
+		}
+		return r.Verb == "get" || r.Verb == "update", 0
+	}
+	err := f.connector(t).Check(context.Background())
+	if !errors.Is(err, connectors.ErrOverPrivileged) || !strings.Contains(err.Error(), "may update externalsecrets") {
+		t.Fatalf("incomplete rules, update allowed: err = %v, want ErrOverPrivileged naming the verb", err)
+	}
+}

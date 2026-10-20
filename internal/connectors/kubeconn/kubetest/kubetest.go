@@ -50,13 +50,18 @@ type Server struct {
 	Now func() time.Time
 }
 
-// New starts a server. By default every access review is allowed except
-// for secrets, the rules review is complete and empty, and the clock is
-// time.Now.
+// ReadOnly is the least-privilege account the chart creates: get, list
+// and watch on anything but secrets, and no write verb.
+func ReadOnly(r Review) bool {
+	return r.Resource != readonly.SecretsResource && (r.Verb == "get" || r.Verb == "list" || r.Verb == "watch")
+}
+
+// New starts a server. By default access reviews answer as ReadOnly, the
+// rules review is complete and empty, and the clock is time.Now.
 func New(t *testing.T) *Server {
 	t.Helper()
 	s := &Server{routes: map[string]func(url.Values) (int, any){}, Now: time.Now}
-	s.Access = func(r Review) (bool, int) { return r.Resource != readonly.SecretsResource, 0 }
+	s.Access = func(r Review) (bool, int) { return ReadOnly(r), 0 }
 	s.Rules = func(string) (int, any) {
 		return 200, map[string]any{"resourceRules": []any{}, "incomplete": false}
 	}

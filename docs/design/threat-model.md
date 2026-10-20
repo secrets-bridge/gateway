@@ -291,7 +291,7 @@ Legend: OUT outbound only, RO read-only, NOVAL no secret values or hashes, BIND 
 | I | Projection gap forwards env literals, inline Helm values or hash annotations | P2, bug | Projected decode structs, annotation key allowlist, golden tests with canary values | 5.2 |
 | I | Path traversal in an ArgoCD app name reaches other GET endpoints | P5 | Name grammar validation and path allowlist (F7) | 5.1 |
 | D | Large responses exhaust memory | P6 | `io.LimitReader` on all HTTP bodies; bounded ReplicaSet list | 5.6 |
-| E | A future change issues a write | bug | GET-only transports; static write-call guard; RBAC has no write verbs | RO |
+| E | A future change issues a write | bug | GET-only transports; static write-call guard; RBAC has no write verbs, and the self-check refuses to run with a write grant on an observed resource (runtime 5.3) | RO |
 
 ### C8. Evidence store and presentation (CP, UI)
 

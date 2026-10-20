@@ -30,8 +30,13 @@ var secretReadVerbs = []string{"get", "list", "watch"}
 // Any verb on secrets, read or write, is over-privilege.
 var secretAllVerbs = []string{"get", "list", "watch", "create", "update", "patch", "delete", "deletecollection", "*"}
 
-// writeVerbs are reported as a warning when a rules review shows them on
-// a resource the connector reads (runtime design 5.3 step 4).
+// observedWriteVerbs on a resource the connector reads are over-privilege
+// (runtime design 5.3, gateway#11): the gateway only observes, so
+// a write grant only widens what a stolen pod token can do. When the rules
+// review is incomplete, each is asked about with an access review.
+var observedWriteVerbs = []string{"create", "update", "patch", "delete", "deletecollection", "*"}
+
+// writeVerbs is the same set, for matching the verbs of a rule.
 var writeVerbs = map[string]bool{
 	"create": true, "update": true, "patch": true, "delete": true, "deletecollection": true, "*": true,
 }
@@ -41,24 +46,20 @@ type Reviewer interface {
 	Create(ctx context.Context, reviewPath string, body any, out any) (kube.Info, error)
 }
 
-// Report is what a passing self-check noticed.
-type Report struct {
-	// WriteVerbs is true when a rules review showed a write verb on a
-	// resource the connector reads. It does not fail the check.
-	WriteVerbs bool
-}
-
 // SelfCheck is the boot self-check of runtime design section 5.3, run
 // for each allowed namespace:
 //
 //  1. A SelfSubjectRulesReview. A rule that grants any verb on secrets
 //     or a secrets subresource (directly or through "*") is
-//     over-privilege.
+//     over-privilege, and so is a rule that grants a write verb (create,
+//     update, patch, delete, deletecollection or "*") on a resource the
+//     connector reads, or one of its subresources.
 //  2. A SelfSubjectAccessReview on core secrets for get, list and watch,
 //     or, when the rules review is incomplete, for every verb: get,
 //     list, watch, create, update, patch, delete, deletecollection and
-//     "*". Any allowed answer is over-privilege, and every review must
-//     answer.
+//     "*". When the rules review is incomplete, also one for each write
+//     verb on each resource the connector reads. Any allowed answer is
+//     over-privilege, and every review must answer.
 //  3. A SelfSubjectAccessReview for each required access. A missing one
 //     fails the check without over-privilege, so the connector is not
 //     ready.
@@ -68,22 +69,23 @@ type Report struct {
 // or 2 fails closed with
 // connectors.ErrPrivilegeUnproven. There is no override (ADR 0001
 // section 11). Errors name the verb and resource, never the namespace.
-func SelfCheck(ctx context.Context, rv Reviewer, namespaces []string, required []Access) (Report, error) {
-	var rep Report
+func SelfCheck(ctx context.Context, rv Reviewer, namespaces []string, required []Access) error {
+	observed := observedResources(required)
 	for _, ns := range namespaces {
 		rules, err := rulesReview(ctx, rv, ns)
 		if err != nil {
-			return rep, fmt.Errorf("%w: rules review failed: %w", connectors.ErrPrivilegeUnproven, reviewCause(err))
+			return fmt.Errorf("%w: rules review failed: %w", connectors.ErrPrivilegeUnproven, reviewCause(err))
 		}
-		// A complete or incomplete list that shows a secrets rule is
-		// over-privilege either way.
+		// A complete or incomplete list that shows a secrets rule, or a
+		// write rule on a resource the connector reads, is over-privilege
+		// either way.
 		for _, r := range rules.ResourceRules {
 			if len(r.Verbs) > 0 && coversCore(r.APIGroups) && coversSecrets(r.Resources) {
-				return rep, fmt.Errorf("%w: a role grants %s on secrets", connectors.ErrOverPrivileged, verbList(r.Verbs))
+				return fmt.Errorf("%w: a role grants %s on secrets", connectors.ErrOverPrivileged, verbList(r.Verbs))
 			}
-			for _, a := range required {
+			for _, a := range observed {
 				if coversGroup(r.APIGroups, a.Group) && coversResource(r.Resources, a.Resource) && hasWrite(r.Verbs) {
-					rep.WriteVerbs = true
+					return fmt.Errorf("%w: a role grants %s on %s", connectors.ErrOverPrivileged, verbList(writesOf(r.Verbs)), a.Resource)
 				}
 			}
 		}
@@ -96,10 +98,24 @@ func SelfCheck(ctx context.Context, rv Reviewer, namespaces []string, required [
 		for _, verb := range verbs {
 			allowed, err := accessReview(ctx, rv, ns, Access{Verb: verb, Resource: readonly.SecretsResource})
 			if err != nil {
-				return rep, fmt.Errorf("%w: access review for %s on secrets failed: %w", connectors.ErrPrivilegeUnproven, verbList([]string{verb}), reviewCause(err))
+				return fmt.Errorf("%w: access review for %s on secrets failed: %w", connectors.ErrPrivilegeUnproven, verbList([]string{verb}), reviewCause(err))
 			}
 			if allowed {
-				return rep, fmt.Errorf("%w: the service account may %s secrets", connectors.ErrOverPrivileged, verbList([]string{verb}))
+				return fmt.Errorf("%w: the service account may %s secrets", connectors.ErrOverPrivileged, verbList([]string{verb}))
+			}
+		}
+		if !*rules.Incomplete {
+			continue
+		}
+		for _, a := range observed {
+			for _, verb := range observedWriteVerbs {
+				allowed, err := accessReview(ctx, rv, ns, Access{Verb: verb, Group: a.Group, Resource: a.Resource})
+				if err != nil {
+					return fmt.Errorf("%w: access review for %s on %s failed: %w", connectors.ErrPrivilegeUnproven, verbList([]string{verb}), a.Resource, reviewCause(err))
+				}
+				if allowed {
+					return fmt.Errorf("%w: the service account may %s %s", connectors.ErrOverPrivileged, verbList([]string{verb}), a.Resource)
+				}
 			}
 		}
 	}
@@ -107,14 +123,29 @@ func SelfCheck(ctx context.Context, rv Reviewer, namespaces []string, required [
 		for _, a := range required {
 			allowed, err := accessReview(ctx, rv, ns, a)
 			if err != nil {
-				return rep, checkError(err)
+				return checkError(err)
 			}
 			if !allowed {
-				return rep, fmt.Errorf("kube self-check: required access %s on %s is missing", a.Verb, a.Resource)
+				return fmt.Errorf("kube self-check: required access %s on %s is missing", a.Verb, a.Resource)
 			}
 		}
 	}
-	return rep, nil
+	return nil
+}
+
+// observedResources is each group and resource the required accesses
+// read, once.
+func observedResources(required []Access) []Access {
+	var out []Access
+	seen := map[[2]string]bool{}
+	for _, a := range required {
+		k := [2]string{a.Group, a.Resource}
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, Access{Group: a.Group, Resource: a.Resource})
+		}
+	}
+	return out
 }
 
 // errReviewIncomplete: a 2xx review answer without the status field the
@@ -209,12 +240,18 @@ func coversResource(resources []string, res string) bool {
 }
 
 func hasWrite(verbs []string) bool {
+	return len(writesOf(verbs)) > 0
+}
+
+// writesOf is the write verbs in a rule's verb list.
+func writesOf(verbs []string) []string {
+	var out []string
 	for _, v := range verbs {
 		if writeVerbs[strings.ToLower(v)] {
-			return true
+			out = append(out, v)
 		}
 	}
-	return false
+	return out
 }
 
 // verbList prints only known verb tokens, so a crafted role cannot put

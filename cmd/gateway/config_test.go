@@ -95,6 +95,7 @@ func TestParseConfig_Errors(t *testing.T) {
 		{"concurrency too high", map[string]string{"SB_CP_ENDPOINT": "https://cp.example.com"}, []string{"--claim-concurrency", "100"}, "between 1"},
 		{"zero lease margin", map[string]string{"SB_CP_ENDPOINT": "https://cp.example.com", "SB_GATEWAY_LEASE_MARGIN": "0s"}, nil, "SB_GATEWAY_LEASE_MARGIN"},
 		{"idle max below interval", map[string]string{"SB_CP_ENDPOINT": "https://cp.example.com", "SB_GATEWAY_CLAIM_INTERVAL": "10s", "SB_GATEWAY_CLAIM_IDLE_MAX": "5s"}, nil, "SB_GATEWAY_CLAIM_IDLE_MAX"},
+		{"bad r2 switch", map[string]string{"SB_CP_ENDPOINT": "https://cp.example.com", "SB_GATEWAY_ENABLE_R2_CONNECTORS": "yes please"}, nil, "SB_GATEWAY_ENABLE_R2_CONNECTORS"},
 		{"positional args", map[string]string{"SB_CP_ENDPOINT": "https://cp.example.com"}, []string{"extra"}, "unexpected arguments"},
 	}
 	for _, tc := range cases {
@@ -104,5 +105,25 @@ func TestParseConfig_Errors(t *testing.T) {
 				t.Fatalf("err = %v, want it to mention %q", err, tc.hint)
 			}
 		})
+	}
+}
+
+// TestParseConfig_R2Switch: the Release 2 connector kinds are off by
+// default and turned on only by the env var or the flag.
+func TestParseConfig_R2Switch(t *testing.T) {
+	base := map[string]string{"SB_CP_ENDPOINT": "https://cp.example.com"}
+	cfg, err := parseConfig(nil, envMap(base), io.Discard)
+	if err != nil || cfg.EnableR2Connectors {
+		t.Fatalf("default: enabled=%v err=%v, want off", cfg.EnableR2Connectors, err)
+	}
+	on := map[string]string{"SB_CP_ENDPOINT": "https://cp.example.com", "SB_GATEWAY_ENABLE_R2_CONNECTORS": "true"}
+	if cfg, err = parseConfig(nil, envMap(on), io.Discard); err != nil || !cfg.EnableR2Connectors {
+		t.Fatalf("env: enabled=%v err=%v, want on", cfg.EnableR2Connectors, err)
+	}
+	if cfg, err = parseConfig([]string{"--enable-r2-connectors"}, envMap(base), io.Discard); err != nil || !cfg.EnableR2Connectors {
+		t.Fatalf("flag: enabled=%v err=%v, want on", cfg.EnableR2Connectors, err)
+	}
+	if cfg, err = parseConfig([]string{"--enable-r2-connectors=false"}, envMap(on), io.Discard); err != nil || cfg.EnableR2Connectors {
+		t.Fatalf("flag override: enabled=%v err=%v, want off", cfg.EnableR2Connectors, err)
 	}
 }

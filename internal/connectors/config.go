@@ -12,6 +12,18 @@ import (
 // maxConfigFileSize caps the connectors file.
 const maxConfigFileSize = 1 << 20
 
+// ErrKindNotEnabled: the connectors file names a Release 2 kind (eso
+// or rollout) and the operator has not enabled Release 2 connectors.
+// Release 1 is Argo CD rollout-state observation only.
+var ErrKindNotEnabled = errors.New("connectors: connector kind is not enabled in Release 1")
+
+// ReleaseTwo reports whether k is a kind deferred to Release 2. These
+// kinds read the Kubernetes API, stay in the code, and are bound only
+// when the operator turns on the non-production Release 2 switch.
+func (k Kind) ReleaseTwo() bool {
+	return k == KindESO || k == KindRollout
+}
+
 // Entry is one bound connector in the local connectors file.
 type Entry struct {
 	Name     string          `json:"name"`
@@ -62,7 +74,8 @@ func LoadFile(path string, factories Factories) (*Registry, error) {
 // array of {name, kind, settings} objects.
 //
 // It refuses unknown fields, invalid names, duplicate names, unknown
-// kinds, kinds this build cannot run, and settings that are not a JSON
+// kinds, kinds this build cannot run, Release 2 kinds that factories
+// leave out (ErrKindNotEnabled), and settings that are not a JSON
 // object. Error messages name the entry index, the connector name and
 // the kind; they never contain settings content.
 func Parse(data []byte, factories Factories) (*Registry, error) {
@@ -93,6 +106,9 @@ func Parse(data []byte, factories Factories) (*Registry, error) {
 			return nil, fmt.Errorf("%w: entry %d (%q): kind must be one of eso, rollout, argocd", ErrUnknownKind, i, e.Name)
 		}
 		factory, ok := factories[e.Kind]
+		if (!ok || factory == nil) && e.Kind.ReleaseTwo() {
+			return nil, fmt.Errorf("%w: entry %d (%q): kind %s is a Release 2 connector and is not supported for production", ErrKindNotEnabled, i, e.Name, e.Kind)
+		}
 		if !ok || factory == nil {
 			return nil, fmt.Errorf("%w: entry %d (%q): kind %s", ErrKindNotSupported, i, e.Name, e.Kind)
 		}

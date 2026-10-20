@@ -9,6 +9,11 @@
 //     paths) and denies Kubernetes Secret paths.
 //   - Bound connectors only. Connectors come from the local connectors
 //     file and are referred to by name; nothing in a task can add one.
+//   - Release 1 is Argo CD only. The eso and rollout kinds are refused
+//     at config load unless SB_GATEWAY_ENABLE_R2_CONNECTORS=true (not
+//     supported for production). With only argocd connectors the
+//     Gateway reads no Kubernetes configuration, builds no Kubernetes
+//     client and runs no Kubernetes self-check.
 //   - Over-privileged connectors refuse the boot: a credential that can
 //     read Kubernetes Secrets stops the Gateway, with no override.
 //   - A control plane that refuses the identity (401) stops claiming
@@ -124,14 +129,36 @@ func gatewayVersion() string {
 
 // connectorFactories lists the connector kinds this build can run. A
 // connectors file that names any other kind is refused at boot. A
-// variable so tests can bind fakes.
+// variable so tests can bind fakes. setup drops the Release 2 kinds
+// unless cfg.EnableR2Connectors is set (see releaseFactories).
 var connectorFactories = func(cfg Config, getenv func(string) (string, bool), logger *slog.Logger) connectors.Factories {
-	kopts := kubeconn.Options{InsecureTransport: cfg.InsecureTransport, Getenv: getenv, Logger: logger}
-	return connectors.Factories{
-		connectors.KindESO:     eso.Factory(kopts),
-		connectors.KindRollout: rollout.Factory(kopts),
-		connectors.KindArgoCD:  argocd.NewFactory(argocd.Options{AllowInsecureHTTP: cfg.InsecureTransport}),
+	f := connectors.Factories{
+		connectors.KindArgoCD: argocd.NewFactory(argocd.Options{AllowInsecureHTTP: cfg.InsecureTransport}),
 	}
+	if cfg.EnableR2Connectors {
+		kopts := kubeconn.Options{InsecureTransport: cfg.InsecureTransport, Getenv: getenv, Logger: logger}
+		f[connectors.KindESO] = eso.Factory(kopts)
+		f[connectors.KindRollout] = rollout.Factory(kopts)
+	}
+	return f
+}
+
+// releaseFactories removes the Release 2 kinds from f unless the
+// operator enabled them, so a connectors file that names eso or rollout
+// is refused at load with connectors.ErrKindNotEnabled and no
+// Kubernetes factory runs. It applies to every factory set, including
+// ones tests bind.
+func releaseFactories(cfg Config, f connectors.Factories) connectors.Factories {
+	if cfg.EnableR2Connectors {
+		return f
+	}
+	out := make(connectors.Factories, len(f))
+	for k, v := range f {
+		if !k.ReleaseTwo() {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 // selfCheckTimeout bounds each connector self-check at boot.
@@ -204,8 +231,14 @@ func setup(cfg Config, getenv func(string) (string, bool), logger *slog.Logger, 
 	}
 	logger.Info("identity loaded", "source", string(src), "gateway_id", id.GatewayID)
 
-	registry, err := connectors.LoadFile(cfg.ConnectorsFile, connectorFactories(cfg, getenv, logger))
+	if cfg.EnableR2Connectors {
+		logger.Warn(envEnableR2Connectors + "=true: the Release 2 eso and rollout connectors are enabled; they read the Kubernetes API and are NOT SUPPORTED FOR PRODUCTION. Release 1 supports Argo CD rollout-state observation only")
+	}
+	registry, err := connectors.LoadFile(cfg.ConnectorsFile, releaseFactories(cfg, connectorFactories(cfg, getenv, logger)))
 	if err != nil {
+		if errors.Is(err, connectors.ErrKindNotEnabled) {
+			return nil, fmt.Errorf("%w; Release 1 runs argocd connectors only (%s=true enables eso and rollout outside production)", err, envEnableR2Connectors)
+		}
 		return nil, err
 	}
 	if registry.Len() == 0 {

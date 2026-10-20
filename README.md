@@ -57,7 +57,18 @@ Control Plane (api, worker, Postgres)
 | `internal/guard` | Guard tests for the module graph and source tree (see Development) |
 | `deploy/rbac-example.yaml` | Release 2 only. Example namespaced Role and RoleBinding: `get` on externalsecrets and deployments, `list` on replicasets. There is no ClusterRole. A test fails on any cluster-scoped kind, secrets resource, wildcard or write verb |
 
-Planned next: `enroll` and `healthcheck` subcommands.
+`gateway healthcheck` is the client for Kubernetes `exec` probes, because the local server listens on loopback only and the image has no shell or curl. It sends one GET to `/readyz` on `SB_GATEWAY_LOCAL_ADDR` (or `/healthz` with `--live`) and exits 0 on a 200 and 1 otherwise. `--timeout` bounds the check (default `2s`, at most `30s`). It reads no identity, connectors file or control-plane setting, dials the literal loopback address directly and never uses a proxy:
+
+```yaml
+livenessProbe:
+  exec:
+    command: ["/usr/local/bin/gateway", "healthcheck", "--live"]
+readinessProbe:
+  exec:
+    command: ["/usr/local/bin/gateway", "healthcheck"]
+```
+
+Planned next: an `enroll` subcommand. Until then, enroll with the curl call in [control-plane design section 4.2](docs/design/control-plane.md#42-e1-enroll).
 
 Runtime behaviour:
 

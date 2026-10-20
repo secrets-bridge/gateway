@@ -33,7 +33,7 @@ gateway/
     config.go          env and flags (SB_GW_*), envOr/envInt/envDuration helpers as in the agent
     transport.go       validateEndpoint, buildHTTPClient, buildTLSConfig, refuseRedirect (copied from agent)
     enroll.go          `gateway enroll`: exchange a one-time token, print the identity JSON to stdout
-    healthcheck.go     `gateway healthcheck`: GET http://127.0.0.1:<port>/readyz, exit 0 or 1
+    healthcheck.go     `gateway healthcheck`: GET http://127.0.0.1:<port>/readyz (`--live`: /healthz), exit 0 or 1
   internal/
     client/            CP client: heartbeat, catalog, claim, lease, release, result
       limits.go        decodeJSON with per-endpoint caps (agent internal/client/limits.go pattern)
@@ -328,7 +328,7 @@ A fleet-wide budget hint from the CP (per-connector qps divided by active replic
 
 - `/healthz` (process up) and `/readyz` (identity loaded, first heartbeat accepted, catalog accepted, all connector self-checks passed, CP reachable within `cp.unreachableReadinessAfter`), `/metrics`, on `127.0.0.1:8091`.
 - The claim loop checks the same state before every claim, not only once at start: a heartbeat accepted within `cp.unreachableReadinessAfter`, the current catalog accepted, and every connector verified. While any of them is false it claims nothing and logs the reason once; a pass already in flight finishes and posts its result. Readiness alone would not stop the poller, because the Gateway is not behind a Service.
-- Probes: `exec: ["/gateway", "healthcheck"]`, which works in `distroless/static` with no shell.
+- Probes: `exec: ["/usr/local/bin/gateway", "healthcheck"]` for readiness and `["/usr/local/bin/gateway", "healthcheck", "--live"]` for liveness, which work in `distroless/static` with no shell.
 - Metrics scraping: `metrics.exposeOnPodIP: false` by default. When true, the chart binds `0.0.0.0:8091` and the NetworkPolicy allows ingress on that port only from `metrics.allowFrom`. This is the one documented exception to loopback-only, and it is opt-in.
 - Metric names, with no namespace, object, application or request names as labels:
   - `sb_gateway_claims_total{outcome="task|empty|unauthorized|error"}`
@@ -546,7 +546,7 @@ Kubernetes API egress under NetworkPolicy depends on the CNI: some evaluate the 
 - ArgoCD tokens mounted read-only per connector at `/etc/secrets-bridge/gateway/argocd/<name>/token`.
 - The connectors ConfigMap mounted read-only, with a `checksum/connectors` pod annotation.
 - No downward API env for pod name or UID.
-- Probes are `exec` on `/gateway healthcheck`.
+- Probes are `exec` on `/usr/local/bin/gateway healthcheck` (readiness) and `healthcheck --live` (liveness).
 
 ## 12. ArgoCD account and RBAC
 

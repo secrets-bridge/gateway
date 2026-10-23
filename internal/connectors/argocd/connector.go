@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -22,6 +23,7 @@ const (
 type appClient interface {
 	GetApplication(ctx context.Context, name, appNamespace string) (*Application, error)
 	GetUserInfo(ctx context.Context) (UserInfo, error)
+	CanI(ctx context.Context, action, project string) (bool, error)
 }
 
 // Connector observes ArgoCD Application sync and health as context for
@@ -66,11 +68,47 @@ func (c *Connector) Targets() []connectors.TargetInfo {
 	return append([]connectors.TargetInfo(nil), c.targets...)
 }
 
-// Check implements connectors.Connector: GET /api/v1/session/userinfo
-// confirms the token works (runtime design 3.5). The optional can-i
-// negative probe is not implemented; its endpoint is not in the
-// transport allowlist.
+// Check implements connectors.Connector (runtime design 3.5). It runs at
+// boot and on every recheck:
+//
+//  1. GET /api/v1/session/userinfo confirms the token works.
+//  2. The negative probe: GET
+//     /api/v1/account/can-i/applications/<action>/<project>/* for each
+//     action in CanIActions and each allowed AppProject. Any "yes" wraps
+//     connectors.ErrOverPrivileged: the Gateway refuses to start, and at
+//     runtime turns not ready and stops, the same as the Kubernetes
+//     over-privilege rule.
+//
+// The check fails closed. A probe that fails, or that cannot run because
+// step 1 failed, wraps connectors.ErrPrivilegeUnproven: at boot the
+// Gateway refuses to start, and later the connector stays unverified, so
+// nothing is claimed or read through it until a recheck passes. Errors
+// name the action, never the AppProject.
 func (c *Connector) Check(ctx context.Context) error {
+	if err := c.checkToken(ctx); err != nil {
+		return fmt.Errorf("%w; can-i probe not run: %w", err, connectors.ErrPrivilegeUnproven)
+	}
+	projects := make([]string, 0, len(c.projects))
+	for p := range c.projects {
+		projects = append(projects, p)
+	}
+	sort.Strings(projects)
+	for _, p := range projects {
+		for _, a := range CanIActions {
+			yes, err := c.client.CanI(ctx, a, p)
+			if err != nil {
+				return fmt.Errorf("argocd: can-i probe for %s on applications failed: %w", a, connectors.ErrPrivilegeUnproven)
+			}
+			if yes {
+				return fmt.Errorf("argocd: the token may %s applications in an allowed AppProject: %w", a, connectors.ErrOverPrivileged)
+			}
+		}
+	}
+	return nil
+}
+
+// checkToken is step 1 of Check.
+func (c *Connector) checkToken(ctx context.Context) error {
 	info, err := c.client.GetUserInfo(ctx)
 	switch {
 	case errors.Is(err, ErrUnauthorized), errors.Is(err, ErrForbidden), errors.Is(err, ErrNoToken):
@@ -274,7 +312,7 @@ func errorCodeFor(err error) contract.ErrorCode {
 		return contract.ErrorConnectorTimeout
 	case errors.Is(err, ErrTLS):
 		return contract.ErrorTLSVerificationFailed
-	case errors.Is(err, ErrResponseTooLarge):
+	case errors.Is(err, ErrResponseTooLarge), errors.Is(err, ErrTooManyApplications):
 		return contract.ErrorResponseTooLarge
 	case errors.Is(err, ErrRateLimited):
 		return contract.ErrorRateLimited

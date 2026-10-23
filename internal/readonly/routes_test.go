@@ -1,0 +1,117 @@
+package readonly
+
+import (
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+const argo = "https://argocd.example.com"
+
+var routePolicy = Policy{
+	Origin: argo,
+	GET:    []string{"/api/v1/applications/*"},
+	Query:  []string{"appNamespace"},
+	Routes: []Route{
+		{Path: "/api/v1/session/userinfo"},
+		{Path: "/api/v1/applications", Query: []QueryRule{
+			{Key: "projects", Required: true, Multi: true, Allow: func(v string) bool { return v == "tenant-a" || v == "tenant-b" }},
+			{Key: "fields", Allow: func(v string) bool { return v == "items.metadata.name" }},
+		}},
+		{Path: "/api/v1/account/can-i/applications/sync/tenant-a/*"},
+	},
+}
+
+// literal builds a GET whose "*" segments go on the wire as "*".
+func literal(raw string) *http.Request {
+	r := httptest.NewRequest(http.MethodGet, raw, nil)
+	r.URL.RawPath = r.URL.Path
+	return r
+}
+
+func TestRoutes_QueryRules(t *testing.T) {
+	next := &countingRT{}
+	tr := newT(t, next, routePolicy)
+	for _, q := range []string{
+		"projects=tenant-a",
+		"projects=tenant-a&projects=tenant-b",
+		"projects=tenant-b&fields=items.metadata.name",
+	} {
+		mustAllow(t, tr, next, get(argo+"/api/v1/applications?"+q))
+	}
+	for _, q := range []string{
+		"",  // required key missing
+		"?", // forced empty query
+		"fields=items.metadata.name",
+		"projects=tenant-c", // value not allowed
+		"projects=tenant-a&projects=tenant-c",
+		"projects=",
+		"projects",
+		"projects=tenant-a&fields=items",
+		"projects=tenant-a&fields=items.metadata.name&fields=items.metadata.name", // not Multi
+		"projects=tenant-a&appNamespace=x",                                        // the pattern allowlist does not apply to a route
+		"projects=tenant-a&refresh=hard",
+		"projects=tenant-a;refresh=hard",
+		"projects=%zz",
+	} {
+		raw := argo + "/api/v1/applications"
+		if q != "" {
+			if q != "?" {
+				raw += "?"
+			}
+			raw += q
+		}
+		mustRefuse(t, tr, next, get(raw), ErrQueryNotAllowed)
+	}
+	// A route with no rules carries no query at all.
+	mustAllow(t, tr, next, get(argo+"/api/v1/session/userinfo"))
+	mustRefuse(t, tr, next, get(argo+"/api/v1/session/userinfo?appNamespace=x"), ErrQueryNotAllowed)
+	// Patterns keep the policy-wide key allowlist.
+	mustAllow(t, tr, next, get(argo+"/api/v1/applications/app?appNamespace=x"))
+	mustRefuse(t, tr, next, get(argo+"/api/v1/applications/app?projects=tenant-a"), ErrQueryNotAllowed)
+}
+
+func TestRoutes_LiteralStar(t *testing.T) {
+	next := &countingRT{}
+	tr := newT(t, next, routePolicy)
+	mustAllow(t, tr, next, literal(argo+"/api/v1/account/can-i/applications/sync/tenant-a/*"))
+	// Go's default escaping (%2A) is not the literal path.
+	mustRefuse(t, tr, next, get(argo+"/api/v1/account/can-i/applications/sync/tenant-a/%2A"), ErrNonCanonicalPath)
+	// A route is exact: no other last segment, project or query.
+	mustRefuse(t, tr, next, literal(argo+"/api/v1/account/can-i/applications/sync/tenant-a/app"), ErrPathNotAllowed)
+	mustRefuse(t, tr, next, literal(argo+"/api/v1/account/can-i/applications/sync/tenant-b/*"), ErrPathNotAllowed)
+	mustRefuse(t, tr, next, literal(argo+"/api/v1/account/can-i/applications/sync/tenant-a/*?x=1"), ErrQueryNotAllowed)
+	// A wildcard pattern never matches a literal "*" segment.
+	mustRefuse(t, tr, next, literal(argo+"/api/v1/applications/*"), ErrPathNotAllowed)
+	// RawPath equal to Path admits "*" only, not other characters Go
+	// would escape.
+	mustRefuse(t, tr, next, literal(argo+"/api/v1/applications/a!b"), ErrNonCanonicalPath)
+	mustRefuse(t, tr, next, literal(argo+"/api/v1/applications/a'b"), ErrNonCanonicalPath)
+}
+
+func TestRoutes_InvalidPolicy(t *testing.T) {
+	allow := func(string) bool { return true }
+	for name, routes := range map[string][]Route{
+		"not canonical":   {{Path: "/api/v1/applications/"}},
+		"relative":        {{Path: "api/v1/applications"}},
+		"duplicate route": {{Path: "/a"}, {Path: "/a"}},
+		"empty key":       {{Path: "/a", Query: []QueryRule{{Key: "", Allow: allow}}}},
+		"nil allow":       {{Path: "/a", Query: []QueryRule{{Key: "k"}}}},
+		"duplicate key":   {{Path: "/a", Query: []QueryRule{{Key: "k", Allow: allow}, {Key: "k", Allow: allow}}}},
+	} {
+		if _, err := New(&countingRT{}, Policy{Origin: argo, Routes: routes}); !errors.Is(err, ErrInvalidPolicy) {
+			t.Fatalf("%s: err = %v", name, err)
+		}
+	}
+}
+
+// A route is GET only.
+func TestRoutes_OnlyGET(t *testing.T) {
+	next := &countingRT{}
+	tr := newT(t, next, routePolicy)
+	for _, m := range []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch} {
+		r := httptest.NewRequest(m, argo+"/api/v1/applications?projects=tenant-a", nil)
+		mustRefuse(t, tr, next, r, ErrMethodNotAllowed)
+	}
+}

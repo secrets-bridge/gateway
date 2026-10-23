@@ -181,13 +181,31 @@ func TestFactsFrom_DropsInvalidRevision(t *testing.T) {
 }
 
 type fakeClient struct {
-	app     *Application
-	err     error
-	info    UserInfo
-	infoErr error
-	calls   atomic.Int32
-	name    string
-	ns      string
+	app *Application
+	err error
+	// loggedOut makes userinfo answer loggedIn false.
+	loggedOut bool
+	infoErr   error
+	calls     atomic.Int32
+	name      string
+	ns        string
+
+	// can-i: yes holds the actions answered "yes"; canIErr fails every
+	// probe. canICalls records "action project" for each probe.
+	mu        sync.Mutex
+	yes       map[string]bool
+	canIErr   error
+	canICalls []string
+}
+
+func (f *fakeClient) CanI(_ context.Context, action, project string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.canICalls = append(f.canICalls, action+" "+project)
+	if f.canIErr != nil {
+		return false, f.canIErr
+	}
+	return f.yes[action], nil
 }
 
 func (f *fakeClient) GetApplication(_ context.Context, name, ns string) (*Application, error) {
@@ -196,7 +214,9 @@ func (f *fakeClient) GetApplication(_ context.Context, name, ns string) (*Applic
 	return f.app, f.err
 }
 
-func (f *fakeClient) GetUserInfo(context.Context) (UserInfo, error) { return f.info, f.infoErr }
+func (f *fakeClient) GetUserInfo(context.Context) (UserInfo, error) {
+	return UserInfo{LoggedIn: !f.loggedOut}, f.infoErr
+}
 
 func newFakeConnector(g appClient) *Connector {
 	return &Connector{
@@ -475,24 +495,25 @@ func TestObserve_UIDIsIdentity(t *testing.T) {
 
 func TestCheck(t *testing.T) {
 	cases := []struct {
-		name string
-		info UserInfo
-		err  error
-		want error
+		name      string
+		loggedOut bool
+		err       error
+		want      error
 	}{
-		{"logged in", UserInfo{LoggedIn: true}, nil, nil},
-		{"not logged in", UserInfo{}, nil, connectors.ErrCheckUnauthorized},
-		{"unauthorized", UserInfo{}, ErrUnauthorized, connectors.ErrCheckUnauthorized},
-		{"forbidden", UserInfo{}, ErrForbidden, connectors.ErrCheckUnauthorized},
-		{"no token", UserInfo{}, ErrNoToken, connectors.ErrCheckUnauthorized},
-		{"unreachable", UserInfo{}, ErrUnreachable, connectors.ErrCheckUnreachable},
-		{"timeout", UserInfo{}, ErrTimeout, connectors.ErrCheckUnreachable},
-		{"tls", UserInfo{}, ErrTLS, connectors.ErrCheckUnreachable},
-		{"bad response", UserInfo{}, ErrBadResponse, nil},
+		{"logged in", false, nil, nil},
+		{"not logged in", true, nil, connectors.ErrCheckUnauthorized},
+		{"unauthorized", false, ErrUnauthorized, connectors.ErrCheckUnauthorized},
+		{"forbidden", false, ErrForbidden, connectors.ErrCheckUnauthorized},
+		{"no token", false, ErrNoToken, connectors.ErrCheckUnauthorized},
+		{"unreachable", false, ErrUnreachable, connectors.ErrCheckUnreachable},
+		{"timeout", false, ErrTimeout, connectors.ErrCheckUnreachable},
+		{"tls", false, ErrTLS, connectors.ErrCheckUnreachable},
+		{"bad response", false, ErrBadResponse, nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := newFakeConnector(&fakeClient{info: tc.info, infoErr: tc.err}).Check(context.Background())
+			g := &fakeClient{loggedOut: tc.loggedOut, infoErr: tc.err}
+			err := newFakeConnector(g).Check(context.Background())
 			switch {
 			case tc.want == nil && tc.err == nil && err != nil:
 				t.Fatalf("err = %v", err)
@@ -503,8 +524,108 @@ func TestCheck(t *testing.T) {
 			case errors.Is(err, connectors.ErrOverPrivileged):
 				t.Fatal("ArgoCD self-check reported over-privilege")
 			}
+			// A token that does not work leaves the probe unrun, which
+			// fails closed.
+			if err != nil && (!errors.Is(err, connectors.ErrPrivilegeUnproven) || len(g.canICalls) != 0) {
+				t.Fatalf("err = %v, probes = %v: a failed token check must be unproven and send no probe", err, g.canICalls)
+			}
 		})
 	}
+}
+
+// The negative can-i probe (gateway hardening, ADR 0002 design): every
+// write action on every allowed AppProject is asked about; any yes is
+// over-privilege, and a failed probe fails closed.
+func TestCheck_CanIProbe(t *testing.T) {
+	ctx := context.Background()
+	t.Run("all no passes and asks every action on every project", func(t *testing.T) {
+		g := &fakeClient{}
+		c := newFakeConnector(g)
+		c.projects = map[string]struct{}{"tenant-b": {}, "tenant-a": {}}
+		if err := c.Check(ctx); err != nil {
+			t.Fatal(err)
+		}
+		var want []string
+		for _, p := range []string{"tenant-a", "tenant-b"} {
+			for _, a := range []string{"sync", "update", "delete", "create", "override", "action"} {
+				want = append(want, a+" "+p)
+			}
+		}
+		if !slices.Equal(g.canICalls, want) {
+			t.Fatalf("probes = %v, want %v", g.canICalls, want)
+		}
+	})
+	for _, action := range CanIActions {
+		t.Run("yes for "+action+" is over-privileged", func(t *testing.T) {
+			g := &fakeClient{yes: map[string]bool{action: true}}
+			err := newFakeConnector(g).Check(ctx)
+			if !errors.Is(err, connectors.ErrOverPrivileged) || errors.Is(err, connectors.ErrPrivilegeUnproven) {
+				t.Fatalf("err = %v, want ErrOverPrivileged", err)
+			}
+			if !strings.Contains(err.Error(), action) || strings.Contains(err.Error(), "tenant-a") {
+				t.Fatalf("err = %q: must name the action and not the AppProject", err)
+			}
+		})
+	}
+	for name, perr := range map[string]error{
+		"unauthorized":  ErrUnauthorized,
+		"unreachable":   ErrUnreachable,
+		"bad response":  ErrBadResponse,
+		"refused":       ErrRequestRefused,
+		"not in policy": ErrProjectNotAllowed,
+	} {
+		t.Run("probe "+name+" fails closed", func(t *testing.T) {
+			g := &fakeClient{canIErr: perr}
+			err := newFakeConnector(g).Check(ctx)
+			if !errors.Is(err, connectors.ErrPrivilegeUnproven) || errors.Is(err, connectors.ErrOverPrivileged) {
+				t.Fatalf("err = %v, want ErrPrivilegeUnproven", err)
+			}
+		})
+	}
+
+	// Through the registry: at boot a yes refuses the start and a failed
+	// probe refuses it too; at runtime RecheckAll finds a grant added
+	// after start, and a failed probe leaves the connector unverified so
+	// nothing is observed through it.
+	t.Run("registry boot and recheck", func(t *testing.T) {
+		g := &fakeClient{app: healthyApp()}
+		r, _ := connectors.NewRegistry(newFakeConnector(g))
+		if err := r.Check(ctx, time.Second); err != nil || !r.Verified() {
+			t.Fatalf("boot: err = %v verified = %v", err, r.Verified())
+		}
+		g.mu.Lock()
+		g.canIErr = ErrUnreachable
+		g.mu.Unlock()
+		if err := r.RecheckAll(ctx, time.Second); err != nil {
+			t.Fatalf("recheck with a failed probe: %v", err)
+		}
+		if r.Verified() || r.Health()[0].Status == connectors.HealthOK {
+			t.Fatalf("failed probe left the connector verified or ok: %+v", r.Health())
+		}
+		if _, err := r.Observe(ctx, "argocd-main", connectors.Target{ID: "payments", Stage: connectors.StageArgoCDContext}); !errors.Is(err, connectors.ErrConnectorUnverified) {
+			t.Fatalf("observe through an unproven connector: %v", err)
+		}
+		g.mu.Lock()
+		g.canIErr, g.yes = nil, map[string]bool{"sync": true}
+		g.mu.Unlock()
+		if err := r.RecheckAll(ctx, time.Second); !errors.Is(err, connectors.ErrOverPrivileged) {
+			t.Fatalf("recheck with a sync grant: %v", err)
+		}
+		if r.Health()[0].Status != connectors.HealthOverPrivileged || r.Verified() {
+			t.Fatalf("health = %+v", r.Health())
+		}
+
+		g2 := &fakeClient{canIErr: ErrTimeout}
+		r2, _ := connectors.NewRegistry(newFakeConnector(g2))
+		if err := r2.Check(ctx, time.Second); !errors.Is(err, connectors.ErrPrivilegeUnproven) {
+			t.Fatalf("boot with a failed probe: %v", err)
+		}
+		g3 := &fakeClient{yes: map[string]bool{"delete": true}}
+		r3, _ := connectors.NewRegistry(newFakeConnector(g3))
+		if err := r3.Check(ctx, time.Second); !errors.Is(err, connectors.ErrOverPrivileged) {
+			t.Fatalf("boot with a delete grant: %v", err)
+		}
+	})
 }
 
 func TestTargets(t *testing.T) {
@@ -543,6 +664,10 @@ func newArgoServer(t *testing.T, app map[string]any) *argoServer {
 			appJSON(w, map[string]any{"loggedIn": true, "username": "gateway", "iss": "argocd"})
 		case "/api/v1/applications/payments-api":
 			appJSON(w, app)
+		case "/api/v1/account/can-i/applications/sync/tenant-a/*", "/api/v1/account/can-i/applications/update/tenant-a/*",
+			"/api/v1/account/can-i/applications/delete/tenant-a/*", "/api/v1/account/can-i/applications/create/tenant-a/*",
+			"/api/v1/account/can-i/applications/override/tenant-a/*", "/api/v1/account/can-i/applications/action/tenant-a/*":
+			appJSON(w, map[string]any{"value": "no"})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -650,11 +775,14 @@ func TestFactory_EndToEnd(t *testing.T) {
 	if err != nil || obs.Outcome != connectors.OutcomeError || obs.Evidence.ErrorCode != contract.ErrorConnectorUnauthorized {
 		t.Fatalf("revoked token: obs = %+v err = %v", obs, err)
 	}
-	if err := reg.Check(context.Background(), 5*time.Second); err != nil {
-		t.Fatalf("check returned %v for an unauthorized token", err)
+	// The can-i probe cannot run with a refused token, so the check
+	// fails closed (a boot would refuse to start), the status stays
+	// unauthorized and the connector is unverified.
+	if err := reg.Check(context.Background(), 5*time.Second); !errors.Is(err, connectors.ErrPrivilegeUnproven) {
+		t.Fatalf("check returned %v for an unauthorized token, want ErrPrivilegeUnproven", err)
 	}
-	if h := reg.Health(); h[0].Status != connectors.HealthUnauthorized {
-		t.Fatalf("health after revocation = %+v", h)
+	if h := reg.Health(); h[0].Status != connectors.HealthUnauthorized || reg.Verified() {
+		t.Fatalf("health after revocation = %+v, verified = %v", h, reg.Verified())
 	}
 
 	// A missing token file is a retryable error and sends nothing.
@@ -662,7 +790,10 @@ func TestFactory_EndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := srv.hits.Load()
-	obs, _ = reg.Observe(context.Background(), "argocd-main", target)
+	// The registry refuses the unverified connector; the connector
+	// itself must still send nothing without a token.
+	c, _ := reg.Lookup("argocd-main")
+	obs, _ = c.Observe(context.Background(), target)
 	if obs.Outcome != connectors.OutcomeError || obs.Evidence.ErrorCode != contract.ErrorConnectorUnauthorized || srv.hits.Load() != before {
 		t.Fatalf("missing token file: obs = %+v", obs)
 	}

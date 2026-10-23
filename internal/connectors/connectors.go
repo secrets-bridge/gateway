@@ -483,8 +483,9 @@ func (r *Registry) check(ctx context.Context, timeout time.Duration, mode checkM
 		st := healthFor(cerr)
 		cancel()
 		if st != HealthOverPrivileged && errors.Is(cerr, ErrPrivilegeUnproven) {
-			// Fail closed: not ready, and at boot not started.
-			st = HealthDegraded
+			// Fail closed: not ready, and at boot not started. The
+			// status is degraded, or the more specific not-ready status
+			// (unauthorized, unreachable) the error also names.
 			if unproven == nil {
 				unproven = fmt.Errorf("%w: connector %q", ErrPrivilegeUnproven, n)
 			}

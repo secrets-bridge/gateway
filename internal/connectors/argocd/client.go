@@ -11,9 +11,12 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/secrets-bridge/gateway/internal/connectors"
+	"github.com/secrets-bridge/gateway/internal/contract"
 	"github.com/secrets-bridge/gateway/internal/readonly"
 )
 
@@ -27,7 +30,38 @@ const (
 	// status.resources lists can exceed small caps; the body is decoded
 	// into a struct holding only the fields the connector uses.
 	MaxResponseBytes = 2 << 20
+	// MaxListResponseBytes caps one application list response. The list
+	// is read with the fields projection, but a server that ignores it
+	// returns whole Applications, so the cap is what bounds the read.
+	MaxListResponseBytes = 8 << 20
+	// MaxListApplications caps the number of items in one list response.
+	// More is refused with ErrTooManyApplications, never truncated.
+	MaxListApplications = 1000
 )
+
+// ListFields is the only value the transport admits for the fields query
+// key of the application list: the projection of the decoded fields.
+// The decode does not rely on the server honouring it.
+const ListFields = "items.metadata.name,items.metadata.namespace,items.metadata.uid," +
+	"items.metadata.creationTimestamp,items.spec.project"
+
+// Query keys the transport admits.
+const (
+	// AppNamespaceQueryKey: single-application GET only.
+	AppNamespaceQueryKey = "appNamespace"
+	// ProjectsQueryKey: list only, required, each value an allowed
+	// AppProject.
+	ProjectsQueryKey = "projects"
+	// FieldsQueryKey: list only, optional, exactly ListFields.
+	FieldsQueryKey = "fields"
+)
+
+// CanIActions are the write actions the negative can-i probe asks about
+// on applications in each allowed AppProject. Argo CD's can-i takes the
+// action as one path segment and accepts only its fixed action names,
+// so "action" stands for the action/* family: an action/<group>/<kind>
+// grant narrower than a wildcard is not visible to can-i.
+var CanIActions = []string{"sync", "update", "delete", "create", "override", "action"}
 
 // Errors returned by the client. None of them carries the base URL, the
 // request path or the token, so they are safe to classify and log.
@@ -44,6 +78,13 @@ var (
 	ErrBadResponse      = errors.New("argocd: unexpected response")
 	ErrNoToken          = errors.New("argocd: token unavailable")
 	ErrInvalidName      = errors.New("argocd: invalid application name")
+	// ErrProjectNotAllowed: a list or can-i request named an AppProject
+	// outside the local allowlist, or a can-i action outside
+	// CanIActions. Nothing is sent.
+	ErrProjectNotAllowed = errors.New("argocd: AppProject or action is not in the local allowlist")
+	// ErrTooManyApplications: a list response held more than
+	// MaxListApplications items.
+	ErrTooManyApplications = errors.New("argocd: application list exceeds the item cap")
 	// ErrRequestRefused: the read-only transport refused the request
 	// (method or path) before it left the process.
 	ErrRequestRefused = errors.New("argocd: request refused by the read-only transport")
@@ -66,37 +107,50 @@ type Config struct {
 	// AllowInsecureHTTP permits an http:// BaseURL (SB_INSECURE_TRANSPORT,
 	// dev only). The zero value refuses it.
 	AllowInsecureHTTP bool
+	// AllowedProjects is the local AppProject allowlist. The list read
+	// and the can-i probe are admitted only for these projects; with
+	// none, neither is admitted.
+	AllowedProjects []string
 }
 
 // Client is the read-only ArgoCD HTTP client.
 //
 // The http.Client is built on internal/readonly with a policy that
-// admits exactly two requests: GET <base>/api/v1/applications/<name>,
-// whose only allowed query key is appNamespace, and GET
-// <base>/api/v1/session/userinfo for the self-check. Every other method,
-// path and query key is refused before the request leaves the process.
-// List, resource-tree, managed-resources and manifests are refused
-// because the last two can return rendered resource bodies and the list
-// reads every application the token sees. A query key such as refresh
-// is refused because GET /api/v1/applications/<name>?refresh=hard makes
-// ArgoCD patch the Application.
+// admits exactly these GET requests:
+//
+//   - <base>/api/v1/applications/<name>, whose only allowed query key is
+//     appNamespace;
+//   - <base>/api/v1/session/userinfo for the self-check, with no query;
+//   - <base>/api/v1/applications with projects required (one or more
+//     values, each in the local AppProject allowlist) and fields
+//     optional (exactly ListFields), and no other key;
+//   - <base>/api/v1/account/can-i/applications/<action>/<project>/* for
+//     each action in CanIActions and each allowed AppProject, with no
+//     query, for the negative probe.
+//
+// Every other method, path and query key is refused before the request
+// leaves the process. resource-tree, managed-resources and manifests are
+// refused because the last two can return rendered resource bodies. A
+// query key such as refresh is refused everywhere because GET
+// /api/v1/applications/<name>?refresh=hard makes ArgoCD patch the
+// Application. The list without projects would read every application
+// the token sees, so it is refused.
 //
 // The transport is readonly.BaseTransport, so proxy environment
 // variables are ignored and the bearer token never goes to a proxy.
 type Client struct {
-	base   *url.URL
-	token  TokenSource
-	hc     *http.Client
-	tlsCfg *tls.Config
+	base     *url.URL
+	token    TokenSource
+	hc       *http.Client
+	tlsCfg   *tls.Config
+	projects map[string]struct{}
 }
 
-// AppNamespaceQueryKey is the only query key the transport admits.
-const AppNamespaceQueryKey = "appNamespace"
-
-// Paths under the base URL. Only these two are in the transport policy.
+// Paths under the base URL. Only these are in the transport policy.
 const (
 	applicationsPath = "/api/v1/applications"
 	userInfoPath     = "/api/v1/session/userinfo"
+	canIAppsPath     = "/api/v1/account/can-i/applications"
 )
 
 // New builds a Client. It fails only on a malformed BaseURL, a scheme
@@ -117,6 +171,13 @@ func New(cfg Config) (*Client, error) {
 	if timeout < 0 || timeout > MaxTimeout {
 		return nil, fmt.Errorf("argocd: timeout must be between 0 and %s", MaxTimeout)
 	}
+	projects := make(map[string]struct{}, len(cfg.AllowedProjects))
+	for _, p := range cfg.AllowedProjects {
+		if !projectPattern.MatchString(p) {
+			return nil, errors.New("argocd: allowed AppProjects must be AppProject names")
+		}
+		projects[p] = struct{}{}
+	}
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: cfg.RootCAs, ServerName: cfg.TLSServerName}
 	next := readonly.BaseTransport(tlsCfg)
 	next.TLSHandshakeTimeout = timeout
@@ -125,21 +186,48 @@ func New(cfg Config) (*Client, error) {
 	// Redirects are refused by readonly.NewClient: following one would
 	// re-send the bearer token to wherever Location points, including an
 	// http:// downgrade or another host. do() reports ErrRedirectRefused.
-	hc, err := readonly.NewClient(next, policyFor(base), timeout)
+	hc, err := readonly.NewClient(next, policyFor(base, projects), timeout)
 	if err != nil {
 		return nil, errors.New("argocd: base URL path cannot form a request allowlist")
 	}
-	return &Client{base: base, token: cfg.Token, hc: hc, tlsCfg: next.TLSClientConfig}, nil
+	return &Client{base: base, token: cfg.Token, hc: hc, tlsCfg: next.TLSClientConfig, projects: projects}, nil
 }
 
 // policyFor is the read-only transport policy for a base URL: pinned to
-// its scheme and host, with GET allowed to the two paths under its path.
-func policyFor(base *url.URL) readonly.Policy {
+// its scheme and host, with GET allowed to the single-application path
+// (query key appNamespace) and, as exact routes, userinfo, the
+// application list (projects and fields judged by value) and one can-i
+// path per action and allowed project. Without projects there is no list
+// and no can-i route.
+func policyFor(base *url.URL, projects map[string]struct{}) readonly.Policy {
+	routes := []readonly.Route{{Path: base.Path + userInfoPath}}
+	if len(projects) > 0 {
+		allowed := func(v string) bool { _, ok := projects[v]; return ok }
+		routes = append(routes, readonly.Route{
+			Path: base.Path + applicationsPath,
+			Query: []readonly.QueryRule{
+				{Key: ProjectsQueryKey, Required: true, Multi: true, Allow: allowed},
+				{Key: FieldsQueryKey, Allow: func(v string) bool { return v == ListFields }},
+			},
+		})
+		for p := range projects {
+			for _, a := range CanIActions {
+				routes = append(routes, readonly.Route{Path: canIPath(base, a, p)})
+			}
+		}
+	}
 	return readonly.Policy{
 		Origin: (&url.URL{Scheme: base.Scheme, Host: base.Host}).String(),
-		GET:    []string{base.Path + applicationsPath + "/*", base.Path + userInfoPath},
+		GET:    []string{base.Path + applicationsPath + "/*"},
 		Query:  []string{AppNamespaceQueryKey},
+		Routes: routes,
 	}
+}
+
+// canIPath is the can-i path for action on every application of
+// project. The last segment is a literal "*".
+func canIPath(base *url.URL, action, project string) string {
+	return base.Path + canIAppsPath + "/" + action + "/" + project + "/*"
 }
 
 func parseBaseURL(raw string, allowHTTP bool) (*url.URL, error) {
@@ -309,6 +397,169 @@ func validAppName(s string) bool {
 	return true
 }
 
+// AppSummary is one item of the application list: the identity and
+// AppProject of an Application, nothing else. It feeds a future catalog
+// only; it is never evidence.
+type AppSummary struct {
+	Name      string
+	Namespace string
+	UID       string
+	Project   string
+	CreatedAt time.Time
+}
+
+// rawSummary mirrors only the list item fields AppSummary keeps. Every
+// other field the server sends, projected or not, is skipped.
+type rawSummary struct {
+	Metadata struct {
+		Name              string `json:"name"`
+		Namespace         string `json:"namespace"`
+		UID               string `json:"uid"`
+		CreationTimestamp string `json:"creationTimestamp"`
+	} `json:"metadata"`
+	Spec struct {
+		Project string `json:"project"`
+	} `json:"spec"`
+}
+
+// ListApplications lists the Applications of one allowed AppProject:
+// GET <base>/api/v1/applications?projects=<project>&fields=ListFields.
+// It is not called by Release 1; it exists for discovery (ADR 0002) and
+// its tests.
+//
+// The project must be in the local allowlist, or nothing is sent. The
+// response is read up to MaxListResponseBytes and decoded item by item
+// into rawSummary; more than MaxListApplications items is
+// ErrTooManyApplications. An item is kept only when its spec.project is
+// the requested project and its name, namespace and uid are valid, so
+// the result does not rely on the server's filter or projection.
+func (c *Client) ListApplications(ctx context.Context, project string) ([]AppSummary, error) {
+	if _, ok := c.projects[project]; !ok {
+		return nil, ErrProjectNotAllowed
+	}
+	u := *c.base
+	u.Path = c.base.Path + applicationsPath
+	u.RawQuery = url.Values{ProjectsQueryKey: {project}, FieldsQueryKey: {ListFields}}.Encode()
+	var out []AppSummary
+	err := c.doStream(ctx, &u, MaxListResponseBytes, func(dec *json.Decoder) error {
+		return decodeList(dec, func(raw rawSummary) {
+			if s, ok := summaryFrom(raw, project); ok {
+				out = append(out, s)
+			}
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// decodeList walks {"items":[...], ...} and hands each item to add,
+// refusing more than MaxListApplications items. Other top-level keys are
+// skipped.
+func decodeList(dec *json.Decoder, add func(rawSummary)) error {
+	if err := expectDelim(dec, '{'); err != nil {
+		return err
+	}
+	n := 0
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		if key, _ := tok.(string); key != "items" {
+			var skip json.RawMessage
+			if err := dec.Decode(&skip); err != nil {
+				return err
+			}
+			continue
+		}
+		tok, err = dec.Token()
+		if err != nil {
+			return err
+		}
+		if tok == nil { // "items": null
+			continue
+		}
+		if d, ok := tok.(json.Delim); !ok || d != '[' {
+			return ErrBadResponse
+		}
+		for dec.More() {
+			if n++; n > MaxListApplications {
+				return ErrTooManyApplications
+			}
+			var raw rawSummary
+			if err := dec.Decode(&raw); err != nil {
+				return err
+			}
+			add(raw)
+		}
+		if err := expectDelim(dec, ']'); err != nil {
+			return err
+		}
+	}
+	if err := expectDelim(dec, '}'); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return ErrBadResponse
+	}
+	return nil
+}
+
+func expectDelim(dec *json.Decoder, want json.Delim) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if d, ok := tok.(json.Delim); !ok || d != want {
+		return ErrBadResponse
+	}
+	return nil
+}
+
+func validNamespace(s string) bool { return connectors.ValidName(s) }
+
+func validUID(s string) bool { return contract.ValidUUID(s) }
+
+func summaryFrom(raw rawSummary, project string) (AppSummary, bool) {
+	m := raw.Metadata
+	if raw.Spec.Project != project || !validAppName(m.Name) || !validNamespace(m.Namespace) || !validUID(m.UID) {
+		return AppSummary{}, false
+	}
+	return AppSummary{Name: m.Name, Namespace: m.Namespace, UID: m.UID, Project: project, CreatedAt: parseTime(m.CreationTimestamp)}, true
+}
+
+// CanI asks Argo CD whether the token may perform action on every
+// application of project: GET
+// <base>/api/v1/account/can-i/applications/<action>/<project>/*. The
+// answer is true for "yes" and false for "no"; anything else is
+// ErrBadResponse. action must be in CanIActions and project in the
+// local allowlist, or nothing is sent.
+func (c *Client) CanI(ctx context.Context, action, project string) (bool, error) {
+	if _, ok := c.projects[project]; !ok || !slices.Contains(CanIActions, action) {
+		return false, ErrProjectNotAllowed
+	}
+	u := *c.base
+	u.Path = canIPath(c.base, action, project)
+	// Sent literally: Go would escape the "*" segment as %2A, which the
+	// transport refuses as non-canonical.
+	u.RawPath = u.Path
+	var raw struct {
+		Value string `json:"value"`
+	}
+	if err := c.do(ctx, &u, &raw); err != nil {
+		return false, err
+	}
+	switch raw.Value {
+	case "yes":
+		return true, nil
+	case "no":
+		return false, nil
+	}
+	return false, ErrBadResponse
+}
+
 // UserInfo is the part of GET /api/v1/session/userinfo the self-check
 // uses. The user name, issuer and groups are not decoded.
 type UserInfo struct {
@@ -336,6 +587,22 @@ func (c *Client) GetUserInfo(ctx context.Context) (UserInfo, error) {
 // round trip is refused rather than sent, and the transport's origin pin
 // refuses any host other than the base URL's.
 func (c *Client) do(ctx context.Context, target *url.URL, out any) error {
+	return c.doStream(ctx, target, MaxResponseBytes, func(dec *json.Decoder) error {
+		if err := dec.Decode(out); err != nil {
+			return err
+		}
+		if _, err := dec.Token(); err != io.EOF {
+			return ErrBadResponse
+		}
+		return nil
+	})
+}
+
+// doStream issues one GET, maps the status code and hands decode a JSON
+// decoder over the body, capped at maxBytes. A body over the cap is
+// ErrResponseTooLarge; any decode failure is ErrBadResponse, without the
+// decoder's text, which can quote the body.
+func (c *Client) doStream(ctx context.Context, target *url.URL, maxBytes int64, decode func(*json.Decoder) error) error {
 	token, err := c.token()
 	if err != nil || token == "" {
 		return ErrNoToken
@@ -352,7 +619,7 @@ func (c *Client) do(ctx context.Context, target *url.URL, out any) error {
 		return classifyTransportError(ctx, err)
 	}
 	defer func() {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, MaxResponseBytes))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBytes))
 		_ = resp.Body.Close()
 	}()
 	switch resp.StatusCode {
@@ -371,21 +638,53 @@ func (c *Client) do(ctx context.Context, target *url.URL, out any) error {
 	default:
 		return fmt.Errorf("%w: HTTP %d", ErrBadResponse, resp.StatusCode)
 	}
-	if resp.ContentLength > MaxResponseBytes {
+	if resp.ContentLength > maxBytes {
 		return ErrResponseTooLarge
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxResponseBytes+1))
-	if err != nil {
-		return classifyTransportError(ctx, err)
-	}
-	if len(body) > MaxResponseBytes {
+	body := &capReader{r: resp.Body, left: maxBytes}
+	err = decode(json.NewDecoder(body))
+	switch {
+	case body.over:
 		return ErrResponseTooLarge
-	}
-	if err := json.Unmarshal(body, out); err != nil {
+	case body.err != nil:
+		return classifyTransportError(ctx, body.err)
+	case errors.Is(err, ErrTooManyApplications):
+		return ErrTooManyApplications
+	case err != nil:
 		// The decoder error can quote the body; drop it.
 		return ErrBadResponse
 	}
 	return nil
+}
+
+// capReader reads at most left bytes and records whether the body went
+// over the cap or failed in transport.
+type capReader struct {
+	r    io.Reader
+	left int64
+	over bool
+	err  error
+}
+
+func (c *capReader) Read(p []byte) (int, error) {
+	if c.left <= 0 {
+		// One more byte decides whether the body is over the cap.
+		var b [1]byte
+		if n, _ := c.r.Read(b[:]); n > 0 {
+			c.over = true
+			return 0, ErrResponseTooLarge
+		}
+		return 0, io.EOF
+	}
+	if int64(len(p)) > c.left {
+		p = p[:c.left]
+	}
+	n, err := c.r.Read(p)
+	c.left -= int64(n)
+	if err != nil && err != io.EOF {
+		c.err = err
+	}
+	return n, err
 }
 
 // classifyTransportError maps a transport failure to a sentinel. The

@@ -258,10 +258,10 @@ func setup(cfg Config, getenv func(string) (string, bool), logger *slog.Logger, 
 	// the replica not ready and is retried before each heartbeat.
 	if err := registry.Check(context.Background(), selfCheckTimeout); err != nil {
 		if errors.Is(err, connectors.ErrOverPrivileged) {
-			return nil, fmt.Errorf("refusing to start: %w; remove every verb on secrets (and any write) from the gateway's RBAC", err)
+			return nil, fmt.Errorf("refusing to start: %w; remove every verb on secrets (and any write) from the gateway's RBAC, and every write action from its Argo CD role", err)
 		}
 		if errors.Is(err, connectors.ErrPrivilegeUnproven) {
-			return nil, fmt.Errorf("refusing to start: %w; the self-check fails closed when a review call fails", err)
+			return nil, fmt.Errorf("refusing to start: %w; the self-check fails closed when a review or can-i call fails", err)
 		}
 		return nil, err
 	}

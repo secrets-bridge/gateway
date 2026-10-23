@@ -48,10 +48,10 @@ const ListFields = "items.metadata.name,items.metadata.namespace,items.metadata.
 const (
 	// AppNamespaceQueryKey: single-application GET only.
 	AppNamespaceQueryKey = "appNamespace"
-	// ProjectsQueryKey: list only, required, each value an allowed
-	// AppProject.
+	// ProjectsQueryKey: list only, required, exactly one value, an
+	// allowed AppProject.
 	ProjectsQueryKey = "projects"
-	// FieldsQueryKey: list only, optional, exactly ListFields.
+	// FieldsQueryKey: list only, required, exactly one value, ListFields.
 	FieldsQueryKey = "fields"
 )
 
@@ -202,9 +202,9 @@ type Config struct {
 //   - <base>/api/v1/applications/<name>, whose only allowed query key is
 //     appNamespace;
 //   - <base>/api/v1/session/userinfo for the self-check, with no query;
-//   - <base>/api/v1/applications with projects required (one or more
-//     values, each in the local AppProject allowlist) and fields
-//     optional (exactly ListFields), and no other key;
+//   - <base>/api/v1/applications with projects required (exactly one
+//     value, in the local AppProject allowlist) and fields required
+//     (exactly one value, ListFields), and no other key;
 //   - <base>/api/v1/account/can-i/<resource>/<action>/<object> for each
 //     of the ProjectProbes of each allowed AppProject and the
 //     TargetProbes of each configured target in each allowed AppProject,
@@ -313,8 +313,8 @@ func allowedProbes(projects map[string]struct{}, apps []AppBinding) []Probe {
 // policyFor is the read-only transport policy for a base URL: pinned to
 // its scheme and host, with GET allowed to the single-application path
 // (query key appNamespace) and, as exact routes, userinfo, the
-// application list (projects and fields judged by value) and one can-i
-// path per admitted question. Without
+// application list (projects and fields both required, one value each,
+// judged by value) and one can-i path per admitted question. Without
 // projects there is no list and no can-i route.
 func policyFor(base *url.URL, projects map[string]struct{}, probes []Probe) readonly.Policy {
 	routes := []readonly.Route{{Path: base.Path + userInfoPath}}
@@ -323,8 +323,8 @@ func policyFor(base *url.URL, projects map[string]struct{}, probes []Probe) read
 		routes = append(routes, readonly.Route{
 			Path: base.Path + applicationsPath,
 			Query: []readonly.QueryRule{
-				{Key: ProjectsQueryKey, Required: true, Multi: true, Allow: allowed},
-				{Key: FieldsQueryKey, Allow: func(v string) bool { return v == ListFields }},
+				{Key: ProjectsQueryKey, Required: true, Allow: allowed},
+				{Key: FieldsQueryKey, Required: true, Allow: func(v string) bool { return v == ListFields }},
 			},
 		})
 		for _, p := range probes {

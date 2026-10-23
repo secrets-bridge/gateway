@@ -82,8 +82,6 @@ func TestTransport_ListAndCanIShapes(t *testing.T) {
 	canI := canIRoot + "applications/"
 
 	allowed := map[string]*url.URL{
-		"list one project":                at("/api/v1/applications", "projects=tenant-a"),
-		"list two projects":               at("/api/v1/applications", "projects=tenant-a&projects=tenant-b"),
 		"list with the fixed projection":  at("/api/v1/applications", "projects=tenant-a&fields="+fields),
 		"list projection before projects": at("/api/v1/applications", "fields="+fields+"&projects=tenant-b"),
 		"single app with appNamespace":    at("/api/v1/applications/app", "appNamespace=tenant-a"),
@@ -127,6 +125,14 @@ func TestTransport_ListAndCanIShapes(t *testing.T) {
 	refused := map[string]*url.URL{
 		"list without query":               at("/api/v1/applications", ""),
 		"list fields only":                 at("/api/v1/applications", "fields="+fields),
+		"list without fields":              at("/api/v1/applications", "projects=tenant-a"),
+		"list two projects":                at("/api/v1/applications", "projects=tenant-a&projects=tenant-b&fields="+fields),
+		"list same project twice":          at("/api/v1/applications", "projects=tenant-a&projects=tenant-a&fields="+fields),
+		"list comma projects":              at("/api/v1/applications", "projects=tenant-a,tenant-b&fields="+fields),
+		"list fields superset":             at("/api/v1/applications", "projects=tenant-a&fields="+url.QueryEscape(ListFields+",items.spec.source")),
+		"list fields subset":               at("/api/v1/applications", "projects=tenant-a&fields=items.metadata.name"),
+		"list extra key with fields":       at("/api/v1/applications", "projects=tenant-a&fields="+fields+"&x=1"),
+		"list refresh with fields":         at("/api/v1/applications", "projects=tenant-a&fields="+fields+"&refresh=hard"),
 		"list project not allowed":         at("/api/v1/applications", "projects=tenant-c"),
 		"list one project not allowed":     at("/api/v1/applications", "projects=tenant-a&projects=tenant-c"),
 		"list empty project":               at("/api/v1/applications", "projects="),

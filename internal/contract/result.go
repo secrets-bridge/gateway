@@ -130,12 +130,17 @@ const (
 	ErrorRateLimited           ErrorCode = "rate_limited"
 	ErrorTLSVerificationFailed ErrorCode = "tls_verification_failed"
 	ErrorInternal              ErrorCode = "internal"
+	// ErrorTargetIdentityChanged: the object found under a configured
+	// target's name is not the configured one (its uid differs from the
+	// pinned uid), so it was deleted and recreated. Nothing about the
+	// replacement is reported.
+	ErrorTargetIdentityChanged ErrorCode = "target_identity_changed"
 )
 
 var allErrorCodes = []ErrorCode{
 	ErrorConnectorUnreachable, ErrorConnectorTimeout, ErrorConnectorUnauthorized, ErrorConnectorForbidden,
 	ErrorResourceNotFound, ErrorAPIVersionNotServed, ErrorResponseTooLarge, ErrorRateLimited,
-	ErrorTLSVerificationFailed, ErrorInternal,
+	ErrorTLSVerificationFailed, ErrorInternal, ErrorTargetIdentityChanged,
 }
 
 // SourceAPI is the API a stage was read from.
@@ -195,11 +200,15 @@ type Source struct {
 
 // Resource is the identity of the object read.
 type Resource struct {
-	APIVersion      string `json:"api_version"`
-	Kind            string `json:"kind"`
-	Namespace       string `json:"namespace"`
-	Name            string `json:"name"`
-	UID             string `json:"uid,omitempty"`
+	APIVersion string `json:"api_version"`
+	Kind       string `json:"kind"`
+	Namespace  string `json:"namespace"`
+	Name       string `json:"name"`
+	UID        string `json:"uid,omitempty"`
+	// IdentityDigest is the scoped identity digest of the object
+	// (TargetIdentityDigest). Argo CD stages carry it instead of the raw
+	// uid, which never leaves the customer boundary.
+	IdentityDigest  string `json:"identity_digest,omitempty"`
 	ResourceVersion string `json:"resource_version,omitempty"`
 	Generation      *int64 `json:"generation,omitempty"`
 }
@@ -303,6 +312,9 @@ type stageRules struct {
 	// observedNeedsLink: an observed outcome needs linkage other than none.
 	observedNeedsLink bool
 	mustCaveat        Caveat
+	// digestIdentity: the resource carries identity_digest, never the
+	// raw uid. Other stages may not carry identity_digest.
+	digestIdentity bool
 }
 
 var allConfidences = []Confidence{ConfidenceHigh, ConfidenceMedium, ConfidenceLow, ConfidenceNone}
@@ -324,13 +336,14 @@ var rulesByStage = map[Stage]stageRules{
 		observedNeedsLink: true,
 	},
 	StageArgoCDContext: {
-		api:         APIArgoCD,
-		outcomes:    []Outcome{OutcomeObserved, OutcomeNotObserved, OutcomeUnverifiable, OutcomeError},
-		confidences: []Confidence{ConfidenceLow, ConfidenceNone},
-		linkages:    []Linkage{LinkageNone},
-		kind:        "Application",
-		apiVersions: []string{"argoproj.io/v1alpha1"},
-		mustCaveat:  CaveatArgoCDHealthNotProof,
+		api:            APIArgoCD,
+		outcomes:       []Outcome{OutcomeObserved, OutcomeNotObserved, OutcomeUnverifiable, OutcomeError},
+		confidences:    []Confidence{ConfidenceLow, ConfidenceNone},
+		linkages:       []Linkage{LinkageNone},
+		kind:           "Application",
+		apiVersions:    []string{"argoproj.io/v1alpha1"},
+		mustCaveat:     CaveatArgoCDHealthNotProof,
+		digestIdentity: true,
 	},
 }
 
@@ -422,6 +435,12 @@ func (r *Resource) validate(rules stageRules) error {
 		return violation("resource.name", "must be an object name")
 	case r.UID != "" && !ValidUUID(r.UID):
 		return violation("resource.uid", "must be a uuid")
+	case rules.digestIdentity && r.UID != "":
+		return violation("resource.uid", "is not allowed for this stage; send identity_digest")
+	case !rules.digestIdentity && r.IdentityDigest != "":
+		return violation("resource.identity_digest", "is not allowed for this stage")
+	case r.IdentityDigest != "" && !ValidTargetIdentityDigest(r.IdentityDigest):
+		return violation("resource.identity_digest", "does not match the pattern")
 	case r.ResourceVersion != "" && !k8sRVRe.MatchString(r.ResourceVersion):
 		return violation("resource.resource_version", "does not match the pattern")
 	case r.Generation != nil && !validNonNeg(*r.Generation):

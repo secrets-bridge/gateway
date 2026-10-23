@@ -318,9 +318,10 @@ func TestObserve_ThroughRegistry(t *testing.T) {
 }
 
 // An Application's uid is its identity (gateway hardening for a deleted
-// and recreated Application). The first successful read records it; the
-// same uid keeps working; another uid under the configured name is
-// refused until the Gateway restarts.
+// and recreated Application). Without a settings uid, the first
+// successful read in the process records it; the same uid keeps
+// working; another uid under the configured name is refused for the
+// lifetime of the process. Settings pins are in identity_test.go.
 func TestObserve_UIDIsIdentity(t *testing.T) {
 	ctx := context.Background()
 	target := connectors.Target{ID: "payments", Stage: connectors.StageArgoCDContext, NotBefore: testNotBefore}
@@ -342,20 +343,20 @@ func TestObserve_UIDIsIdentity(t *testing.T) {
 		if !errors.Is(err, connectors.ErrTargetIdentityChanged) {
 			t.Fatalf("err = %v, want ErrTargetIdentityChanged", err)
 		}
-		if obs.Outcome != connectors.OutcomeError || obs.Evidence.ErrorCode != contract.ErrorResourceNotFound ||
+		if obs.Outcome != connectors.OutcomeError || obs.Evidence.ErrorCode != contract.ErrorTargetIdentityChanged ||
 			obs.Evidence.Resource != nil || obs.Evidence.Facts != nil {
-			t.Fatalf("obs = %+v, want an error observation with resource_not_found and no evidence", obs)
+			t.Fatalf("obs = %+v, want an error observation with target_identity_changed and no evidence", obs)
 		}
 	}
 
-	t.Run("first read records the uid and reports it", func(t *testing.T) {
+	t.Run("first read records the uid and reports its digest, never the uid", func(t *testing.T) {
 		_, c, r := setup(t)
 		obs, err := r.Observe(ctx, "argocd-main", target)
 		if err != nil || obs.Outcome != connectors.OutcomeObserved {
 			t.Fatalf("obs = %+v err = %v", obs, err)
 		}
-		if obs.Evidence.Resource.UID != appUID {
-			t.Fatalf("resource uid = %q", obs.Evidence.Resource.UID)
+		if obs.Evidence.Resource.UID != "" || obs.Evidence.Resource.IdentityDigest != contract.TargetIdentityDigest("argocd-main", appUID) {
+			t.Fatalf("resource = %+v, want the identity digest and no uid", obs.Evidence.Resource)
 		}
 		if got := c.pinned["payments"]; got != appUID {
 			t.Fatalf("pinned = %q, want the first read's uid", got)
@@ -393,18 +394,20 @@ func TestObserve_UIDIsIdentity(t *testing.T) {
 		}
 	})
 
-	t.Run("a restart confirms the new object", func(t *testing.T) {
+	t.Run("without a settings uid the pin lasts for the process only", func(t *testing.T) {
 		g, _, r := setup(t)
 		_, _ = r.Observe(ctx, "argocd-main", target)
 		g.app = with(func(a *Application) { a.UID = recreateUID })
 		if _, err := r.Observe(ctx, "argocd-main", target); !errors.Is(err, connectors.ErrTargetIdentityChanged) {
 			t.Fatalf("err = %v", err)
 		}
-		// A new process (a fresh connector) learns the uid again.
+		// A new process (a fresh connector) learns the uid again: the
+		// auto pin is not a confirmation that survives a restart.
 		r2, _ := connectors.NewRegistry(newFakeConnector(g))
 		_ = r2.Check(ctx, time.Second)
 		obs, err := r2.Observe(ctx, "argocd-main", target)
-		if err != nil || obs.Outcome != connectors.OutcomeObserved || obs.Evidence.Resource.UID != recreateUID {
+		if err != nil || obs.Outcome != connectors.OutcomeObserved ||
+			obs.Evidence.Resource.IdentityDigest != contract.TargetIdentityDigest("argocd-main", recreateUID) {
 			t.Fatalf("after restart: obs = %+v err = %v", obs, err)
 		}
 	})
@@ -461,7 +464,7 @@ func TestObserve_UIDIsIdentity(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				if c.pin("payments", uid) {
+				if c.pin(c.apps["payments"], uid) {
 					accepted.Add(1)
 				}
 			}()

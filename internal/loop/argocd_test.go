@@ -121,7 +121,7 @@ func TestLoop_RealArgoCDConnector(t *testing.T) {
 			if obs, err := f.conn.Observe(context.Background(), connectors.Target{ID: "payments-api", Stage: contract.StageArgoCDContext}); err != nil || obs.Outcome == connectors.OutcomeError {
 				panic(fmt.Sprintf("first read: %+v %v", obs, err))
 			}
-		}, "error", "resource_not_found", ""},
+		}, "error", "target_identity_changed", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

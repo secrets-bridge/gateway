@@ -229,7 +229,8 @@
         "response_too_large",
         "rate_limited",
         "tls_verification_failed",
-        "internal"
+        "internal",
+        "target_identity_changed"
       ]
     },
     "source": {
@@ -292,6 +293,9 @@
         "uid": {
           "$ref": "#/$defs/uuid"
         },
+        "identity_digest": {
+          "$ref": "#/$defs/targetIdentityDigest"
+        },
         "resource_version": {
           "$ref": "#/$defs/k8sResourceVersion"
         },
@@ -299,7 +303,7 @@
           "$ref": "#/$defs/nonNegInt"
         }
       },
-      "description": "Identity of the object read. namespace and name are the same values the Gateway advertised in its catalog for this target."
+      "description": "Identity of the object read. namespace and name are the same values the Gateway advertised in its catalog for this target. Kubernetes stages may carry uid; Argo CD stages carry identity_digest instead and never the raw uid."
     },
     "stageObservation": {
       "oneOf": [
@@ -387,6 +391,17 @@
               }
             }
           }
+        },
+        {
+          "properties": {
+            "resource": {
+              "not": {
+                "required": [
+                  "identity_digest"
+                ]
+              }
+            }
+          }
         }
       ]
     },
@@ -467,6 +482,17 @@
               }
             }
           }
+        },
+        {
+          "properties": {
+            "resource": {
+              "not": {
+                "required": [
+                  "identity_digest"
+                ]
+              }
+            }
+          }
         }
       ]
     },
@@ -536,6 +562,17 @@
       "allOf": [
         {
           "$ref": "#/$defs/errorRule"
+        },
+        {
+          "properties": {
+            "resource": {
+              "not": {
+                "required": [
+                  "uid"
+                ]
+              }
+            }
+          }
         }
       ]
     },
@@ -558,6 +595,11 @@
           "confidence": {
             "const": "none"
           }
+        },
+        "not": {
+          "required": [
+            "facts"
+          ]
         }
       },
       "else": {
@@ -838,6 +880,11 @@
         "none"
       ],
       "description": "How the observation is tied to the change. version_pinned: the ExternalSecret pins remoteRef.version to the expected provider_version_id. time_ordered: ordered after the change by timestamps only. none: no link."
+    },
+    "targetIdentityDigest": {
+      "type": "string",
+      "description": "Scoped identity digest of the object read: \"d-\" and the first 130 bits, in lower-case base32, of SHA-256(uint32 big-endian len(connector_id) || connector_id || uid). One-way; the raw uid of an Argo CD Application never leaves the customer boundary.",
+      "pattern": "^d-[a-z2-7]{26}$"
     }
   }
 }

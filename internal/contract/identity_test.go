@@ -10,13 +10,13 @@ import (
 const testAppUID = "6f1c2c1e-0000-4000-8000-0000000000a1"
 
 // Known answers, computed outside Go from the documented construction
-// SHA-256(uint32_be(len(connector_id)) || connector_id || uid), first
+// SHA-256("sb-argocd-target/v1" || uint32_be(len(connector_id)) || connector_id || uid), first
 // 130 bits in lower-case base32, "d-" prefix.
 func TestTargetIdentityDigest_KnownAnswers(t *testing.T) {
 	cases := []struct{ connector, uid, want string }{
-		{"argocd-main", testAppUID, "d-7qvuzdcaqndmfdcy3ypmjnz2rr"},
-		{"argocd-main", "6f1c2c1e-0000-4000-8000-0000000000b2", "d-sfwqmefe7r6jbunm4cjirep3q3"},
-		{"argocd-other", testAppUID, "d-r5l7u7j2w3vru2wobukut3tflt"},
+		{"argocd-main", testAppUID, "d-li3oyoq5xwjxe72ps7qqn5dikf"},
+		{"argocd-main", "6f1c2c1e-0000-4000-8000-0000000000b2", "d-zk5ykqqvtcwquubd3reviuzqrz"},
+		{"argocd-other", testAppUID, "d-dpo3siyhwgggkpmrcajvcjdp77"},
 	}
 	for _, tc := range cases {
 		got := TargetIdentityDigest(tc.connector, tc.uid)
@@ -97,7 +97,7 @@ func TestResult_IdentityRefusals(t *testing.T) {
 		{"digest on a rollout stage", func(r *EvidenceResult) {
 			r.Stages[1].Resource.IdentityDigest = TargetIdentityDigest("rollout-main", testAppUID)
 		}},
-		{"digest without prefix", func(r *EvidenceResult) { r.Stages[2].Resource.IdentityDigest = "7qvuzdcaqndmfdcy3ypmjnz2rr" }},
+		{"digest without prefix", func(r *EvidenceResult) { r.Stages[2].Resource.IdentityDigest = "li3oyoq5xwjxe72ps7qqn5dikf" }},
 		{"digest upper case", func(r *EvidenceResult) { r.Stages[2].Resource.IdentityDigest = "d-7QVUZDCAQNDMFDCY3YPMJNZ2RR" }},
 		{"digest is the uid", func(r *EvidenceResult) { r.Stages[2].Resource.IdentityDigest = testAppUID }},
 		{"digest too short", func(r *EvidenceResult) { r.Stages[2].Resource.IdentityDigest = "d-7qvuzdcaqndmfdcy3ypmjnz2r" }},
@@ -144,5 +144,14 @@ func TestErrorTargetIdentityChanged_InClosedSet(t *testing.T) {
 		if enum[i] != string(c) {
 			t.Fatalf("error code %d: schema %v, Go %s", i, enum[i], c)
 		}
+	}
+}
+
+// The domain separation label is part of the input: the digest is not
+// the plain hash of the length-prefixed pair (known answer for that
+// construction computed outside Go).
+func TestTargetIdentityDigest_DomainSeparated(t *testing.T) {
+	if TargetIdentityDigest("argocd-main", testAppUID) == "d-7qvuzdcaqndmfdcy3ypmjnz2rr" {
+		t.Fatal("the digest has no domain separation label")
 	}
 }

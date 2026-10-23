@@ -883,7 +883,7 @@
     },
     "targetIdentityDigest": {
       "type": "string",
-      "description": "Scoped identity digest of the object read: \"d-\" and the first 130 bits, in lower-case base32, of SHA-256(uint32 big-endian len(connector_id) || connector_id || uid). One-way; the raw uid of an Argo CD Application never leaves the customer boundary.",
+      "description": "Scoped identity digest of the object read: \"d-\" and the first 130 bits, in lower-case base32, of SHA-256(\"sb-argocd-target/v1\" || uint32 big-endian len(connector_id) || connector_id || uid), the same derivation as a discovered target id (ADR 0002 C3). One-way; the raw uid of an Argo CD Application never leaves the customer boundary.",
       "pattern": "^d-[a-z2-7]{26}$"
     }
   }

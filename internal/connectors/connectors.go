@@ -213,7 +213,10 @@ type Connector interface {
 	// refused, and ErrCheckUnreachable when the API cannot be reached.
 	Check(ctx context.Context) error
 	// Observe performs one bounded, read-only pass for target. It must
-	// not retry internally, watch, or keep state between calls.
+	// not retry internally or watch. The only state it may keep between
+	// calls is the identity (uid) of a configured target, recorded on
+	// the first successful read, which can only refuse a later read
+	// (ErrTargetIdentityChanged), never widen one.
 	Observe(ctx context.Context, target Target) (Observation, error)
 }
 
@@ -253,6 +256,12 @@ var (
 	ErrCheckUnauthorized = errors.New("connectors: credential refused by the integration")
 	// ErrCheckUnreachable: the integration could not be reached.
 	ErrCheckUnreachable = errors.New("connectors: integration unreachable")
+	// ErrTargetIdentityChanged: the object found under a configured
+	// target's name is not the one first read for that target (its uid
+	// differs), so it was deleted and recreated. Observe answers an
+	// error observation until the integrator confirms the new object by
+	// restarting the Gateway.
+	ErrTargetIdentityChanged = errors.New("connectors: the object under the configured name has a different uid than the one first read")
 )
 
 // HealthStatus is a connector status in the heartbeat (control-plane

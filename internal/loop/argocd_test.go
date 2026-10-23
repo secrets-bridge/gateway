@@ -1,6 +1,7 @@
 package loop
 
 import (
+	"context"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -25,6 +26,9 @@ type argoFixture struct {
 	appHits atomic.Int32
 	status  atomic.Int32 // HTTP status for the application GET; 0 is 200
 	app     atomic.Value // map[string]any
+	// recreateAfterFirstRead answers every read after the first with
+	// the same Application under a new uid.
+	recreateAfterFirstRead atomic.Bool
 }
 
 func newArgoFixture(t *testing.T) *argoFixture {
@@ -36,12 +40,17 @@ func newArgoFixture(t *testing.T) *argoFixture {
 		case "/api/v1/session/userinfo":
 			_, _ = w.Write([]byte(`{"loggedIn":true}`))
 		case "/api/v1/applications/payments-api":
-			f.appHits.Add(1)
+			hit := f.appHits.Add(1)
 			if st := f.status.Load(); st != 0 {
 				w.WriteHeader(int(st))
 				return
 			}
-			_ = json.NewEncoder(w).Encode(f.app.Load())
+			app, _ := f.app.Load().(map[string]any)
+			if hit > 1 && f.recreateAfterFirstRead.Load() {
+				app = map[string]any{"metadata": map[string]any{"name": "payments-api", "namespace": "argocd",
+					"uid": "6f1c2c1e-0000-4000-8000-0000000000b2"}, "spec": app["spec"], "status": app["status"]}
+			}
+			_ = json.NewEncoder(w).Encode(app)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -77,7 +86,7 @@ func (f *argoFixture) setApp(health, sync, phase string, reconciled time.Time) {
 		status["operationState"] = map[string]string{"phase": phase, "message": "free text"}
 	}
 	f.app.Store(map[string]any{
-		"metadata": map[string]any{"name": "payments-api", "namespace": "argocd"},
+		"metadata": map[string]any{"name": "payments-api", "namespace": "argocd", "uid": "6f1c2c1e-0000-4000-8000-0000000000a1"},
 		"spec":     map[string]any{"project": "tenant-a", "source": map[string]any{"helm": map[string]any{"values": "password: hunter2"}}},
 		"status":   status,
 	})
@@ -105,6 +114,14 @@ func TestLoop_RealArgoCDConnector(t *testing.T) {
 		{"token refused", func(f *argoFixture) { f.status.Store(http.StatusUnauthorized) }, "error", "connector_unauthorized", ""},
 		{"forbidden", func(f *argoFixture) { f.status.Store(http.StatusForbidden) }, "error", "connector_forbidden", ""},
 		{"not found", func(f *argoFixture) { f.status.Store(http.StatusNotFound) }, "error", "resource_not_found", ""},
+		// An earlier pass recorded the uid; the Application was then
+		// deleted and recreated under the same name.
+		{"recreated under the same name", func(f *argoFixture) {
+			f.recreateAfterFirstRead.Store(true)
+			if obs, err := f.conn.Observe(context.Background(), connectors.Target{ID: "payments-api", Stage: contract.StageArgoCDContext}); err != nil || obs.Outcome == connectors.OutcomeError {
+				panic(fmt.Sprintf("first read: %+v %v", obs, err))
+			}
+		}, "error", "resource_not_found", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -141,6 +158,9 @@ func TestLoop_RealArgoCDConnector(t *testing.T) {
 			}
 			if f.appHits.Load() == 0 {
 				t.Fatal("the application was never read")
+			}
+			if logged := strings.Contains(h.logs.String(), "different uid"); logged != f.recreateAfterFirstRead.Load() {
+				t.Fatalf("identity change logged = %v, want %v", logged, f.recreateAfterFirstRead.Load())
 			}
 		})
 	}

@@ -153,6 +153,12 @@ func (l *Loop) toStage(ref contract.ConnectorRef, tg connectors.Target, obs conn
 			code = contract.ErrorConnectorTimeout
 		}
 		s := errorStage(code)
+		if errors.Is(err, connectors.ErrTargetIdentityChanged) {
+			stageLog.Warn("the object under this target's configured name is not the one first read (different uid); "+
+				"refusing to observe it until the gateway is restarted to confirm the new object",
+				"outcome", string(s.Outcome), "error_code", string(s.ErrorCode))
+			return s
+		}
 		stageLog.Info("stage observed", "outcome", string(s.Outcome), "error_code", string(s.ErrorCode))
 		return s
 	}

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -22,6 +23,12 @@ import (
 
 var allowed = map[string]struct{}{"tenant-a": {}}
 
+// Application uids used by the tests. appUID is the healthy fixture's.
+const (
+	appUID      = "6f1c2c1e-0000-4000-8000-0000000000a1"
+	recreateUID = "6f1c2c1e-0000-4000-8000-0000000000b2"
+)
+
 // Times used by the decision tests: the change bound is before the
 // reconcile of the healthy fixture.
 var (
@@ -30,7 +37,7 @@ var (
 )
 
 func healthyApp() *Application {
-	return &Application{Name: "payments-api", Namespace: "argocd", Project: "tenant-a", SyncStatus: "Synced",
+	return &Application{Name: "payments-api", Namespace: "argocd", UID: appUID, Project: "tenant-a", SyncStatus: "Synced",
 		HealthStatus: "Healthy", SyncRevision: "4f2a9c1", ReconciledAt: testReconciled}
 }
 
@@ -310,6 +317,162 @@ func TestObserve_ThroughRegistry(t *testing.T) {
 	})
 }
 
+// An Application's uid is its identity (gateway hardening for a deleted
+// and recreated Application). The first successful read records it; the
+// same uid keeps working; another uid under the configured name is
+// refused until the Gateway restarts.
+func TestObserve_UIDIsIdentity(t *testing.T) {
+	ctx := context.Background()
+	target := connectors.Target{ID: "payments", Stage: connectors.StageArgoCDContext, NotBefore: testNotBefore}
+	setup := func(t *testing.T) (*fakeClient, *Connector, *connectors.Registry) {
+		t.Helper()
+		g := &fakeClient{app: healthyApp()}
+		c := newFakeConnector(g)
+		r, err := connectors.NewRegistry(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Check(ctx, time.Second); err != nil {
+			t.Fatal(err)
+		}
+		return g, c, r
+	}
+	recreated := func(t *testing.T, obs connectors.Observation, err error) {
+		t.Helper()
+		if !errors.Is(err, connectors.ErrTargetIdentityChanged) {
+			t.Fatalf("err = %v, want ErrTargetIdentityChanged", err)
+		}
+		if obs.Outcome != connectors.OutcomeError || obs.Evidence.ErrorCode != contract.ErrorResourceNotFound ||
+			obs.Evidence.Resource != nil || obs.Evidence.Facts != nil {
+			t.Fatalf("obs = %+v, want an error observation with resource_not_found and no evidence", obs)
+		}
+	}
+
+	t.Run("first read records the uid and reports it", func(t *testing.T) {
+		_, c, r := setup(t)
+		obs, err := r.Observe(ctx, "argocd-main", target)
+		if err != nil || obs.Outcome != connectors.OutcomeObserved {
+			t.Fatalf("obs = %+v err = %v", obs, err)
+		}
+		if obs.Evidence.Resource.UID != appUID {
+			t.Fatalf("resource uid = %q", obs.Evidence.Resource.UID)
+		}
+		if got := c.pinned["payments"]; got != appUID {
+			t.Fatalf("pinned = %q, want the first read's uid", got)
+		}
+		st := stageFor(Decision{Outcome: obs.Outcome, Evidence: obs.Evidence})
+		if err := st.Validate(); err != nil {
+			t.Fatalf("stage with uid breaks the schema: %v", err)
+		}
+	})
+
+	t.Run("same uid keeps working", func(t *testing.T) {
+		g, _, r := setup(t)
+		for i := 0; i < 3; i++ {
+			g.app = with(func(a *Application) { a.SyncRevision = fmt.Sprintf("rev%d", i) })
+			obs, err := r.Observe(ctx, "argocd-main", target)
+			if err != nil || obs.Outcome != connectors.OutcomeObserved {
+				t.Fatalf("read %d: obs = %+v err = %v", i, obs, err)
+			}
+		}
+	})
+
+	t.Run("same name recreated with a new uid is refused", func(t *testing.T) {
+		g, _, r := setup(t)
+		if obs, err := r.Observe(ctx, "argocd-main", target); err != nil || obs.Outcome != connectors.OutcomeObserved {
+			t.Fatalf("first read: obs = %+v err = %v", obs, err)
+		}
+		g.app = with(func(a *Application) { a.UID = recreateUID })
+		obs, err := r.Observe(ctx, "argocd-main", target)
+		recreated(t, obs, err)
+		// It stays refused on every later read, healthy or not.
+		obs, err = r.Observe(ctx, "argocd-main", target)
+		recreated(t, obs, err)
+		if dump := fmt.Sprintf("%v", err); strings.Contains(dump, recreateUID) || strings.Contains(dump, appUID) {
+			t.Fatalf("error carries a uid: %s", dump)
+		}
+	})
+
+	t.Run("a restart confirms the new object", func(t *testing.T) {
+		g, _, r := setup(t)
+		_, _ = r.Observe(ctx, "argocd-main", target)
+		g.app = with(func(a *Application) { a.UID = recreateUID })
+		if _, err := r.Observe(ctx, "argocd-main", target); !errors.Is(err, connectors.ErrTargetIdentityChanged) {
+			t.Fatalf("err = %v", err)
+		}
+		// A new process (a fresh connector) learns the uid again.
+		r2, _ := connectors.NewRegistry(newFakeConnector(g))
+		_ = r2.Check(ctx, time.Second)
+		obs, err := r2.Observe(ctx, "argocd-main", target)
+		if err != nil || obs.Outcome != connectors.OutcomeObserved || obs.Evidence.Resource.UID != recreateUID {
+			t.Fatalf("after restart: obs = %+v err = %v", obs, err)
+		}
+	})
+
+	t.Run("targets are pinned independently", func(t *testing.T) {
+		g, _, r := setup(t)
+		_, _ = r.Observe(ctx, "argocd-main", target)
+		g.app = with(func(a *Application) { a.Name = "billing-api"; a.Namespace = "tenant-a-uat"; a.UID = recreateUID })
+		billing := target
+		billing.ID = "billing"
+		if obs, err := r.Observe(ctx, "argocd-main", billing); err != nil || obs.Outcome != connectors.OutcomeObserved {
+			t.Fatalf("billing: obs = %+v err = %v", obs, err)
+		}
+	})
+
+	t.Run("a failed read records nothing", func(t *testing.T) {
+		g, c, r := setup(t)
+		g.app, g.err = nil, ErrNotFound
+		if obs, _ := r.Observe(ctx, "argocd-main", target); obs.Evidence.ErrorCode != contract.ErrorResourceNotFound {
+			t.Fatalf("obs = %+v", obs)
+		}
+		if _, ok := c.pinned["payments"]; ok {
+			t.Fatal("a 404 recorded a uid")
+		}
+		g.app, g.err = with(func(a *Application) { a.UID = recreateUID }), nil
+		if obs, err := r.Observe(ctx, "argocd-main", target); err != nil || obs.Outcome != connectors.OutcomeObserved {
+			t.Fatalf("after the 404: obs = %+v err = %v", obs, err)
+		}
+	})
+
+	t.Run("an answer without a valid uid is an internal error and records nothing", func(t *testing.T) {
+		for _, uid := range []string{"", "not-a-uuid", strings.ToUpper(appUID)} {
+			g, c, r := setup(t)
+			g.app = with(func(a *Application) { a.UID = uid })
+			obs, err := r.Observe(ctx, "argocd-main", target)
+			if err != nil || obs.Outcome != connectors.OutcomeError || obs.Evidence.ErrorCode != contract.ErrorInternal {
+				t.Fatalf("uid %q: obs = %+v err = %v", uid, obs, err)
+			}
+			if len(c.pinned) != 0 {
+				t.Fatalf("uid %q was recorded", uid)
+			}
+		}
+	})
+
+	t.Run("concurrent first reads agree on one uid", func(t *testing.T) {
+		_, c, _ := setup(t)
+		var wg sync.WaitGroup
+		var accepted atomic.Int32
+		for i := 0; i < 16; i++ {
+			uid := appUID
+			if i%2 == 1 {
+				uid = recreateUID
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if c.pin("payments", uid) {
+					accepted.Add(1)
+				}
+			}()
+		}
+		wg.Wait()
+		if accepted.Load() != 8 {
+			t.Fatalf("accepted = %d, want exactly the 8 reads of the first recorded uid", accepted.Load())
+		}
+	})
+}
+
 func TestCheck(t *testing.T) {
 	cases := []struct {
 		name string
@@ -409,7 +572,7 @@ func settingsJSON(t *testing.T, s map[string]any) json.RawMessage {
 
 func TestFactory_EndToEnd(t *testing.T) {
 	srv := newArgoServer(t, map[string]any{
-		"metadata": map[string]any{"name": "payments-api", "namespace": "argocd"},
+		"metadata": map[string]any{"name": "payments-api", "namespace": "argocd", "uid": appUID},
 		"spec":     map[string]any{"project": "tenant-a"},
 		"status": map[string]any{
 			"health":         map[string]string{"status": "Healthy", "message": "db password=hunter2 ok"},

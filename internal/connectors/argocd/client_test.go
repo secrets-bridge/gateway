@@ -57,7 +57,7 @@ func TestGetApplication_HappyPath(t *testing.T) {
 			t.Errorf("missing Authorization header")
 		}
 		appJSON(w, map[string]any{
-			"metadata": map[string]any{"name": "billing-api", "namespace": "argocd"},
+			"metadata": map[string]any{"name": "billing-api", "namespace": "argocd", "uid": "6f1c2c1e-0000-4000-8000-0000000000a1"},
 			"spec": map[string]any{"project": "tenant-a", "source": map[string]any{
 				"helm": map[string]any{"values": "password: should-never-be-decoded"},
 			}},
@@ -78,6 +78,9 @@ func TestGetApplication_HappyPath(t *testing.T) {
 	}
 	if app.OperationPhase != "Succeeded" || app.Project != "tenant-a" || app.Namespace != "argocd" {
 		t.Fatalf("app = %+v", app)
+	}
+	if app.UID != "6f1c2c1e-0000-4000-8000-0000000000a1" {
+		t.Fatalf("uid = %q, want metadata.uid decoded", app.UID)
 	}
 	if !app.OperationFinishedAt.Equal(time.Date(2026, 10, 1, 10, 1, 0, 0, time.UTC)) || app.ReconciledAt.IsZero() || app.OperationStartedAt.IsZero() {
 		t.Fatalf("timestamps = %+v", app)

@@ -9,14 +9,18 @@
 //     that admits exactly GET <base>/api/v1/applications/{name}, whose
 //     only allowed query key is appNamespace, GET
 //     <base>/api/v1/session/userinfo and the can-i probe paths for the
-//     self-check, and the application list with projects required (each
-//     an allowed AppProject) and fields only with the fixed projection.
+//     self-check, and the application list with projects (exactly one
+//     allowed AppProject) and fields (exactly the fixed projection) both
+//     required.
 //     Release 1 never sends the list. resource-tree, managed-resources,
 //     manifests and the refresh query are refused in the transport. No
 //     proxy is used.
-//   - Negative probe. The self-check asks can-i for every write action
-//     on every allowed AppProject; a yes is over-privilege and a failed
-//     probe fails closed.
+//   - Negative probe. The self-check asks can-i for every application
+//     write action, exec, logs, applicationsets and projects writes on
+//     every allowed AppProject, and the first verified read of a static
+//     target asks the application actions, exec and logs on that
+//     target, again on every recheck. A yes is over-privilege and a
+//     failed probe fails closed.
 //   - Bound settings only. The base URL, token file, CA file, allowed
 //     AppProjects and the target-to-Application map come from the local
 //     connectors file. A task names a target id and nothing else.

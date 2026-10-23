@@ -261,7 +261,8 @@ func setup(cfg Config, getenv func(string) (string, bool), logger *slog.Logger, 
 			return nil, fmt.Errorf("refusing to start: %w; remove every verb on secrets (and any write) from the gateway's RBAC, and every write action from its Argo CD role", err)
 		}
 		if errors.Is(err, connectors.ErrPrivilegeUnproven) {
-			return nil, fmt.Errorf("refusing to start: %w; the self-check fails closed when a review or can-i call fails", err)
+			return nil, fmt.Errorf("refusing to start: %w; the self-check fails closed when a review or can-i call fails, "+
+				"or Argo CD cannot be reached or refuses the token; the next restart starts once the call succeeds", err)
 		}
 		return nil, err
 	}

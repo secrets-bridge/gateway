@@ -613,3 +613,71 @@ func TestSetup_ArgoCDCanIProbeRefusesBoot(t *testing.T) {
 		})
 	}
 }
+
+// TestSetup_ArgoCDOutageAtBoot is the Release 1 behaviour change: an
+// Argo CD that cannot be reached at boot, or that refuses the token,
+// refuses the start (the pod restarts and backs off) instead of leaving
+// a running replica that is not ready. Once Argo CD answers again, the
+// next start passes without any change to the Gateway.
+func TestSetup_ArgoCDOutageAtBoot(t *testing.T) {
+	var down atomic.Int32 // 1 refuses connections, 2 answers 401, 3 answers 503
+	var hits atomic.Int32
+	file := argoBootFile(t, func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		switch down.Load() {
+		case 1:
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Error("no hijacker")
+				return
+			}
+			conn, _, _ := hj.Hijack()
+			_ = conn.Close()
+			return
+		case 2:
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		case 3:
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = io.WriteString(w, `{"loggedIn":true,"value":"no"}`)
+	})
+	orig := newLoop
+	newLoop = func(loopDeps) cpLoop { return &fakeLoop{stopCh: make(chan struct{})} }
+	t.Cleanup(func() { newLoop = orig })
+
+	for _, tc := range []struct {
+		name string
+		mode int32
+	}{
+		{"unreachable", 1},
+		{"token refused", 2},
+		{"server error", 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			down.Store(tc.mode)
+			f := newFixture(t)
+			f.cfg.ConnectorsFile = file
+			_, err := f.setup()
+			if !errors.Is(err, connectors.ErrPrivilegeUnproven) || !strings.Contains(err.Error(), "refusing to start") {
+				t.Fatalf("setup err = %v, want a refused start", err)
+			}
+			if f.cpHits.Load() != 0 {
+				t.Fatal("the control plane was called by a refused start")
+			}
+
+			// Recovery: Argo CD is back, and the next start (the pod's
+			// restart) passes with no change to the Gateway.
+			down.Store(0)
+			f2 := newFixture(t)
+			f2.cfg.ConnectorsFile = file
+			if _, err := f2.setup(); err != nil {
+				t.Fatalf("restart after recovery: %v", err)
+			}
+		})
+	}
+	if hits.Load() == 0 {
+		t.Fatal("Argo CD was never called")
+	}
+}

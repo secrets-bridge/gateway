@@ -71,7 +71,8 @@ var postCeiling = map[string]bool{
 
 // streamSegments are path segments that open an exec, attach, port
 // forward, API server proxy or log stream. They are refused for every
-// client, whatever the policy says.
+// GET pattern and POST, whatever the policy says. Only an exact Route
+// with StreamName set may carry one, as a plain path parameter.
 var streamSegments = map[string]bool{
 	"exec":        true,
 	"attach":      true,
@@ -136,6 +137,19 @@ type Policy struct {
 type Route struct {
 	Path  string
 	Query []QueryRule
+	// StreamName admits a stream segment name (exec, log, proxy, ...) in
+	// this exact path, where it is a plain path parameter and opens no
+	// stream: Argo CD's can-i takes the RBAC resource "exec" as a path
+	// segment. The request is still a GET to this one path, with no
+	// Upgrade header and the Route's query rules. It never applies to a
+	// GET pattern.
+	StreamName bool
+}
+
+// route is a Route as the transport keeps it.
+type route struct {
+	query      []QueryRule
+	streamName bool
 }
 
 // QueryRule admits one query key on a Route.
@@ -160,7 +174,7 @@ type Transport struct {
 	get    [][]string
 	post   map[string]bool
 	query  map[string]bool
-	routes map[string][]QueryRule
+	routes map[string]route
 	deny   DenyFunc
 }
 
@@ -175,7 +189,7 @@ func New(next http.RoundTripper, p Policy) (*Transport, error) {
 		return nil, err
 	}
 	t := &Transport{next: next, scheme: scheme, host: host, post: map[string]bool{}, query: map[string]bool{},
-		routes: map[string][]QueryRule{}, deny: p.Deny}
+		routes: map[string]route{}, deny: p.Deny}
 	for _, pat := range p.GET {
 		if !canonical(pat) {
 			return nil, fmt.Errorf("%w: GET pattern is not a canonical path", ErrInvalidPolicy)
@@ -208,7 +222,7 @@ func New(next http.RoundTripper, p Policy) (*Transport, error) {
 			}
 			keys[q.Key] = true
 		}
-		t.routes[r.Path] = append([]QueryRule{}, r.Query...)
+		t.routes[r.Path] = route{query: append([]QueryRule{}, r.Query...), streamName: r.StreamName}
 	}
 	return t, nil
 }
@@ -321,8 +335,10 @@ func (t *Transport) check(req *http.Request) error {
 	}
 	lower := strings.ToLower(p)
 	segs := strings.Split(lower, "/")
+	rt, isRoute := t.routes[p]
+	exempt := isRoute && rt.streamName && (req.Method == "" || req.Method == http.MethodGet)
 	for _, s := range segs {
-		if streamSegments[s] {
+		if streamSegments[s] && !exempt {
 			return ErrStreamSubresource
 		}
 	}
@@ -335,8 +351,8 @@ func (t *Transport) check(req *http.Request) error {
 		if req.Body != nil && req.Body != http.NoBody && req.ContentLength != 0 {
 			return fmt.Errorf("%w (GET with a body)", ErrMethodNotAllowed)
 		}
-		if rules, ok := t.routes[p]; ok {
-			return checkRouteQuery(u, rules)
+		if isRoute {
+			return checkRouteQuery(u, rt.query)
 		}
 		if !t.matchGET(strings.Split(p, "/")) {
 			return ErrPathNotAllowed

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -190,22 +191,59 @@ type fakeClient struct {
 	name      string
 	ns        string
 
-	// can-i: yes holds the actions answered "yes"; canIErr fails every
-	// probe. canICalls records "action project" for each probe.
+	// can-i: grants are Argo CD style policy lines (resource, action
+	// and object globs) answered "yes" when they match the question;
+	// canIErr fails every probe and errs fails the probes whose key
+	// ("resource action object") it holds. canICalls records the key of
+	// each probe.
 	mu        sync.Mutex
-	yes       map[string]bool
+	grants    []grant
 	canIErr   error
+	errs      map[string]error
 	canICalls []string
 }
 
-func (f *fakeClient) CanI(_ context.Context, action, project string) (bool, error) {
+// grant is one allow line of an Argo CD RBAC policy. Like Argo CD's
+// casbin matcher, each field is a glob matched against the question,
+// and "*" also matches "/".
+type grant struct{ res, act, obj string }
+
+func globMatch(pattern, value string) bool {
+	re := "^" + strings.ReplaceAll(regexp.QuoteMeta(pattern), `\*`, ".*") + "$"
+	return regexp.MustCompile(re).MatchString(value)
+}
+
+func probeKey(p Probe) string { return p.Resource + " " + p.Action + " " + p.Object }
+
+func (f *fakeClient) setGrants(g ...grant) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.canICalls = append(f.canICalls, action+" "+project)
+	f.grants = g
+}
+
+func (f *fakeClient) calledProbes() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.canICalls)
+}
+
+func (f *fakeClient) CanI(_ context.Context, p Probe) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k := probeKey(p)
+	f.canICalls = append(f.canICalls, k)
 	if f.canIErr != nil {
 		return false, f.canIErr
 	}
-	return f.yes[action], nil
+	if err := f.errs[k]; err != nil {
+		return false, err
+	}
+	for _, g := range f.grants {
+		if globMatch(g.res, p.Resource) && globMatch(g.act, p.Action) && globMatch(g.obj, p.Object) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (f *fakeClient) GetApplication(_ context.Context, name, ns string) (*Application, error) {
@@ -534,11 +572,11 @@ func TestCheck(t *testing.T) {
 }
 
 // The negative can-i probe (gateway hardening, ADR 0002 design): every
-// write action on every allowed AppProject is asked about; any yes is
-// over-privilege, and a failed probe fails closed.
+// question of ProjectProbes on every allowed AppProject is asked; any yes
+// is over-privilege, and a failed probe fails closed.
 func TestCheck_CanIProbe(t *testing.T) {
 	ctx := context.Background()
-	t.Run("all no passes and asks every action on every project", func(t *testing.T) {
+	t.Run("all no passes and asks every question on every project", func(t *testing.T) {
 		g := &fakeClient{}
 		c := newFakeConnector(g)
 		c.projects = map[string]struct{}{"tenant-b": {}, "tenant-a": {}}
@@ -547,30 +585,59 @@ func TestCheck_CanIProbe(t *testing.T) {
 		}
 		var want []string
 		for _, p := range []string{"tenant-a", "tenant-b"} {
-			for _, a := range []string{"sync", "update", "delete", "create", "override", "action"} {
-				want = append(want, a+" "+p)
+			for _, a := range []string{"sync", "update", "delete", "create", "override", "action", "rollback", "invoke"} {
+				want = append(want, "applications "+a+" "+p+"/*")
 			}
+			want = append(want,
+				"exec create "+p+"/*",
+				"logs get "+p+"/*",
+				"applicationsets create "+p+"/*",
+				"applicationsets update "+p+"/*",
+				"applicationsets delete "+p+"/*",
+				"projects update "+p,
+				"projects delete "+p,
+			)
 		}
-		if !slices.Equal(g.canICalls, want) {
-			t.Fatalf("probes = %v, want %v", g.canICalls, want)
+		if got := g.calledProbes(); !slices.Equal(got, want) {
+			t.Fatalf("probes = %v, want %v", got, want)
 		}
 	})
-	for _, action := range CanIActions {
-		t.Run("yes for "+action+" is over-privileged", func(t *testing.T) {
-			g := &fakeClient{yes: map[string]bool{action: true}}
-			err := newFakeConnector(g).Check(ctx)
+	for _, p := range ProjectProbes("tenant-a") {
+		t.Run("yes for "+probeKey(p)+" is over-privileged", func(t *testing.T) {
+			g := &fakeClient{grants: []grant{{p.Resource, p.Action, p.Object}}}
+			c := newFakeConnector(g)
+			err := c.Check(ctx)
 			if !errors.Is(err, connectors.ErrOverPrivileged) || errors.Is(err, connectors.ErrPrivilegeUnproven) {
 				t.Fatalf("err = %v, want ErrOverPrivileged", err)
 			}
-			if !strings.Contains(err.Error(), action) || strings.Contains(err.Error(), "tenant-a") {
-				t.Fatalf("err = %q: must name the action and not the AppProject", err)
+			if !strings.Contains(err.Error(), p.Action+" "+p.Resource) || strings.Contains(err.Error(), "tenant-a") {
+				t.Fatalf("err = %q: must name the action and resource and not the AppProject", err)
+			}
+			// Sticky: a later check sends nothing and stays over-privileged.
+			n := len(g.calledProbes())
+			if err := c.Check(ctx); !errors.Is(err, connectors.ErrOverPrivileged) || len(g.calledProbes()) != n {
+				t.Fatalf("second check: err = %v, probes sent %d", err, len(g.calledProbes())-n)
 			}
 		})
 	}
+	t.Run("a wildcard grant is over-privileged", func(t *testing.T) {
+		for _, gr := range []grant{{"*", "*", "*"}, {"applications", "*", "tenant-a/*"}, {"*", "create", "*"}, {"projects", "*", "tenant-a"}} {
+			if err := newFakeConnector(&fakeClient{grants: []grant{gr}}).Check(ctx); !errors.Is(err, connectors.ErrOverPrivileged) {
+				t.Fatalf("%+v: err = %v", gr, err)
+			}
+		}
+	})
+	t.Run("read grants pass", func(t *testing.T) {
+		g := &fakeClient{grants: []grant{{"applications", "get", "tenant-a/*"}, {"projects", "get", "tenant-a"}, {"applications", "sync", "tenant-b/*"}}}
+		if err := newFakeConnector(g).Check(ctx); err != nil {
+			t.Fatal(err)
+		}
+	})
 	for name, perr := range map[string]error{
 		"unauthorized":  ErrUnauthorized,
 		"unreachable":   ErrUnreachable,
 		"bad response":  ErrBadResponse,
+		"bad request":   ErrBadRequest,
 		"refused":       ErrRequestRefused,
 		"not in policy": ErrProjectNotAllowed,
 	} {
@@ -582,6 +649,42 @@ func TestCheck_CanIProbe(t *testing.T) {
 			}
 		})
 	}
+	for _, p := range ProjectProbes("tenant-a") {
+		t.Run("one failed probe fails closed: "+probeKey(p), func(t *testing.T) {
+			for _, perr := range []error{ErrUnreachable, ErrBadResponse, ErrBadRequest} {
+				if p.Action == ActionRollback && perr == ErrBadRequest {
+					continue // covered by the rollback test below
+				}
+				g := &fakeClient{errs: map[string]error{probeKey(p): perr}}
+				if err := newFakeConnector(g).Check(ctx); !errors.Is(err, connectors.ErrPrivilegeUnproven) {
+					t.Fatalf("%v: err = %v, want ErrPrivilegeUnproven", perr, err)
+				}
+			}
+		})
+	}
+
+	// Argo CD before 3.6 has no rollback RBAC action: can-i answers 400
+	// and the rollback endpoint enforces sync, which is asked first.
+	t.Run("rollback unknown to the server is covered by sync", func(t *testing.T) {
+		g := &fakeClient{errs: map[string]error{"applications rollback tenant-a/*": ErrBadRequest}}
+		if err := newFakeConnector(g).Check(ctx); err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		calls := g.calledProbes()
+		if slices.Index(calls, "applications sync tenant-a/*") > slices.Index(calls, "applications rollback tenant-a/*") {
+			t.Fatalf("sync must be asked before rollback: %v", calls)
+		}
+		g.setGrants(grant{"applications", "sync", "tenant-a/*"})
+		if err := newFakeConnector(g).Check(ctx); !errors.Is(err, connectors.ErrOverPrivileged) {
+			t.Fatalf("sync grant with rollback unknown: %v", err)
+		}
+		for _, perr := range []error{ErrBadResponse, ErrUnreachable, ErrForbidden} {
+			g := &fakeClient{errs: map[string]error{"applications rollback tenant-a/*": perr}}
+			if err := newFakeConnector(g).Check(ctx); !errors.Is(err, connectors.ErrPrivilegeUnproven) {
+				t.Fatalf("rollback %v: err = %v, want ErrPrivilegeUnproven", perr, err)
+			}
+		}
+	})
 
 	// Through the registry: at boot a yes refuses the start and a failed
 	// probe refuses it too; at runtime RecheckAll finds a grant added
@@ -606,10 +709,11 @@ func TestCheck_CanIProbe(t *testing.T) {
 			t.Fatalf("observe through an unproven connector: %v", err)
 		}
 		g.mu.Lock()
-		g.canIErr, g.yes = nil, map[string]bool{"sync": true}
+		g.canIErr = nil
 		g.mu.Unlock()
+		g.setGrants(grant{"exec", "create", "tenant-a/*"})
 		if err := r.RecheckAll(ctx, time.Second); !errors.Is(err, connectors.ErrOverPrivileged) {
-			t.Fatalf("recheck with a sync grant: %v", err)
+			t.Fatalf("recheck with an exec grant: %v", err)
 		}
 		if r.Health()[0].Status != connectors.HealthOverPrivileged || r.Verified() {
 			t.Fatalf("health = %+v", r.Health())
@@ -620,10 +724,10 @@ func TestCheck_CanIProbe(t *testing.T) {
 		if err := r2.Check(ctx, time.Second); !errors.Is(err, connectors.ErrPrivilegeUnproven) {
 			t.Fatalf("boot with a failed probe: %v", err)
 		}
-		g3 := &fakeClient{yes: map[string]bool{"delete": true}}
+		g3 := &fakeClient{grants: []grant{{"projects", "delete", "tenant-a"}}}
 		r3, _ := connectors.NewRegistry(newFakeConnector(g3))
 		if err := r3.Check(ctx, time.Second); !errors.Is(err, connectors.ErrOverPrivileged) {
-			t.Fatalf("boot with a delete grant: %v", err)
+			t.Fatalf("boot with a projects delete grant: %v", err)
 		}
 	})
 }
@@ -659,15 +763,15 @@ func newArgoServer(t *testing.T, app map[string]any) *argoServer {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
+		if strings.HasPrefix(r.URL.Path, "/api/v1/account/can-i/") {
+			appJSON(w, map[string]any{"value": "no"})
+			return
+		}
 		switch r.URL.Path {
 		case "/api/v1/session/userinfo":
 			appJSON(w, map[string]any{"loggedIn": true, "username": "gateway", "iss": "argocd"})
 		case "/api/v1/applications/payments-api":
 			appJSON(w, app)
-		case "/api/v1/account/can-i/applications/sync/tenant-a/*", "/api/v1/account/can-i/applications/update/tenant-a/*",
-			"/api/v1/account/can-i/applications/delete/tenant-a/*", "/api/v1/account/can-i/applications/create/tenant-a/*",
-			"/api/v1/account/can-i/applications/override/tenant-a/*", "/api/v1/account/can-i/applications/action/tenant-a/*":
-			appJSON(w, map[string]any{"value": "no"})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}

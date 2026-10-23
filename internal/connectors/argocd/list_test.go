@@ -19,13 +19,17 @@ import (
 
 var listProjects = []string{"tenant-a", "tenant-b"}
 
+// listApps are the static targets of the list client: one in the Argo CD
+// namespace and one outside it.
+var listApps = []AppBinding{{ID: "payments", Name: "payments-api"}, {ID: "billing", Name: "billing-api", AppNamespace: "tenant-a-uat"}}
+
 // newListClient is newTestClient with an AppProject allowlist, so the
 // list and can-i routes exist.
 func newListClient(t *testing.T, h http.HandlerFunc) (*Client, *httptest.Server) {
 	t.Helper()
 	srv := httptest.NewTLSServer(h)
 	t.Cleanup(srv.Close)
-	c, err := New(Config{BaseURL: srv.URL, Token: staticToken(testToken), RootCAs: poolFor(srv), AllowedProjects: listProjects})
+	c, err := New(Config{BaseURL: srv.URL, Token: staticToken(testToken), RootCAs: poolFor(srv), AllowedProjects: listProjects, Applications: listApps})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -74,7 +78,8 @@ func TestTransport_ListAndCanIShapes(t *testing.T) {
 		return &u
 	}
 	fields := url.QueryEscape(ListFields)
-	canI := "/api/v1/account/can-i/applications/"
+	canIRoot := "/api/v1/account/can-i/"
+	canI := canIRoot + "applications/"
 
 	allowed := map[string]*url.URL{
 		"list one project":                at("/api/v1/applications", "projects=tenant-a"),
@@ -84,9 +89,31 @@ func TestTransport_ListAndCanIShapes(t *testing.T) {
 		"single app with appNamespace":    at("/api/v1/applications/app", "appNamespace=tenant-a"),
 		"userinfo":                        at("/api/v1/session/userinfo", ""),
 	}
-	for _, a := range CanIActions {
-		for _, p := range listProjects {
-			allowed["can-i "+a+" "+p] = at(canI+a+"/"+p+"/*", "")
+	n := 0
+	for _, p := range listProjects {
+		probes := ProjectProbes(p)
+		for _, b := range listApps {
+			probes = append(probes, TargetProbes(p, b)...)
+		}
+		for _, pr := range probes {
+			allowed["can-i "+probeKey(pr)] = at(canIRoot+pr.Resource+"/"+pr.Action+"/"+pr.Object, "")
+			n++
+		}
+	}
+	// 15 project questions, 10 for payments and 20 for billing (two
+	// objects), per AppProject.
+	if n != 2*(15+10+20) {
+		t.Fatalf("%d can-i questions, want %d", n, 2*(15+10+20))
+	}
+	for _, k := range []string{
+		"can-i exec create tenant-a/*", "can-i logs get tenant-b/*", "can-i applicationsets delete tenant-a/*",
+		"can-i projects update tenant-a", "can-i projects delete tenant-b", "can-i applications rollback tenant-a/*",
+		"can-i applications invoke tenant-b/*", "can-i applications sync tenant-a/payments-api",
+		"can-i exec create tenant-b/payments-api", "can-i applications delete tenant-a/tenant-a-uat/billing-api",
+		"can-i logs get tenant-a/billing-api",
+	} {
+		if allowed[k] == nil {
+			t.Fatalf("%s is not an admitted question", k)
 		}
 	}
 	for name, u := range allowed {
@@ -129,10 +156,22 @@ func TestTransport_ListAndCanIShapes(t *testing.T) {
 		"can-i project not allowed":        at(canI+"sync/tenant-c/*", ""),
 		"can-i read action":                at(canI+"get/tenant-a/*", ""),
 		"can-i literal action/*":           at(canI+"action/*/tenant-a/*", ""),
-		"can-i one app":                    at(canI+"sync/tenant-a/app", ""),
+		"can-i unconfigured app":           at(canI+"sync/tenant-a/app", ""),
+		"can-i target in other project":    at(canI+"sync/tenant-c/payments-api", ""),
+		"can-i target with namespace":      at(canI+"sync/tenant-a/argocd/payments-api", ""),
+		"can-i target glob":                at(canI+"sync/tenant-a/payments-*", ""),
+		"can-i exec other project":         at(canIRoot+"exec/create/tenant-c/*", ""),
+		"can-i exec get":                   at(canIRoot+"exec/get/tenant-a/*", ""),
+		"can-i logs other project":         at(canIRoot+"logs/get/tenant-c/*", ""),
+		"can-i projects with star":         at(canIRoot+"projects/update/tenant-a/*", ""),
+		"can-i projects other":             at(canIRoot+"projects/delete/tenant-c", ""),
+		"can-i projects get":               at(canIRoot+"projects/get/tenant-a", ""),
+		"can-i applicationsets bare":       at(canIRoot+"applicationsets/create/tenant-a", ""),
+		"can-i applicationsets sync":       at(canIRoot+"applicationsets/sync/tenant-a/*", ""),
+		"exec stream":                      at("/api/v1/applications/app/exec", ""),
+		"can-i exec with query":            at(canIRoot+"exec/create/tenant-a/*", "x=1"),
 		"can-i every project":              at(canI+"sync/*/*", ""),
 		"can-i with query":                 at(canI+"sync/tenant-a/*", "x=1"),
-		"can-i other resource":             at("/api/v1/account/can-i/applicationsets/sync/tenant-a/*", ""),
 		"can-i clusters":                   at("/api/v1/account/can-i/clusters/update/tenant-a/*", ""),
 		"can-i shorter":                    at(canI+"sync/tenant-a", ""),
 		"can-i longer":                     at(canI+"sync/tenant-a/*/x", ""),
@@ -163,16 +202,22 @@ func TestTransport_ListAndCanIShapes(t *testing.T) {
 		})
 	}
 
-	t.Run("POST to can-i is refused", func(t *testing.T) {
-		u := at(canI+"sync/tenant-a/*", "")
-		req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, u.String(), strings.NewReader("{}"))
-		req.URL.RawPath = req.URL.Path
-		req.Header.Set("Content-Type", "application/json")
-		if resp, err := c.hc.Do(req); err == nil {
-			_ = resp.Body.Close()
-			t.Fatal("POST was sent")
-		}
-	})
+	for _, path := range []string{canI + "sync/tenant-a/*", canIRoot + "exec/create/tenant-a/*"} {
+		t.Run("POST to "+path+" is refused", func(t *testing.T) {
+			postRefused(t, c, at(path, ""))
+		})
+	}
+}
+
+func postRefused(t *testing.T, c *Client, u *url.URL) {
+	t.Helper()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, u.String(), strings.NewReader("{}"))
+	req.URL.RawPath = req.URL.Path
+	req.Header.Set("Content-Type", "application/json")
+	if resp, err := c.hc.Do(req); err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("POST was sent")
+	}
 }
 
 // Without an AppProject allowlist (Release 1 callers that pass none)
@@ -192,7 +237,7 @@ func TestTransport_NoProjectsNoListNoCanI(t *testing.T) {
 	if _, err := c.ListApplications(context.Background(), "tenant-a"); !errors.Is(err, ErrProjectNotAllowed) {
 		t.Fatalf("list: %v", err)
 	}
-	if _, err := c.CanI(context.Background(), "sync", "tenant-a"); !errors.Is(err, ErrProjectNotAllowed) {
+	if _, err := c.CanI(context.Background(), Probe{ResourceApplications, "sync", "tenant-a/*"}); !errors.Is(err, ErrProjectNotAllowed) {
 		t.Fatalf("can-i: %v", err)
 	}
 	if hits.Load() != 0 {
@@ -359,29 +404,60 @@ func TestCanI(t *testing.T) {
 	answer := atomic.Value{}
 	c, _ := newListClient(t, func(w http.ResponseWriter, r *http.Request) {
 		uri.Store(r.RequestURI)
-		_, _ = w.Write([]byte(answer.Load().(string)))
+		if a := answer.Load().(string); a == "400" {
+			w.WriteHeader(http.StatusBadRequest)
+		} else {
+			_, _ = w.Write([]byte(a))
+		}
 	})
 	ctx := context.Background()
 	for body, want := range map[string]bool{`{"value":"yes"}`: true, `{"value":"no"}`: false} {
 		answer.Store(body)
-		got, err := c.CanI(ctx, "override", "tenant-b")
-		if err != nil || got != want {
-			t.Fatalf("%s: got %v err %v", body, got, err)
-		}
-		// The "*" reaches the wire literally, not as %2A.
-		if uri.Load() != "/api/v1/account/can-i/applications/override/tenant-b/*" {
-			t.Fatalf("request uri = %v", uri.Load())
+		for pr, wantURI := range map[Probe]string{
+			{ResourceApplications, "override", "tenant-b/*"}:              "/api/v1/account/can-i/applications/override/tenant-b/*",
+			{ResourceExec, "create", "tenant-a/*"}:                        "/api/v1/account/can-i/exec/create/tenant-a/*",
+			{ResourceLogs, "get", "tenant-b/*"}:                           "/api/v1/account/can-i/logs/get/tenant-b/*",
+			{ResourceApplicationSets, "delete", "tenant-a/*"}:             "/api/v1/account/can-i/applicationsets/delete/tenant-a/*",
+			{ResourceProjects, "update", "tenant-a"}:                      "/api/v1/account/can-i/projects/update/tenant-a",
+			{ResourceApplications, "sync", "tenant-a/payments-api"}:       "/api/v1/account/can-i/applications/sync/tenant-a/payments-api",
+			{ResourceExec, "create", "tenant-b/tenant-a-uat/billing-api"}: "/api/v1/account/can-i/exec/create/tenant-b/tenant-a-uat/billing-api",
+		} {
+			got, err := c.CanI(ctx, pr)
+			if err != nil || got != want {
+				t.Fatalf("%s %+v: got %v err %v", body, pr, got, err)
+			}
+			// The "*" reaches the wire literally, not as %2A.
+			if uri.Load() != wantURI {
+				t.Fatalf("request uri = %v, want %s", uri.Load(), wantURI)
+			}
 		}
 	}
 	for _, body := range []string{`{"value":"YES"}`, `{"value":""}`, `{}`, `{"value":true}`, `yes`} {
 		answer.Store(body)
-		if got, err := c.CanI(ctx, "sync", "tenant-a"); !errors.Is(err, ErrBadResponse) || got {
+		if got, err := c.CanI(ctx, Probe{ResourceApplications, "sync", "tenant-a/*"}); !errors.Is(err, ErrBadResponse) || got {
 			t.Fatalf("%s: got %v err %v, want ErrBadResponse", body, got, err)
 		}
 	}
-	for _, tc := range [][2]string{{"get", "tenant-a"}, {"action/*", "tenant-a"}, {"sync", "tenant-c"}, {"sync", "*"}, {"", "tenant-a"}} {
-		if _, err := c.CanI(ctx, tc[0], tc[1]); !errors.Is(err, ErrProjectNotAllowed) {
-			t.Fatalf("%v: err = %v", tc, err)
+	answer.Store("400")
+	if got, err := c.CanI(ctx, Probe{ResourceApplications, ActionRollback, "tenant-a/*"}); !errors.Is(err, ErrBadRequest) || got {
+		t.Fatalf("400: got %v err %v, want ErrBadRequest", got, err)
+	}
+	for _, pr := range []Probe{
+		{ResourceApplications, "get", "tenant-a/*"}, {ResourceApplications, "action/*", "tenant-a/*"},
+		{ResourceApplications, "sync", "tenant-c/*"}, {ResourceApplications, "sync", "*"}, {ResourceApplications, "", "tenant-a/*"},
+		{ResourceApplications, "sync", "tenant-a/other-app"}, {ResourceProjects, "update", "tenant-a/*"},
+		{ResourceExec, "create", "tenant-a"}, {"clusters", "update", "tenant-a/*"}, {ResourceApplications, "sync", "tenant-a/payments-api?x=1"},
+	} {
+		if _, err := c.CanI(ctx, pr); !errors.Is(err, ErrProjectNotAllowed) {
+			t.Fatalf("%+v: err = %v", pr, err)
+		}
+	}
+}
+
+func TestNew_RefusesBadApplication(t *testing.T) {
+	for _, b := range []AppBinding{{Name: "a/b"}, {Name: "*"}, {Name: "ok", AppNamespace: "a/b"}, {Name: ""}} {
+		if _, err := New(Config{BaseURL: "https://argocd.example.com", Token: staticToken("t"), AllowedProjects: []string{"tenant-a"}, Applications: []AppBinding{b}}); err == nil {
+			t.Fatalf("application %+v accepted", b)
 		}
 	}
 }

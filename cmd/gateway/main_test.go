@@ -466,7 +466,8 @@ func waitFor(t *testing.T, cond func() bool) {
 
 // argoCheckCalls is the boot self-check of an argocd connector with one
 // allowed AppProject (tenant-a): userinfo, then the negative can-i probe
-// for each write action.
+// for each application write action, exec, logs, applicationsets and
+// projects. No per-target question is asked before a read.
 var argoCheckCalls = []string{
 	"GET /api/v1/session/userinfo",
 	"GET /api/v1/account/can-i/applications/sync/tenant-a/*",
@@ -475,6 +476,15 @@ var argoCheckCalls = []string{
 	"GET /api/v1/account/can-i/applications/create/tenant-a/*",
 	"GET /api/v1/account/can-i/applications/override/tenant-a/*",
 	"GET /api/v1/account/can-i/applications/action/tenant-a/*",
+	"GET /api/v1/account/can-i/applications/rollback/tenant-a/*",
+	"GET /api/v1/account/can-i/applications/invoke/tenant-a/*",
+	"GET /api/v1/account/can-i/exec/create/tenant-a/*",
+	"GET /api/v1/account/can-i/logs/get/tenant-a/*",
+	"GET /api/v1/account/can-i/applicationsets/create/tenant-a/*",
+	"GET /api/v1/account/can-i/applicationsets/update/tenant-a/*",
+	"GET /api/v1/account/can-i/applicationsets/delete/tenant-a/*",
+	"GET /api/v1/account/can-i/projects/update/tenant-a",
+	"GET /api/v1/account/can-i/projects/delete/tenant-a",
 }
 
 // argoBootFile writes a connectors file with one argocd connector bound
@@ -566,6 +576,27 @@ func TestSetup_ArgoCDCanIProbeRefusesBoot(t *testing.T) {
 		}, connectors.ErrPrivilegeUnproven},
 		{"token refused so the probe cannot run", func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusUnauthorized)
+		}, connectors.ErrPrivilegeUnproven},
+		{"can-i yes for exec", func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/can-i/exec/create/tenant-a/*") {
+				_, _ = io.WriteString(w, `{"value":"yes"}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"loggedIn":true,"value":"no"}`)
+		}, connectors.ErrOverPrivileged},
+		{"can-i yes for projects delete", func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/can-i/projects/delete/tenant-a") {
+				_, _ = io.WriteString(w, `{"value":"yes"}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"loggedIn":true,"value":"no"}`)
+		}, connectors.ErrOverPrivileged},
+		{"can-i 400 for exec", func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/can-i/exec/") {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			_, _ = io.WriteString(w, `{"loggedIn":true,"value":"no"}`)
 		}, connectors.ErrPrivilegeUnproven},
 	}
 	for _, tc := range cases {

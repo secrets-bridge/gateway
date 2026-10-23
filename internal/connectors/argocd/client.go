@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"slices"
 	"strings"
 	"time"
 
@@ -56,12 +55,86 @@ const (
 	FieldsQueryKey = "fields"
 )
 
-// CanIActions are the write actions the negative can-i probe asks about
-// on applications in each allowed AppProject. Argo CD's can-i takes the
-// action as one path segment and accepts only its fixed action names,
-// so "action" stands for the action/* family: an action/<group>/<kind>
-// grant narrower than a wildcard is not visible to can-i.
-var CanIActions = []string{"sync", "update", "delete", "create", "override", "action"}
+// Probe is one negative can-i question: may the token perform Action on
+// Resource for Object? It is sent as
+// GET <base>/api/v1/account/can-i/<resource>/<action>/<object>, and Argo
+// CD's route takes the object as the rest of the path
+// ({subresource=**}), so a project/app object keeps its slash.
+type Probe struct {
+	Resource string
+	Action   string
+	Object   string
+}
+
+// Argo CD RBAC resources the probe asks about.
+const (
+	ResourceApplications    = "applications"
+	ResourceApplicationSets = "applicationsets"
+	ResourceProjects        = "projects"
+	ResourceExec            = "exec"
+	ResourceLogs            = "logs"
+)
+
+// ActionRollback is the application rollback action. Argo CD releases
+// before 3.6 have no such RBAC action: their can-i answers HTTP 400, and
+// their rollback endpoint enforces the sync permission instead. See
+// Connector.Check.
+const ActionRollback = "rollback"
+
+// AppActions are the application actions the negative probe asks about,
+// in order. sync comes before rollback on purpose (see Connector.Check).
+// Argo CD's can-i takes the action as one path segment and accepts only
+// its fixed action names, so "action" stands for the action/* family:
+// an action/<group>/<kind> grant narrower than a wildcard is not visible
+// to can-i.
+var AppActions = []string{"sync", "update", "delete", "create", "override", "action", ActionRollback, "invoke"}
+
+// ProjectProbes are the questions asked for every allowed AppProject, at
+// boot and on every recheck: each application action, exec create, logs
+// get and applicationsets create, update and delete on <project>/*, and
+// projects update and delete on the bare <project> (the projects
+// resource takes the AppProject name as its object). Any yes is
+// over-privilege.
+func ProjectProbes(project string) []Probe {
+	all := project + "/*"
+	out := make([]Probe, 0, len(AppActions)+7)
+	for _, a := range AppActions {
+		out = append(out, Probe{ResourceApplications, a, all})
+	}
+	return append(out,
+		Probe{ResourceExec, "create", all},
+		Probe{ResourceLogs, "get", all},
+		Probe{ResourceApplicationSets, "create", all},
+		Probe{ResourceApplicationSets, "update", all},
+		Probe{ResourceApplicationSets, "delete", all},
+		Probe{ResourceProjects, "update", project},
+		Probe{ResourceProjects, "delete", project},
+	)
+}
+
+// TargetProbes are the questions asked for one static target once a
+// verified read has told its AppProject: each application action, exec
+// create and logs get on <project>/<app>. A grant on one named
+// Application, or on a glob narrower than <project>/* such as
+// <project>/payments-*, does not match the <project>/* object of
+// ProjectProbes; it matches this one. For an Application outside the
+// Argo CD namespace (app_namespace set) the same questions are also
+// asked on <project>/<app-namespace>/<app>, its RBAC name, so the answer
+// does not depend on whether the server normalizes the object.
+func TargetProbes(project string, b AppBinding) []Probe {
+	objs := []string{project + "/" + b.Name}
+	if b.AppNamespace != "" {
+		objs = append(objs, project+"/"+b.AppNamespace+"/"+b.Name)
+	}
+	out := make([]Probe, 0, len(objs)*(len(AppActions)+2))
+	for _, o := range objs {
+		for _, a := range AppActions {
+			out = append(out, Probe{ResourceApplications, a, o})
+		}
+		out = append(out, Probe{ResourceExec, "create", o}, Probe{ResourceLogs, "get", o})
+	}
+	return out
+}
 
 // Errors returned by the client. None of them carries the base URL, the
 // request path or the token, so they are safe to classify and log.
@@ -76,12 +149,16 @@ var (
 	ErrTLS              = errors.New("argocd: TLS verification failed")
 	ErrUnreachable      = errors.New("argocd: endpoint unreachable")
 	ErrBadResponse      = errors.New("argocd: unexpected response")
-	ErrNoToken          = errors.New("argocd: token unavailable")
-	ErrInvalidName      = errors.New("argocd: invalid application name")
-	// ErrProjectNotAllowed: a list or can-i request named an AppProject
-	// outside the local allowlist, or a can-i action outside
-	// CanIActions. Nothing is sent.
-	ErrProjectNotAllowed = errors.New("argocd: AppProject or action is not in the local allowlist")
+	// ErrBadRequest: Argo CD answered HTTP 400, which its can-i returns
+	// for an action or resource it does not know.
+	ErrBadRequest  = errors.New("argocd: request rejected as invalid")
+	ErrNoToken     = errors.New("argocd: token unavailable")
+	ErrInvalidName = errors.New("argocd: invalid application name")
+	// ErrProjectNotAllowed: a list request named an AppProject outside
+	// the local allowlist, or a can-i question is not one of the
+	// ProjectProbes of an allowed AppProject or the TargetProbes of a
+	// configured target in one. Nothing is sent.
+	ErrProjectNotAllowed = errors.New("argocd: AppProject or can-i question is not in the local allowlist")
 	// ErrTooManyApplications: a list response held more than
 	// MaxListApplications items.
 	ErrTooManyApplications = errors.New("argocd: application list exceeds the item cap")
@@ -111,6 +188,10 @@ type Config struct {
 	// and the can-i probe are admitted only for these projects; with
 	// none, neither is admitted.
 	AllowedProjects []string
+	// Applications are the configured static targets. The per-target
+	// can-i questions are admitted for each of them in each allowed
+	// AppProject, since the AppProject is known only after a read.
+	Applications []AppBinding
 }
 
 // Client is the read-only ArgoCD HTTP client.
@@ -124,9 +205,10 @@ type Config struct {
 //   - <base>/api/v1/applications with projects required (one or more
 //     values, each in the local AppProject allowlist) and fields
 //     optional (exactly ListFields), and no other key;
-//   - <base>/api/v1/account/can-i/applications/<action>/<project>/* for
-//     each action in CanIActions and each allowed AppProject, with no
-//     query, for the negative probe.
+//   - <base>/api/v1/account/can-i/<resource>/<action>/<object> for each
+//     of the ProjectProbes of each allowed AppProject and the
+//     TargetProbes of each configured target in each allowed AppProject,
+//     with no query, for the negative probe.
 //
 // Every other method, path and query key is refused before the request
 // leaves the process. resource-tree, managed-resources and manifests are
@@ -144,13 +226,15 @@ type Client struct {
 	hc       *http.Client
 	tlsCfg   *tls.Config
 	projects map[string]struct{}
+	// canI holds the path of every admitted can-i question.
+	canI map[string]struct{}
 }
 
 // Paths under the base URL. Only these are in the transport policy.
 const (
 	applicationsPath = "/api/v1/applications"
 	userInfoPath     = "/api/v1/session/userinfo"
-	canIAppsPath     = "/api/v1/account/can-i/applications"
+	canIBasePath     = "/api/v1/account/can-i"
 )
 
 // New builds a Client. It fails only on a malformed BaseURL, a scheme
@@ -178,6 +262,12 @@ func New(cfg Config) (*Client, error) {
 		}
 		projects[p] = struct{}{}
 	}
+	for _, b := range cfg.Applications {
+		if !validAppName(b.Name) || (b.AppNamespace != "" && !connectors.ValidName(b.AppNamespace)) {
+			return nil, errors.New("argocd: configured applications must have valid names")
+		}
+	}
+	probes := allowedProbes(projects, cfg.Applications)
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: cfg.RootCAs, ServerName: cfg.TLSServerName}
 	next := readonly.BaseTransport(tlsCfg)
 	next.TLSHandshakeTimeout = timeout
@@ -186,20 +276,47 @@ func New(cfg Config) (*Client, error) {
 	// Redirects are refused by readonly.NewClient: following one would
 	// re-send the bearer token to wherever Location points, including an
 	// http:// downgrade or another host. do() reports ErrRedirectRefused.
-	hc, err := readonly.NewClient(next, policyFor(base, projects), timeout)
+	hc, err := readonly.NewClient(next, policyFor(base, projects, probes), timeout)
 	if err != nil {
 		return nil, errors.New("argocd: base URL path cannot form a request allowlist")
 	}
-	return &Client{base: base, token: cfg.Token, hc: hc, tlsCfg: next.TLSClientConfig, projects: projects}, nil
+	canI := make(map[string]struct{}, len(probes))
+	for _, p := range probes {
+		canI[canIPath(base, p)] = struct{}{}
+	}
+	return &Client{base: base, token: cfg.Token, hc: hc, tlsCfg: next.TLSClientConfig, projects: projects, canI: canI}, nil
+}
+
+// allowedProbes is every can-i question the client may send: the
+// ProjectProbes of each allowed AppProject and the TargetProbes of each
+// configured application in each allowed AppProject, without duplicates.
+func allowedProbes(projects map[string]struct{}, apps []AppBinding) []Probe {
+	seen := map[Probe]bool{}
+	var out []Probe
+	add := func(ps []Probe) {
+		for _, p := range ps {
+			if !seen[p] {
+				seen[p] = true
+				out = append(out, p)
+			}
+		}
+	}
+	for p := range projects {
+		add(ProjectProbes(p))
+		for _, b := range apps {
+			add(TargetProbes(p, b))
+		}
+	}
+	return out
 }
 
 // policyFor is the read-only transport policy for a base URL: pinned to
 // its scheme and host, with GET allowed to the single-application path
 // (query key appNamespace) and, as exact routes, userinfo, the
 // application list (projects and fields judged by value) and one can-i
-// path per action and allowed project. Without projects there is no list
-// and no can-i route.
-func policyFor(base *url.URL, projects map[string]struct{}) readonly.Policy {
+// path per admitted question. Without
+// projects there is no list and no can-i route.
+func policyFor(base *url.URL, projects map[string]struct{}, probes []Probe) readonly.Policy {
 	routes := []readonly.Route{{Path: base.Path + userInfoPath}}
 	if len(projects) > 0 {
 		allowed := func(v string) bool { _, ok := projects[v]; return ok }
@@ -210,10 +327,10 @@ func policyFor(base *url.URL, projects map[string]struct{}) readonly.Policy {
 				{Key: FieldsQueryKey, Allow: func(v string) bool { return v == ListFields }},
 			},
 		})
-		for p := range projects {
-			for _, a := range CanIActions {
-				routes = append(routes, readonly.Route{Path: canIPath(base, a, p)})
-			}
+		for _, p := range probes {
+			// The exec resource name is a plain path parameter here and
+			// opens no stream; only this exact route may carry it.
+			routes = append(routes, readonly.Route{Path: canIPath(base, p), StreamName: p.Resource == ResourceExec})
 		}
 	}
 	return readonly.Policy{
@@ -224,10 +341,10 @@ func policyFor(base *url.URL, projects map[string]struct{}) readonly.Policy {
 	}
 }
 
-// canIPath is the can-i path for action on every application of
-// project. The last segment is a literal "*".
-func canIPath(base *url.URL, action, project string) string {
-	return base.Path + canIAppsPath + "/" + action + "/" + project + "/*"
+// canIPath is the can-i path of one question. A project-wide object
+// ends in a literal "*" segment.
+func canIPath(base *url.URL, p Probe) string {
+	return base.Path + canIBasePath + "/" + p.Resource + "/" + p.Action + "/" + p.Object
 }
 
 func parseBaseURL(raw string, allowHTTP bool) (*url.URL, error) {
@@ -530,18 +647,19 @@ func summaryFrom(raw rawSummary, project string) (AppSummary, bool) {
 	return AppSummary{Name: m.Name, Namespace: m.Namespace, UID: m.UID, Project: project, CreatedAt: parseTime(m.CreationTimestamp)}, true
 }
 
-// CanI asks Argo CD whether the token may perform action on every
-// application of project: GET
-// <base>/api/v1/account/can-i/applications/<action>/<project>/*. The
-// answer is true for "yes" and false for "no"; anything else is
-// ErrBadResponse. action must be in CanIActions and project in the
-// local allowlist, or nothing is sent.
-func (c *Client) CanI(ctx context.Context, action, project string) (bool, error) {
-	if _, ok := c.projects[project]; !ok || !slices.Contains(CanIActions, action) {
+// CanI asks Argo CD one negative question: GET
+// <base>/api/v1/account/can-i/<resource>/<action>/<object>. The answer
+// is true for "yes" and false for "no"; anything else is ErrBadResponse,
+// and HTTP 400 is ErrBadRequest. The question must be one of the
+// ProjectProbes of an allowed AppProject or the TargetProbes of a
+// configured application in one, or nothing is sent.
+func (c *Client) CanI(ctx context.Context, p Probe) (bool, error) {
+	path := canIPath(c.base, p)
+	if _, ok := c.canI[path]; !ok {
 		return false, ErrProjectNotAllowed
 	}
 	u := *c.base
-	u.Path = canIPath(c.base, action, project)
+	u.Path = path
 	// Sent literally: Go would escape the "*" segment as %2A, which the
 	// transport refuses as non-canonical.
 	u.RawPath = u.Path
@@ -624,6 +742,8 @@ func (c *Client) doStream(ctx context.Context, target *url.URL, maxBytes int64, 
 	}()
 	switch resp.StatusCode {
 	case http.StatusOK:
+	case http.StatusBadRequest:
+		return ErrBadRequest
 	case http.StatusUnauthorized:
 		return ErrUnauthorized
 	case http.StatusForbidden:

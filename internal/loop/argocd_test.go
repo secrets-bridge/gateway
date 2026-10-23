@@ -36,13 +36,13 @@ func newArgoFixture(t *testing.T) *argoFixture {
 	f := &argoFixture{}
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(r.URL.Path, "/api/v1/account/can-i/") {
+			_, _ = w.Write([]byte(`{"value":"no"}`))
+			return
+		}
 		switch r.URL.Path {
 		case "/api/v1/session/userinfo":
 			_, _ = w.Write([]byte(`{"loggedIn":true}`))
-		case "/api/v1/account/can-i/applications/sync/tenant-a/*", "/api/v1/account/can-i/applications/update/tenant-a/*",
-			"/api/v1/account/can-i/applications/delete/tenant-a/*", "/api/v1/account/can-i/applications/create/tenant-a/*",
-			"/api/v1/account/can-i/applications/override/tenant-a/*", "/api/v1/account/can-i/applications/action/tenant-a/*":
-			_, _ = w.Write([]byte(`{"value":"no"}`))
 		case "/api/v1/applications/payments-api":
 			hit := f.appHits.Add(1)
 			if st := f.status.Load(); st != 0 {

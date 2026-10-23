@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -114,4 +115,36 @@ func TestRoutes_OnlyGET(t *testing.T) {
 		r := httptest.NewRequest(m, argo+"/api/v1/applications?projects=tenant-a", nil)
 		mustRefuse(t, tr, next, r, ErrMethodNotAllowed)
 	}
+}
+
+// A stream segment name is admitted only in an exact Route that sets
+// StreamName, as a plain path parameter (Argo CD's can-i resource
+// "exec"). Every other path with it is still refused, a Route without
+// the flag included, and the request stays a GET with no query and no
+// Upgrade header.
+func TestRoutes_StreamName(t *testing.T) {
+	next := &countingRT{}
+	tr := newT(t, next, Policy{
+		Origin: argo,
+		GET:    []string{"/api/v1/applications/*", "/api/v1/applications/*/*"},
+		Routes: []Route{
+			{Path: "/api/v1/account/can-i/exec/create/tenant-a/*", StreamName: true},
+			{Path: "/api/v1/account/can-i/exec/create/tenant-b/*"},
+		},
+	})
+	mustAllow(t, tr, next, literal(argo+"/api/v1/account/can-i/exec/create/tenant-a/*"))
+	mustRefuse(t, tr, next, literal(argo+"/api/v1/account/can-i/exec/create/tenant-b/*"), ErrStreamSubresource)
+	mustRefuse(t, tr, next, literal(argo+"/api/v1/account/can-i/exec/create/tenant-c/*"), ErrStreamSubresource)
+	mustRefuse(t, tr, next, get(argo+"/api/v1/applications/exec"), ErrStreamSubresource)
+	mustRefuse(t, tr, next, get(argo+"/api/v1/applications/app/exec"), ErrStreamSubresource)
+	mustRefuse(t, tr, next, literal(argo+"/api/v1/account/can-i/exec/create/tenant-a/*?x=1"), ErrQueryNotAllowed)
+	up := literal(argo + "/api/v1/account/can-i/exec/create/tenant-a/*")
+	up.Header.Set("Upgrade", "websocket")
+	up.Header.Set("Connection", "Upgrade")
+	mustRefuse(t, tr, next, up, ErrUpgradeRefused)
+	post := httptest.NewRequest(http.MethodPost, argo+"/api/v1/account/can-i/exec/create/tenant-a/*", strings.NewReader("{}"))
+	post.URL.RawPath = post.URL.Path
+	post.Header.Set("Content-Type", "application/json")
+	// The exemption is for GET only.
+	mustRefuse(t, tr, next, post, ErrStreamSubresource)
 }

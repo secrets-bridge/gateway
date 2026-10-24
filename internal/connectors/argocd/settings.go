@@ -39,6 +39,9 @@ type Settings struct {
 	Timeout         string       `json:"timeout,omitempty"`
 	AllowedProjects []string     `json:"allowed_projects"`
 	Applications    []AppBinding `json:"applications"`
+	// Discovery is the optional discovery block (ADR 0002). Absent or
+	// with enabled false, the connector is exactly Release 1.
+	Discovery *DiscoverySettings `json:"discovery,omitempty"`
 }
 
 // AppBinding maps a local target id to one ArgoCD Application.
@@ -57,8 +60,9 @@ type AppBinding struct {
 }
 
 // ReservedTargetIDPrefix starts every discovered target id (ADR 0002
-// condition C3). A static target id may not start with it.
-const ReservedTargetIDPrefix = "d-"
+// condition C3). A static target id may not start with it, whether
+// discovery is on or off.
+const ReservedTargetIDPrefix = connectors.ReservedTargetIDPrefix
 
 // maxCAFileSize caps the CA bundle.
 const maxCAFileSize = 1 << 20
@@ -79,7 +83,16 @@ type Options struct {
 	AllowInsecureHTTP bool
 	// Now overrides the clock in tests.
 	Now func() time.Time
+	// RecheckInterval is the privilege recheck interval
+	// (SB_GATEWAY_PRIVILEGE_RECHECK_INTERVAL). A task for a discovered
+	// target whose last per-target probe is older runs it first. Zero
+	// means DefaultRecheckInterval.
+	RecheckInterval time.Duration
 }
+
+// DefaultRecheckInterval is the default privilege recheck interval
+// (ADR 0002 decision D4).
+const DefaultRecheckInterval = 5 * time.Minute
 
 // NewFactory returns the connectors.Factory for kind argocd.
 func NewFactory(opts Options) connectors.Factory {
@@ -113,8 +126,13 @@ func build(name string, s Settings, opts Options) (*Connector, error) {
 	if s.BaseURL == "" {
 		return nil, &connectors.SettingsError{Field: "base_url", Reason: "is required"}
 	}
-	if _, err := parseBaseURL(s.BaseURL, opts.AllowInsecureHTTP); err != nil {
+	base, err := parseBaseURL(s.BaseURL, opts.AllowInsecureHTTP)
+	if err != nil {
 		return nil, &connectors.SettingsError{Field: "base_url", Reason: "must be an https:// URL without credentials, query or fragment"}
+	}
+	disc, err := parseDiscovery(s.Discovery)
+	if err != nil {
+		return nil, err
 	}
 	if s.TokenFile == "" || !filepath.IsAbs(s.TokenFile) {
 		return nil, &connectors.SettingsError{Field: "token_file", Reason: "must be an absolute path"}
@@ -143,9 +161,18 @@ func build(name string, s Settings, opts Options) (*Connector, error) {
 		if !projectPattern.MatchString(p) {
 			return nil, &connectors.SettingsError{Field: "allowed_projects", Reason: "each entry must be an AppProject name"}
 		}
+		if _, dup := projects[p]; dup && disc.enabled {
+			return nil, &connectors.SettingsError{Field: "allowed_projects", Reason: "must not repeat an AppProject"}
+		}
 		projects[p] = struct{}{}
 	}
-	if len(s.Applications) == 0 {
+	if disc.enabled && len(projects) > contract.MaxAllowedProjects {
+		// ADR 0002 C9: at most 64 allowed AppProjects with discovery on.
+		return nil, &connectors.SettingsError{Field: "allowed_projects", Reason: "must list at most 64 AppProjects with discovery on"}
+	}
+	if len(s.Applications) == 0 && !disc.enabled {
+		// With discovery on the targets are discovered, so the static
+		// list may be empty (ADR 0002 section 4.1).
 		return nil, &connectors.SettingsError{Field: "applications", Reason: "must list at least one application"}
 	}
 	apps := make(map[string]AppBinding, len(s.Applications))
@@ -183,6 +210,8 @@ func build(name string, s Settings, opts Options) (*Connector, error) {
 		AllowInsecureHTTP: opts.AllowInsecureHTTP,
 		AllowedProjects:   s.AllowedProjects,
 		Applications:      s.Applications,
+		discoveryList:     disc.enabled,
+		listMaxBytes:      disc.maxBytes,
 	})
 	if err != nil {
 		return nil, &connectors.SettingsError{Field: "base_url", Reason: "rejected"}
@@ -191,7 +220,16 @@ func build(name string, s Settings, opts Options) (*Connector, error) {
 	if now == nil {
 		now = time.Now
 	}
-	return &Connector{name: name, client: client, projects: projects, apps: apps, targets: targets, now: now}, nil
+	recheck := opts.RecheckInterval
+	if recheck <= 0 {
+		recheck = DefaultRecheckInterval
+	}
+	c := &Connector{name: name, client: client, projects: projects, apps: apps, targets: targets, now: now,
+		disc: disc, baseNorm: normalizeBaseURL(base), recheck: recheck}
+	if disc.enabled {
+		c.lister = client
+	}
+	return c, nil
 }
 
 // loadCAFile reads a PEM bundle that becomes the only trust anchor.

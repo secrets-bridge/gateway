@@ -32,6 +32,14 @@ const (
 	RefusalSchemaViolation          RefusalReason = "schema_violation"
 	RefusalUnsupportedSchemaVersion RefusalReason = "unsupported_schema_version"
 	RefusalDeadlinePassed           RefusalReason = "deadline_passed"
+	// RefusalTargetSnapshotStale: a task named a discovered target (a d-
+	// id on an Argo CD connector with discovery on) while this replica
+	// has no usable discovery snapshot: none fetched, the last fetch was
+	// a 404, the blob failed an opening rule, or it is older than
+	// discovery.snapshot_max_age. Nothing was read. Added inside v1 (ADR
+	// 0002 C7, discovery-contract.md section 7.2); only a contract 2
+	// Gateway sends it.
+	RefusalTargetSnapshotStale RefusalReason = "target_snapshot_stale"
 )
 
 // Outcome is the stage outcome the Gateway proposes. The control plane
@@ -255,7 +263,8 @@ func (r *EvidenceResult) Validate() error {
 	switch r.AttemptStatus {
 	case AttemptRefused:
 		if !oneOf(r.RefusalReason, RefusalUnknownConnector, RefusalUnboundTarget, RefusalStageNotSupported,
-			RefusalScopeMismatch, RefusalSchemaViolation, RefusalUnsupportedSchemaVersion, RefusalDeadlinePassed) {
+			RefusalScopeMismatch, RefusalSchemaViolation, RefusalUnsupportedSchemaVersion, RefusalDeadlinePassed,
+			RefusalTargetSnapshotStale) {
 			return violation("refusal_reason", "is required and must be a v1 reason when refused")
 		}
 		if len(r.Stages) != 0 {

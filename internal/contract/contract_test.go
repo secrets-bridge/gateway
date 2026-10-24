@@ -263,6 +263,9 @@ func TestResult_MarshalPassesSchema(t *testing.T) {
 	partial := baseResult(errorStage())
 	partial.AttemptStatus = AttemptPartial
 	partial.Clock.APIServerOffsetMS = i64(40)
+	stale := baseResult()
+	stale.AttemptStatus = AttemptRefused
+	stale.RefusalReason = RefusalTargetSnapshotStale
 	pinned := esoStage()
 	pinned.Linkage = LinkageVersionPinned
 	pinned.Confidence = ConfidenceHigh
@@ -273,6 +276,7 @@ func TestResult_MarshalPassesSchema(t *testing.T) {
 		"version pinned":  baseResult(pinned),
 		"error stage":     partial,
 		"refused":         refused,
+		"snapshot stale":  stale,
 		"argocd only":     baseResult(argoStage()),
 		"rollout only":    baseResult(rolloutStage()),
 		"eso and rollout": baseResult(esoStage(), rolloutStage()),

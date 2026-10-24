@@ -477,13 +477,10 @@ func (r *Registry) Lookup(name string) (Connector, error) {
 }
 
 // HasTarget reports whether the connector bound under name has a local
-// target with this id.
+// target with this id: a static target, or a discovered target in the
+// connector's usable snapshot.
 func (r *Registry) HasTarget(name, targetID string) bool {
-	if !ValidName(name) || !ValidName(targetID) {
-		return false
-	}
-	_, ok := r.targets[name][targetID]
-	return ok
+	return r.TargetStatus(name, targetID) == TargetBound
 }
 
 // Catalog returns every connector and its targets, sorted by name, for
@@ -634,7 +631,11 @@ func (r *Registry) Observe(ctx context.Context, name string, target Target) (Obs
 	if !ValidName(target.ID) {
 		return Observation{}, ErrInvalidReference
 	}
-	if !r.HasTarget(name, target.ID) {
+	switch r.TargetStatus(name, target.ID) {
+	case TargetBound:
+	case TargetSnapshotStale:
+		return Observation{}, fmt.Errorf("%w: connector %q", ErrTargetSnapshotStale, name)
+	default:
 		return Observation{}, fmt.Errorf("%w: connector %q", ErrUnboundTarget, name)
 	}
 	stage, _ := StageFor(c.Kind())

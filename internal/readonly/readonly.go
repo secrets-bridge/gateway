@@ -128,6 +128,17 @@ type Policy struct {
 	// wildcard. A request to a Route path is judged by the Route's rules
 	// only; Query does not apply to it.
 	Routes []Route
+	// Exact, when set, admits more exact GET paths, decided at request
+	// time: a path for which it reports ok is judged as a Route with no
+	// query rules (so it carries no query at all), and streamName says
+	// whether that path may carry a stream segment name as a plain path
+	// parameter, as Route.StreamName does. It is a set of exact paths,
+	// never a pattern: the transport passes the canonical path itself,
+	// and an Exact func must compare it with paths it built. The Argo CD
+	// connector uses it for the per-target can-i questions of discovered
+	// Applications, whose names are known only at run time. Routes take
+	// precedence. May be nil.
+	Exact func(path string) (ok, streamName bool)
 	// Deny refuses paths even when a GET pattern matches. May be nil.
 	Deny DenyFunc
 }
@@ -175,6 +186,7 @@ type Transport struct {
 	post   map[string]bool
 	query  map[string]bool
 	routes map[string]route
+	exact  func(string) (bool, bool)
 	deny   DenyFunc
 }
 
@@ -189,7 +201,7 @@ func New(next http.RoundTripper, p Policy) (*Transport, error) {
 		return nil, err
 	}
 	t := &Transport{next: next, scheme: scheme, host: host, post: map[string]bool{}, query: map[string]bool{},
-		routes: map[string]route{}, deny: p.Deny}
+		routes: map[string]route{}, exact: p.Exact, deny: p.Deny}
 	for _, pat := range p.GET {
 		if !canonical(pat) {
 			return nil, fmt.Errorf("%w: GET pattern is not a canonical path", ErrInvalidPolicy)
@@ -336,6 +348,11 @@ func (t *Transport) check(req *http.Request) error {
 	lower := strings.ToLower(p)
 	segs := strings.Split(lower, "/")
 	rt, isRoute := t.routes[p]
+	if !isRoute && t.exact != nil {
+		if ok, stream := t.exact(p); ok {
+			rt, isRoute = route{streamName: stream}, true
+		}
+	}
 	exempt := isRoute && rt.streamName && (req.Method == "" || req.Method == http.MethodGet)
 	for _, s := range segs {
 		if streamSegments[s] && !exempt {

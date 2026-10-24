@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -70,6 +71,31 @@ type Connector struct {
 	known map[string]string
 	// startupRead is set once the startup read has been tried.
 	startupRead bool
+
+	// Discovery (ADR 0002 S3). disc is fixed at build; lister is the
+	// list client, nil with discovery off. baseNorm is the normalized
+	// base URL, used only as the endpoint digest input. recheck is the
+	// privilege recheck interval: a task for a discovered target whose
+	// last per-target probe is older runs the probe first.
+	disc     discoveryConfig
+	lister   listClient
+	baseNorm string
+	recheck  time.Duration
+	// dmu guards the discovery state below.
+	dmu sync.Mutex
+	// snap is the snapshot discovered targets resolve through, nil when
+	// there is none.
+	snap *installed
+	// dprobes is the last passing per-target probe of each discovered
+	// target.
+	dprobes map[string]targetProbe
+	// deferred are the targets the last run left out; the next run
+	// probes them first.
+	deferred map[string]bool
+	// bound are the bound target ids the control plane reported, and
+	// tasked the discovered targets that received a task, with when.
+	bound  map[string]bool
+	tasked map[string]time.Time
 }
 
 var _ connectors.Connector = (*Connector)(nil)
@@ -131,6 +157,9 @@ func (c *Connector) identityOf(id string) string {
 //     (<project>/<app>, and <project>/<app-namespace>/<app> for an
 //     Application outside the Argo CD namespace). A target not read yet
 //     is probed by Observe before its first observation is returned.
+//  6. With discovery on, the same per-target probe (DiscoveredProbes)
+//     for every bound discovered target: in the control plane's bound
+//     list, or tasked in the last 24 hours (ADR 0002 C2).
 //
 // Any yes in steps 2 or 5 wraps connectors.ErrOverPrivileged: the Gateway refuses to
 // start, and at runtime turns not ready and stops, the same as the
@@ -181,6 +210,9 @@ func (c *Connector) Check(ctx context.Context) error {
 		if err := c.proveTarget(ctx, id, true); err != nil {
 			return err
 		}
+	}
+	if err := c.checkBoundDiscovered(ctx); err != nil {
+		return err
 	}
 	if wide {
 		return fmt.Errorf("argocd: the token may get applications outside the allowed AppProjects: %w", connectors.ErrReadBeyondScope)
@@ -367,6 +399,9 @@ func (c *Connector) Observe(ctx context.Context, target connectors.Target) (conn
 	}
 	if target.Stage != connectors.StageArgoCDContext {
 		return obs, connectors.ErrStageNotSupported
+	}
+	if c.disc.enabled && strings.HasPrefix(target.ID, ReservedTargetIDPrefix) {
+		return c.observeDiscovered(ctx, target, obs)
 	}
 	binding, ok := c.apps[target.ID]
 	if !ok {

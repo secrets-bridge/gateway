@@ -119,11 +119,13 @@ The connectors file is a JSON array. Each entry has a `name` (a DNS label that t
       "token_file": "/etc/secrets-bridge/gateway/argocd/argocd-main/token",
       "ca_file": "/etc/secrets-bridge/gateway/argocd/argocd-main/ca.crt",
       "allowed_projects": ["tenant-a"],
-      "applications": [{"id": "payments-api", "name": "payments-api"}]
+      "applications": [{"id": "payments-api", "name": "payments-api", "uid": "6f1c2c1e-0000-4000-8000-0000000000a1"}]
     }
   }
 ]
 ```
+
+`uid` is optional and pins the Application's `metadata.uid`. With it, every replica refuses any other object under that name from its first read and after restarts, with `target_identity_changed`. Without it, each process pins the uid of its own first read, which a restart forgets. Evidence carries a one-way digest of the uid, never the uid itself ([runtime design](docs/design/runtime.md)).
 
 The control plane names only a connector and a target id. The Argo CD URL, token and Application names stay in this file, and an Application outside `allowed_projects` is reported as `unverifiable` with no status. The token needs only `applications, get` in Argo CD RBAC ([runtime design section 12](docs/design/runtime.md#12-argocd-account-and-rbac)). An Argo CD-only Gateway can run with `automountServiceAccountToken: false` and no Role.
 

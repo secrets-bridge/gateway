@@ -152,13 +152,17 @@ func (l *Loop) toStage(ref contract.ConnectorRef, tg connectors.Target, obs conn
 		case timedOut || errors.Is(err, context.DeadlineExceeded):
 			code = contract.ErrorConnectorTimeout
 		}
-		s := errorStage(code)
 		if errors.Is(err, connectors.ErrTargetIdentityChanged) {
-			stageLog.Warn("the object under this target's configured name is not the one first read (different uid); "+
-				"refusing to observe it until the gateway is restarted to confirm the new object",
+			// Whatever the connector put in the observation, the
+			// replacement object is reported only as this typed error:
+			// no resource, no facts, no status.
+			s := errorStage(contract.ErrorTargetIdentityChanged)
+			stageLog.Warn("the object under this target's configured name has a different uid than the pinned one; "+
+				"refusing to observe it until the integrator confirms the new object (applications[].uid in settings)",
 				"outcome", string(s.Outcome), "error_code", string(s.ErrorCode))
 			return s
 		}
+		s := errorStage(code)
 		stageLog.Info("stage observed", "outcome", string(s.Outcome), "error_code", string(s.ErrorCode))
 		return s
 	}

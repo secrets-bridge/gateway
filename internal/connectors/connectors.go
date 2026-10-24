@@ -257,11 +257,12 @@ var (
 	// ErrCheckUnreachable: the integration could not be reached.
 	ErrCheckUnreachable = errors.New("connectors: integration unreachable")
 	// ErrTargetIdentityChanged: the object found under a configured
-	// target's name is not the one first read for that target (its uid
-	// differs), so it was deleted and recreated. Observe answers an
-	// error observation until the integrator confirms the new object by
-	// restarting the Gateway.
-	ErrTargetIdentityChanged = errors.New("connectors: the object under the configured name has a different uid than the one first read")
+	// target's name is not the pinned one (its uid differs from the uid
+	// in settings, or from the one first read in this process), so it
+	// was deleted and recreated. Observe answers an error observation
+	// with target_identity_changed and nothing about the new object,
+	// until the integrator confirms it locally.
+	ErrTargetIdentityChanged = errors.New("connectors: the object under the configured name has a different uid than the pinned one")
 )
 
 // HealthStatus is a connector status in the heartbeat (control-plane

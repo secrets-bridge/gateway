@@ -31,10 +31,15 @@
 //     the argocd_health_not_proof caveat, never failed or
 //     not_applicable. The loop sets linkage none. A read failure is a
 //     retryable error with a schema error code.
-//   - The uid is the identity. The first successful read of a target
-//     records metadata.uid in memory; a later answer with another uid
-//     under the same name is an error observation until the Gateway is
-//     restarted. Nothing else is kept between reads.
+//   - The uid is the identity. A settings uid (applications[].uid) is
+//     enforced from the first read on every replica and survives
+//     restarts. Without one, the first successful read in the process
+//     records metadata.uid in memory, for the lifetime of the process
+//     only. A later answer with another uid under the same name is an
+//     error observation with target_identity_changed and nothing about
+//     the new object. Nothing else is kept between reads.
+//   - Evidence carries a scoped digest of the uid (identity_digest),
+//     never the raw uid.
 //   - Metadata only. Health and operation messages, manifests, sources
 //     and Helm values are never decoded.
 package argocd

@@ -32,10 +32,9 @@ type appClient interface {
 // outcome is at most observed, with confidence low, linkage none (set by
 // the loop) and the argocd_health_not_proof caveat.
 //
-// An Application's identity is its metadata.uid, not its name. The
-// connector records the uid of each configured target on the first
-// successful read and refuses any later answer with a different uid
-// (see Observe).
+// An Application's identity is its metadata.uid, not its name.
+// A settings uid is enforced from the first read across replicas and
+// restarts. Without one, each process pins its first successful read.
 type Connector struct {
 	name     string
 	client   appClient
@@ -44,11 +43,8 @@ type Connector struct {
 	targets  []connectors.TargetInfo
 	now      func() time.Time
 
-	// pinned maps a target id to the uid recorded on its first
-	// successful read. It lives in process memory only: the Gateway is
-	// stateless, so a restart learns the uid again on the next read.
-	// Pinning the uid on the control-plane side, so that it survives a
-	// restart, is a later step of the ADR 0002 design.
+	// pinned maps targets without settings uid to the first successfully
+	// read uid in this process. Settings uid pins are never replaced.
 	mu     sync.Mutex
 	pinned map[string]string
 	// probed maps a target id to the AppProject its last verified read
@@ -235,16 +231,11 @@ func (c *Connector) checkToken(ctx context.Context) error {
 // connector over_privileged or unverified. After a yes, Observe reads
 // nothing more.
 //
-// The first successful read of a target records the Application's uid.
-// An answer with no valid uid is an internal error. A later answer with
-// a different uid means the configured Application was deleted and
-// another one now has its name: that object is not the configured
-// target, so Observe answers an error observation with
-// resource_not_found (the configured object no longer exists; the closed
-// error code set has no more specific code) and returns
-// connectors.ErrTargetIdentityChanged. It keeps doing so until the
-// integrator confirms the new object by restarting the Gateway, which
-// records the uid again.
+// Identity checks fail closed. A settings uid must match from the first
+// read; otherwise the first successful read pins this process. Another
+// uid reports target_identity_changed with no replacement evidence.
+// Argo CD is read-only and context only; verified target permissions
+// are probed before any observation is returned.
 func (c *Connector) Observe(ctx context.Context, target connectors.Target) (connectors.Observation, error) {
 	obs := connectors.Observation{
 		Connector: c.name,
@@ -273,9 +264,9 @@ func (c *Connector) Observe(ctx context.Context, target connectors.Target) (conn
 			obs.Evidence = contract.StageEvidence{ErrorCode: contract.ErrorInternal}
 			return obs, nil
 		}
-		if !c.pin(target.ID, app.UID) {
+		if !c.pin(binding, app.UID) {
 			obs.Outcome = connectors.OutcomeError
-			obs.Evidence = contract.StageEvidence{ErrorCode: contract.ErrorResourceNotFound}
+			obs.Evidence = contract.StageEvidence{ErrorCode: contract.ErrorTargetIdentityChanged}
 			return obs, fmt.Errorf("argocd: target %q: %w", target.ID, connectors.ErrTargetIdentityChanged)
 		}
 		if _, ok := c.projects[app.Project]; ok {
@@ -291,14 +282,23 @@ func (c *Connector) Observe(ctx context.Context, target connectors.Target) (conn
 		}
 	}
 	d := Decide(app, err, c.projects, target.NotBefore)
+	if d.Evidence.Resource != nil {
+		d.Evidence.Resource.IdentityDigest = contract.TargetIdentityDigest(c.name, app.UID)
+	}
 	obs.Outcome = d.Outcome
 	obs.Evidence = d.Evidence
 	return obs, nil
 }
 
-// pin records uid for target id on its first successful read and
-// reports whether uid is the recorded one.
-func (c *Connector) pin(id, uid string) bool {
+// pin reports whether uid is the identity of the target bound by b. A
+// settings uid is the only accepted one and is never replaced. Without
+// it, the first successful read in this process records uid for the
+// target and later reads must match it.
+func (c *Connector) pin(b AppBinding, uid string) bool {
+	if b.UID != "" {
+		return uid == b.UID
+	}
+	id := b.ID
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.pinned == nil {
@@ -353,9 +353,9 @@ type Decision struct {
 //     non-terminal: 404 is resource_not_found, 401 or a missing token
 //     connector_unauthorized, 403 connector_forbidden.
 //
-// Every non-error decision carries the resource identity (with the uid
-// when it is a valid uuid), the facts, and the argocd_health_not_proof
-// caveat.
+// Every non-error decision carries the resource identity, facts and
+// the argocd_health_not_proof caveat. Observe adds the identity digest
+// of the validated uid, but never emits the raw uid.
 func Decide(app *Application, fetchErr error, allowedProjects map[string]struct{}, notBefore time.Time) Decision {
 	if fetchErr != nil {
 		return errorDecision(errorCodeFor(fetchErr))
@@ -368,9 +368,6 @@ func Decide(app *Application, fetchErr error, allowedProjects map[string]struct{
 		Kind:       applicationKind,
 		Namespace:  app.Namespace,
 		Name:       app.Name,
-	}
-	if contract.ValidUUID(app.UID) {
-		res.UID = app.UID
 	}
 	caveats := []contract.Caveat{contract.CaveatArgoCDHealthNotProof}
 	if _, ok := allowedProjects[app.Project]; !ok {

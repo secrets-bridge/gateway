@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/secrets-bridge/gateway/internal/connectors"
+	"github.com/secrets-bridge/gateway/internal/contract"
 )
 
 // Settings is the local configuration of one ArgoCD connector. It lives
@@ -25,7 +26,8 @@ import (
 //	  "timeout": "10s",
 //	  "allowed_projects": ["tenant-a"],
 //	  "applications": [
-//	    {"id": "payments-api", "name": "payments-api", "app_namespace": ""}
+//	    {"id": "payments-api", "name": "payments-api", "app_namespace": "",
+//	     "uid": "6f1c2c1e-0000-4000-8000-0000000000a1"}
 //	  ]
 //	}
 type Settings struct {
@@ -43,6 +45,14 @@ type AppBinding struct {
 	ID           string `json:"id"`
 	Name         string `json:"name"`
 	AppNamespace string `json:"app_namespace,omitempty"`
+	// UID optionally pins the Application's metadata.uid. When set,
+	// every replica checks it from its first read and refuses any other
+	// object under the name, across restarts: it is the integrator's
+	// explicit, replica-wide confirmation of which object the target is.
+	// When unset, each replica pins the uid of its own first successful
+	// read, for the lifetime of the process only. The uid stays inside
+	// the boundary; evidence carries a digest of it.
+	UID string `json:"uid,omitempty"`
 }
 
 // maxCAFileSize caps the CA bundle.
@@ -147,6 +157,9 @@ func build(name string, s Settings, opts Options) (*Connector, error) {
 		}
 		if a.AppNamespace != "" && !connectors.ValidName(a.AppNamespace) {
 			return nil, &connectors.SettingsError{Field: "applications.app_namespace", Reason: "must be a DNS label"}
+		}
+		if a.UID != "" && !contract.ValidUUID(a.UID) {
+			return nil, &connectors.SettingsError{Field: "applications.uid", Reason: "must be a lower-case uuid"}
 		}
 		apps[a.ID] = a
 		targets = append(targets, connectors.TargetInfo{ID: a.ID, Namespace: a.AppNamespace, Name: a.Name})

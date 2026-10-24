@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://secrets-bridge.io/schemas/gateway/v2/gateway-discovery-error.schema.json",
+  "title": "GatewayDiscoveryError",
+  "description": "The error body of E8 (discovery upload) and E9 (snapshot fetch), docs/design/discovery-contract.md section 7.1. One closed code and nothing else: no field name, value, count or limit is echoed.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["error"],
+  "properties": {
+    "error": {
+      "enum": [
+        "invalid_request",
+        "unauthorized",
+        "connector_not_found",
+        "snapshot_not_found",
+        "lease_not_held",
+        "discovery_generation_stale",
+        "scope_digest_mismatch",
+        "catalog_too_large",
+        "schema_violation"
+      ]
+    }
+  }
+}

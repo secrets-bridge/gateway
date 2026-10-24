@@ -1,0 +1,47 @@
+{
+  "description": "Known answers for docs/design/discovery-contract.md sections 2.2 and 5. Computed with Go (crypto/hkdf, crypto/aes, crypto/cipher) and checked independently with Python cryptography 48.0.0 (HKDF, AESGCM). Test values only; never use this snapshot_key.",
+  "scope": {
+    "gateway_id": "123e4567-e89b-42d3-a456-426614174000",
+    "connector_id": "argocd-main",
+    "normalized_base_url": "https://argocd.example.com",
+    "allowed_projects": [
+      "team-b-apps",
+      "team-a-apps"
+    ],
+    "discovery_enabled": true,
+    "identity_mode": "names",
+    "endpoint_digest": "sha256:9508006565bb8a9beb9bb68e3984a5350e7e0320f55945cad5aeddbdd71115ce",
+    "canonical": "{\"allowed_projects\":[\"team-a-apps\",\"team-b-apps\"],\"discovery_enabled\":true,\"endpoint_digest\":\"sha256:9508006565bb8a9beb9bb68e3984a5350e7e0320f55945cad5aeddbdd71115ce\",\"identity_mode\":\"names\",\"kind\":\"argocd\",\"v\":\"sb-argocd-scope/v1\"}",
+    "scope_digest": "sha256:bf4357a6ba9936070285b4ac00d9d32ba1ad29922757fbd7556dc9f08c2784a7"
+  },
+  "seal": {
+    "snapshot_key_b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+    "hkdf_salt_hex": "",
+    "hkdf_info": "sb-gateway-snapshot-seal/v1",
+    "seal_key_hex": "e881a329ca030cc144947556b33c5fa21b319cf386614b9545f65ddb75d4c522",
+    "gateway_id": "123e4567-e89b-42d3-a456-426614174000",
+    "connector_id": "argocd-main",
+    "generation": 7,
+    "discovered_at": "2026-10-24T12:00:00Z",
+    "aad": "{\"connector_id\":\"argocd-main\",\"discovered_at\":\"2026-10-24T12:00:00Z\",\"gateway_id\":\"123e4567-e89b-42d3-a456-426614174000\",\"generation\":7,\"v\":\"sb-gateway-snapshot-aad/v1\"}",
+    "apps": [
+      {
+        "uid": "6f1c2c1e-0000-4000-8000-0000000000a1",
+        "app_project": "team-a-apps",
+        "namespace": "argocd",
+        "name": "payments-api",
+        "target_id": "d-li3oyoq5xwjxe72ps7qqn5dikf"
+      },
+      {
+        "uid": "6f1c2c1e-0000-4000-8000-0000000000b2",
+        "app_project": "team-a-apps",
+        "namespace": "argocd",
+        "name": "billing-api",
+        "target_id": "d-zk5ykqqvtcwquubd3reviuzqrz"
+      }
+    ],
+    "plaintext": "{\"targets\":[{\"app_project\":\"team-a-apps\",\"name\":\"payments-api\",\"namespace\":\"argocd\",\"target_id\":\"d-li3oyoq5xwjxe72ps7qqn5dikf\",\"uid\":\"6f1c2c1e-0000-4000-8000-0000000000a1\"},{\"app_project\":\"team-a-apps\",\"name\":\"billing-api\",\"namespace\":\"argocd\",\"target_id\":\"d-zk5ykqqvtcwquubd3reviuzqrz\",\"uid\":\"6f1c2c1e-0000-4000-8000-0000000000b2\"}],\"v\":\"sb-gateway-snapshot/v1\"}",
+    "nonce_b64": "oKGio6Slpqeoqaqr",
+    "ciphertext_b64": "9PsIQ8x9PHIxtoJLMc1EpRInCgZVl/noeGRP7EQHVmbNlI6YAhWH/zQC/uOOoCP8IplIPU+VA3KghSSiMdseGqEW0WV9atr6BHRaX4morwA4cO7VA8c7SYLjZTUso4X62h4v9LJNAeqWgJuoIrnqh7C+NVX/pl+jiBR4taNycD/1xQ27jSLb9IcG3jsOBoFmsKXWk+ZUXhhzevnJKXc6NVeuQ1eIPIsKQSfzyp+qqLaH+TDDnyXKKDvuCOUWTd+AQlauQ4RgvGWldXWnKxgsM1h6Yky//m0tgeQqhTThW3YPkIOShYL3QACIzUB6ULs4GEMt78aG9jYdW7Y7zqGT13+wtr2GBTlT24zLGVHuLj6fx7iy3iLrhK8bZyEop2qVHPJUdowZI3pOVmGOkJ9j6nVnIaFzYQ6fxhr7nPtrWg6LiFURNzJqPmBKeTekkqMPpdoqcdTkLqxeshb4HMVAG+dBYUm/+y358BLZCe8P62JXcUzxbE1Ny6t7bg=="
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://secrets-bridge.io/schemas/gateway/v2/gateway-discovery-result.schema.json",
+  "title": "GatewayDiscoveryResult",
+  "description": "The E8 200 body (docs/design/discovery-contract.md section 3.3). Counts only; no names.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "generation", "targets_present", "targets_new", "targets_missing", "targets_renamed"],
+  "properties": {
+    "status": {
+      "enum": ["accepted", "duplicate"],
+      "description": "duplicate: the same lease_id, generation and body SHA-256 were already accepted (a retry after a lost response). Nothing changed."
+    },
+    "generation": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+    "targets_present": {"type": "integer", "minimum": 0, "maximum": 10000},
+    "targets_new": {"type": "integer", "minimum": 0, "maximum": 10000},
+    "targets_missing": {"type": "integer", "minimum": 0, "maximum": 1000000},
+    "targets_renamed": {"type": "integer", "minimum": 0, "maximum": 10000}
+  }
+}

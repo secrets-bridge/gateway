@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://secrets-bridge.io/schemas/gateway/v2/gateway-catalog-read.schema.json",
+  "title": "GatewayCatalogRead",
+  "description": "The 200 body of GET /api/v1/gateway-catalog, the console's catalog read (ADR 0002 D7; docs/design/discovery-contract.md section 8). Filtered on the server to the caller's teams before paging. It never carries an identity digest of a static target, a uid, a snapshot, a URL or an endpoint digest.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["items"],
+  "properties": {
+    "items": {
+      "type": "array",
+      "maxItems": 200,
+      "items": {"$ref": "#/$defs/item"}
+    },
+    "next_cursor": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9_-]+$",
+      "description": "Absent on the last page. Opaque; valid only with the same filters."
+    }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "localId": {
+      "type": "string",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    },
+    "k8sName": {
+      "type": "string",
+      "maxLength": 253,
+      "pattern": "^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$"
+    },
+    "item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "gateway_id",
+        "connector_uuid",
+        "connector_id",
+        "target_id",
+        "source",
+        "status",
+        "first_seen_at",
+        "is_new",
+        "look_alike",
+        "binding_count"
+      ],
+      "properties": {
+        "gateway_id": {"$ref": "#/$defs/uuid"},
+        "connector_uuid": {
+          "$ref": "#/$defs/uuid",
+          "description": "The connector row id used by the admin routes (/admin/gateways/:id/connectors/:cid) and by argocd_connector_id in a binding."
+        },
+        "connector_id": {"$ref": "#/$defs/localId"},
+        "target_id": {"$ref": "#/$defs/localId"},
+        "source": {"enum": ["discovered", "static"]},
+        "status": {
+          "enum": ["present", "missing", "stale", "identity_changed"],
+          "description": "discovered: present or missing. static: present, stale or identity_changed."
+        },
+        "app_project": {"$ref": "#/$defs/k8sName"},
+        "project_alias": {"$ref": "#/$defs/localId"},
+        "namespace": {"$ref": "#/$defs/localId"},
+        "name": {"$ref": "#/$defs/k8sName"},
+        "label": {
+          "type": "string",
+          "maxLength": 63,
+          "pattern": "^([A-Za-z0-9]([A-Za-z0-9_.-]*[A-Za-z0-9])?)?$"
+        },
+        "first_seen_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Control-plane clock: when the first catalog that held this target was accepted."
+        },
+        "last_seen_at": {"type": "string", "format": "date-time"},
+        "is_new": {
+          "type": "boolean",
+          "description": "first_seen_at within the last 24 hours."
+        },
+        "look_alike": {
+          "type": "boolean",
+          "description": "Another target visible to this caller on the same Gateway has the same name in a different AppProject or namespace."
+        },
+        "binding_count": {"type": "integer", "minimum": 0, "maximum": 100000},
+        "team_ids": {
+          "type": "array",
+          "maxItems": 16,
+          "uniqueItems": true,
+          "description": "The teams the target's AppProject maps to, limited to the teams the caller can see. Absent for static targets and unmapped AppProjects.",
+          "items": {"$ref": "#/$defs/uuid"}
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"source": {"const": "static"}}},
+          "then": {
+            "properties": {"status": {"enum": ["present", "stale", "identity_changed"]}},
+            "allOf": [
+              {"not": {"required": ["app_project"]}},
+              {"not": {"required": ["project_alias"]}},
+              {"not": {"required": ["label"]}},
+              {"not": {"required": ["team_ids"]}}
+            ]
+          },
+          "else": {
+            "properties": {
+              "status": {"enum": ["present", "missing"]},
+              "target_id": {"pattern": "^d-[a-z2-7]{26}$"}
+            }
+          }
+        }
+      ]
+    }
+  }
+}

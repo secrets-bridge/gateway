@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://secrets-bridge.io/schemas/gateway/v2/gateway-snapshot-plaintext.schema.json",
+  "title": "GatewaySnapshotPlaintext",
+  "description": "The plaintext inside a sealed discovery snapshot (docs/design/discovery-contract.md section 5.4). Never on the wire in the clear and never logged. It holds the resolve data a replica needs to turn a discovered target id into one GET of one Application: target id, AppProject, namespace, name and uid. Canonical JSON (sorted keys, no whitespace), targets sorted by target_id.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v", "targets"],
+  "properties": {
+    "v": {"const": "sb-gateway-snapshot/v1"},
+    "targets": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["target_id", "app_project", "namespace", "name", "uid"],
+        "properties": {
+          "target_id": {"type": "string", "pattern": "^d-[a-z2-7]{26}$"},
+          "app_project": {
+            "type": "string",
+            "maxLength": 253,
+            "pattern": "^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$"
+          },
+          "namespace": {
+            "type": "string",
+            "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 253,
+            "pattern": "^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$",
+            "not": {"pattern": "\\.\\."}
+          },
+          "uid": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "description": "metadata.uid. Only here, under the seal; never in any clear-text body, log or metric."
+          }
+        }
+      }
+    }
+  }
+}

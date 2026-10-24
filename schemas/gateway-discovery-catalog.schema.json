@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://secrets-bridge.io/schemas/gateway/v2/gateway-discovery-catalog.schema.json",
+  "title": "GatewayDiscoveryCatalog",
+  "description": "The E8 body of PUT /api/v1/gateways/{id}/connectors/{connector_id}/discovery (contract gateway.discovery-catalog/v1, docs/design/discovery-contract.md section 3). Sent by the discovery lease holder only. Full replace of the connector's discovered targets. It carries derived target ids, validated display names, counts, the allowed AppProjects (or aliases) and the sealed snapshot. It never carries a URL, a credential, a raw uid, an Application spec, an annotation or a label other than the one opaque-mode label value.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "replica_id",
+    "lease_id",
+    "generation",
+    "discovered_at",
+    "scope_digest",
+    "endpoint_digest",
+    "identity_mode",
+    "entries",
+    "entries_rejected",
+    "entries_deferred",
+    "snapshot"
+  ],
+  "properties": {
+    "schema_version": {"const": "gateway.discovery-catalog/v1"},
+    "replica_id": {"$ref": "#/$defs/uuid"},
+    "lease_id": {"$ref": "#/$defs/uuid"},
+    "generation": {"$ref": "#/$defs/generation"},
+    "discovered_at": {
+      "$ref": "#/$defs/wholeSecondTime",
+      "description": "Gateway clock, the start of the run (before the first list read). Whole seconds, UTC. Part of the snapshot associated data, so the control plane must store and return it byte for byte."
+    },
+    "scope_digest": {
+      "$ref": "#/$defs/sha256",
+      "description": "The digest this replica sends in its heartbeat. The control plane recomputes it from endpoint_digest, allowed_projects and identity_mode (names mode) and refuses a mismatch."
+    },
+    "endpoint_digest": {
+      "$ref": "#/$defs/sha256",
+      "description": "SHA-256(\"sb-argocd-endpoint/v1\" || uint32_be(len(gateway_id)) || gateway_id || uint32_be(len(connector_id)) || connector_id || normalized_base_url). The URL itself never leaves the boundary."
+    },
+    "identity_mode": {"enum": ["names", "opaque"]},
+    "allowed_projects": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "uniqueItems": true,
+      "description": "Names mode only. The local allowed_projects, sorted.",
+      "items": {"$ref": "#/$defs/appProject"}
+    },
+    "project_aliases": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "uniqueItems": true,
+      "description": "Opaque mode only. One alias per allowed AppProject, sorted. Deferred past the demo.",
+      "items": {"$ref": "#/$defs/localId"}
+    },
+    "entries": {
+      "type": "array",
+      "maxItems": 10000,
+      "description": "Sorted by target_id, target_id unique. The control plane also enforces the per-connector cap (default 2000) and the per-Gateway cap (10000) and answers 413 catalog_too_large above them.",
+      "items": {"$ref": "#/$defs/entry"}
+    },
+    "entries_rejected": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10000,
+      "description": "Items dropped by validation: a name, namespace or AppProject outside its pattern, an empty or malformed uid, or an AppProject outside the allowlist."
+    },
+    "entries_deferred": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10000,
+      "description": "Valid new items left out because their per-target can-i probe could not finish before the lease deadline. They are probed in a later run and are in neither the entries nor the snapshot."
+    },
+    "snapshot": {"$ref": "#/$defs/sealed"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"identity_mode": {"const": "names"}}},
+      "then": {
+        "required": ["allowed_projects"],
+        "not": {"required": ["project_aliases"]},
+        "properties": {"entries": {"items": {"$ref": "#/$defs/namesEntry"}}}
+      },
+      "else": {
+        "required": ["project_aliases"],
+        "not": {"required": ["allowed_projects"]},
+        "properties": {"entries": {"items": {"$ref": "#/$defs/opaqueEntry"}}}
+      }
+    }
+  ],
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "localId": {
+      "type": "string",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "generation": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "wholeSecondTime": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "targetId": {
+      "type": "string",
+      "pattern": "^d-[a-z2-7]{26}$",
+      "description": "Discovered target id: contract.TargetIdentityDigest(connector_id, metadata.uid) in internal/contract/identity.go (ADR 0002 C3)."
+    },
+    "appProject": {
+      "type": "string",
+      "maxLength": 253,
+      "pattern": "^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$"
+    },
+    "appName": {
+      "type": "string",
+      "maxLength": 253,
+      "pattern": "^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$",
+      "not": {"pattern": "\\.\\."}
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_id"],
+      "properties": {
+        "target_id": {"$ref": "#/$defs/targetId"},
+        "app_project": {"$ref": "#/$defs/appProject"},
+        "namespace": {"$ref": "#/$defs/localId"},
+        "name": {"$ref": "#/$defs/appName"},
+        "project_alias": {"$ref": "#/$defs/localId"},
+        "label": {
+          "type": "string",
+          "maxLength": 63,
+          "pattern": "^([A-Za-z0-9]([A-Za-z0-9_.-]*[A-Za-z0-9])?)?$"
+        }
+      }
+    },
+    "namesEntry": {
+      "required": ["target_id", "app_project", "namespace", "name"],
+      "allOf": [
+        {"not": {"required": ["project_alias"]}},
+        {"not": {"required": ["label"]}}
+      ]
+    },
+    "opaqueEntry": {
+      "required": ["target_id", "project_alias"],
+      "allOf": [
+        {"not": {"required": ["app_project"]}},
+        {"not": {"required": ["namespace"]}},
+        {"not": {"required": ["name"]}}
+      ]
+    },
+    "sealed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alg", "nonce", "ciphertext"],
+      "description": "AES-256-GCM under HKDF-SHA256(snapshot_key, salt empty, info \"sb-gateway-snapshot-seal/v1\", 32 bytes). The associated data is not sent: each side rebuilds it from gateway_id, connector_id, generation and discovered_at (section 5).",
+      "properties": {
+        "alg": {"const": "A256GCM+HKDF-SHA256/v1"},
+        "nonce": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9+/]{16}$",
+          "description": "12 random bytes, standard base64 (16 characters, no padding needed)."
+        },
+        "ciphertext": {
+          "type": "string",
+          "minLength": 24,
+          "maxLength": 2000000,
+          "pattern": "^[A-Za-z0-9+/]+={0,2}$",
+          "description": "Standard base64 of the GCM output: ciphertext followed by the 16-byte tag."
+        }
+      }
+    }
+  }
+}

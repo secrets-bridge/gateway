@@ -171,6 +171,8 @@ func build(name string, s Settings, opts Options) (*Connector, error) {
 		TLSServerName:     s.TLSServerName,
 		Timeout:           timeout,
 		AllowInsecureHTTP: opts.AllowInsecureHTTP,
+		AllowedProjects:   s.AllowedProjects,
+		Applications:      s.Applications,
 	})
 	if err != nil {
 		return nil, &connectors.SettingsError{Field: "base_url", Reason: "rejected"}

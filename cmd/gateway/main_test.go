@@ -464,18 +464,34 @@ func waitFor(t *testing.T, cond func() bool) {
 	t.Fatal("condition not met within 5s")
 }
 
-// TestSetup_BindsArgoCDConnector: the argocd kind is bound at boot, its
-// self-check reads only GET /api/v1/session/userinfo, and no
-// Application is read before a task asks for one.
-func TestSetup_BindsArgoCDConnector(t *testing.T) {
-	var mu sync.Mutex
-	var calls []string
-	argo := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		calls = append(calls, r.Method+" "+r.URL.Path)
-		mu.Unlock()
-		_, _ = io.WriteString(w, `{"loggedIn":true}`)
-	}))
+// argoCheckCalls is the boot self-check of an argocd connector with one
+// allowed AppProject (tenant-a): userinfo, then the negative can-i probe
+// for each application write action, exec, logs, applicationsets and
+// projects. No per-target question is asked before a read.
+var argoCheckCalls = []string{
+	"GET /api/v1/session/userinfo",
+	"GET /api/v1/account/can-i/applications/sync/tenant-a/*",
+	"GET /api/v1/account/can-i/applications/update/tenant-a/*",
+	"GET /api/v1/account/can-i/applications/delete/tenant-a/*",
+	"GET /api/v1/account/can-i/applications/create/tenant-a/*",
+	"GET /api/v1/account/can-i/applications/override/tenant-a/*",
+	"GET /api/v1/account/can-i/applications/action/tenant-a/*",
+	"GET /api/v1/account/can-i/applications/rollback/tenant-a/*",
+	"GET /api/v1/account/can-i/applications/invoke/tenant-a/*",
+	"GET /api/v1/account/can-i/exec/create/tenant-a/*",
+	"GET /api/v1/account/can-i/logs/get/tenant-a/*",
+	"GET /api/v1/account/can-i/applicationsets/create/tenant-a/*",
+	"GET /api/v1/account/can-i/applicationsets/update/tenant-a/*",
+	"GET /api/v1/account/can-i/applicationsets/delete/tenant-a/*",
+	"GET /api/v1/account/can-i/projects/update/tenant-a",
+	"GET /api/v1/account/can-i/projects/delete/tenant-a",
+}
+
+// argoBootFile writes a connectors file with one argocd connector bound
+// to a fake Argo CD whose answers come from h.
+func argoBootFile(t *testing.T, h http.HandlerFunc) string {
+	t.Helper()
+	argo := httptest.NewTLSServer(h)
 	t.Cleanup(argo.Close)
 	dir := t.TempDir()
 	token := filepath.Join(dir, "token")
@@ -492,6 +508,21 @@ func TestSetup_BindsArgoCDConnector(t *testing.T) {
 	if err := os.WriteFile(file, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	return file
+}
+
+// TestSetup_BindsArgoCDConnector: the argocd kind is bound at boot, its
+// self-check reads only GET /api/v1/session/userinfo and the can-i
+// probe, and no Application is read before a task asks for one.
+func TestSetup_BindsArgoCDConnector(t *testing.T) {
+	var mu sync.Mutex
+	var calls []string
+	file := argoBootFile(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls = append(calls, r.Method+" "+r.URL.Path)
+		mu.Unlock()
+		_, _ = io.WriteString(w, `{"loggedIn":true,"value":"no"}`)
+	})
 
 	f := newFixture(t)
 	f.cfg.ConnectorsFile = file
@@ -511,7 +542,142 @@ func TestSetup_BindsArgoCDConnector(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(calls) != 1 || calls[0] != "GET /api/v1/session/userinfo" {
-		t.Fatalf("ArgoCD calls during boot = %v", calls)
+	if !slices.Equal(calls, argoCheckCalls) {
+		t.Fatalf("ArgoCD calls during boot = %v, want %v", calls, argoCheckCalls)
+	}
+}
+
+// TestSetup_ArgoCDCanIProbeRefusesBoot: a token that may perform any
+// write action in an allowed AppProject refuses the boot as
+// over-privileged, and a probe that fails (or cannot run) refuses it as
+// unproven. There is no override.
+func TestSetup_ArgoCDCanIProbeRefusesBoot(t *testing.T) {
+	cases := []struct {
+		name   string
+		answer func(w http.ResponseWriter, r *http.Request)
+		want   error
+	}{
+		{"can-i yes for override", func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/override/tenant-a/*") {
+				_, _ = io.WriteString(w, `{"value":"yes"}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"loggedIn":true,"value":"no"}`)
+		}, connectors.ErrOverPrivileged},
+		{"can-i fails", func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/can-i/") {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			_, _ = io.WriteString(w, `{"loggedIn":true}`)
+		}, connectors.ErrPrivilegeUnproven},
+		{"can-i answers neither yes nor no", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = io.WriteString(w, `{"loggedIn":true,"value":"maybe"}`)
+		}, connectors.ErrPrivilegeUnproven},
+		{"token refused so the probe cannot run", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusUnauthorized)
+		}, connectors.ErrPrivilegeUnproven},
+		{"can-i yes for exec", func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/can-i/exec/create/tenant-a/*") {
+				_, _ = io.WriteString(w, `{"value":"yes"}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"loggedIn":true,"value":"no"}`)
+		}, connectors.ErrOverPrivileged},
+		{"can-i yes for projects delete", func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/can-i/projects/delete/tenant-a") {
+				_, _ = io.WriteString(w, `{"value":"yes"}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"loggedIn":true,"value":"no"}`)
+		}, connectors.ErrOverPrivileged},
+		{"can-i 400 for exec", func(w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "/can-i/exec/") {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			_, _ = io.WriteString(w, `{"loggedIn":true,"value":"no"}`)
+		}, connectors.ErrPrivilegeUnproven},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			f.cfg.ConnectorsFile = argoBootFile(t, tc.answer)
+			_, err := f.setup()
+			if !errors.Is(err, tc.want) || !strings.Contains(err.Error(), "refusing to start") {
+				t.Fatalf("setup err = %v, want %v and a refused start", err, tc.want)
+			}
+			if strings.Contains(err.Error(), "tenant-a") {
+				t.Fatalf("error names the AppProject: %v", err)
+			}
+		})
+	}
+}
+
+// TestSetup_ArgoCDOutageAtBoot is the Release 1 behaviour change: an
+// Argo CD that cannot be reached at boot, or that refuses the token,
+// refuses the start (the pod restarts and backs off) instead of leaving
+// a running replica that is not ready. Once Argo CD answers again, the
+// next start passes without any change to the Gateway.
+func TestSetup_ArgoCDOutageAtBoot(t *testing.T) {
+	var down atomic.Int32 // 1 refuses connections, 2 answers 401, 3 answers 503
+	var hits atomic.Int32
+	file := argoBootFile(t, func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		switch down.Load() {
+		case 1:
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Error("no hijacker")
+				return
+			}
+			conn, _, _ := hj.Hijack()
+			_ = conn.Close()
+			return
+		case 2:
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		case 3:
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = io.WriteString(w, `{"loggedIn":true,"value":"no"}`)
+	})
+	orig := newLoop
+	newLoop = func(loopDeps) cpLoop { return &fakeLoop{stopCh: make(chan struct{})} }
+	t.Cleanup(func() { newLoop = orig })
+
+	for _, tc := range []struct {
+		name string
+		mode int32
+	}{
+		{"unreachable", 1},
+		{"token refused", 2},
+		{"server error", 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			down.Store(tc.mode)
+			f := newFixture(t)
+			f.cfg.ConnectorsFile = file
+			_, err := f.setup()
+			if !errors.Is(err, connectors.ErrPrivilegeUnproven) || !strings.Contains(err.Error(), "refusing to start") {
+				t.Fatalf("setup err = %v, want a refused start", err)
+			}
+			if f.cpHits.Load() != 0 {
+				t.Fatal("the control plane was called by a refused start")
+			}
+
+			// Recovery: Argo CD is back, and the next start (the pod's
+			// restart) passes with no change to the Gateway.
+			down.Store(0)
+			f2 := newFixture(t)
+			f2.cfg.ConnectorsFile = file
+			if _, err := f2.setup(); err != nil {
+				t.Fatalf("restart after recovery: %v", err)
+			}
+		})
+	}
+	if hits.Load() == 0 {
+		t.Fatal("Argo CD was never called")
 	}
 }

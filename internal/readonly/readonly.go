@@ -14,16 +14,20 @@
 //     override the URL host.
 //   - The path is canonical: rooted, no "." or ".." segments, no
 //     repeated or trailing slash, and no percent-encoding, so the path
-//     that is judged is the path on the wire.
+//     that is judged is the path on the wire. A literal "*" segment is
+//     sent as "*", not "%2A", and only an exact Route can match it.
 //   - The request carries no Upgrade header (no websocket or SPDY
 //     streams) and its path has no exec, attach, portforward, proxy or
 //     log segment.
-//   - The method is GET and the path matches one of the policy's GET
-//     patterns, or the method is POST, the path is one of the two
-//     Kubernetes self-review paths (and listed in the policy), and the
-//     body is JSON. Every other method is refused.
-//   - Every query key is in the policy's allowlist (GET only; a POST
-//     carries no query).
+//   - The method is GET and the path is one of the policy's exact
+//     Routes or matches one of its GET patterns, or the method is POST,
+//     the path is one of the two Kubernetes self-review paths (and
+//     listed in the policy), and the body is JSON. Every other method is
+//     refused.
+//   - A GET to a Route carries exactly the query its rules admit: every
+//     key has a rule, every required key is present, and every value
+//     passes the rule. A GET to a pattern carries only keys in the
+//     policy's Query allowlist. A POST carries no query.
 //   - The policy's deny hook, if any, does not refuse the path.
 //
 // Errors name the rule that refused the request, never the path, query
@@ -67,7 +71,8 @@ var postCeiling = map[string]bool{
 
 // streamSegments are path segments that open an exec, attach, port
 // forward, API server proxy or log stream. They are refused for every
-// client, whatever the policy says.
+// GET pattern and POST, whatever the policy says. Only an exact Route
+// with StreamName set may carry one, as a plain path parameter.
 var streamSegments = map[string]bool{
 	"exec":        true,
 	"attach":      true,
@@ -118,8 +123,47 @@ type Policy struct {
 	// Query lists the query keys a GET may carry. Values are not
 	// judged; keys outside the list refuse the request.
 	Query []string
+	// Routes are exact GET paths, each with its own query rules. A "*"
+	// segment in a Route path is the literal character, not a
+	// wildcard. A request to a Route path is judged by the Route's rules
+	// only; Query does not apply to it.
+	Routes []Route
 	// Deny refuses paths even when a GET pattern matches. May be nil.
 	Deny DenyFunc
+}
+
+// Route is one exact GET path and the query it may carry. With no
+// rules, the request carries no query at all.
+type Route struct {
+	Path  string
+	Query []QueryRule
+	// StreamName admits a stream segment name (exec, log, proxy, ...) in
+	// this exact path, where it is a plain path parameter and opens no
+	// stream: Argo CD's can-i takes the RBAC resource "exec" as a path
+	// segment. The request is still a GET to this one path, with no
+	// Upgrade header and the Route's query rules. It never applies to a
+	// GET pattern.
+	StreamName bool
+}
+
+// route is a Route as the transport keeps it.
+type route struct {
+	query      []QueryRule
+	streamName bool
+}
+
+// QueryRule admits one query key on a Route.
+type QueryRule struct {
+	// Key is the exact, case-sensitive query key.
+	Key string
+	// Required refuses a request without the key.
+	Required bool
+	// Multi admits more than one value. Without it the key carries
+	// exactly one value.
+	Multi bool
+	// Allow judges each value. It is required: a rule that admits any
+	// value must say so in code.
+	Allow func(value string) bool
 }
 
 // Transport wraps another RoundTripper and enforces a Policy.
@@ -130,6 +174,7 @@ type Transport struct {
 	get    [][]string
 	post   map[string]bool
 	query  map[string]bool
+	routes map[string]route
 	deny   DenyFunc
 }
 
@@ -143,7 +188,8 @@ func New(next http.RoundTripper, p Policy) (*Transport, error) {
 	if err != nil {
 		return nil, err
 	}
-	t := &Transport{next: next, scheme: scheme, host: host, post: map[string]bool{}, query: map[string]bool{}, deny: p.Deny}
+	t := &Transport{next: next, scheme: scheme, host: host, post: map[string]bool{}, query: map[string]bool{},
+		routes: map[string]route{}, deny: p.Deny}
 	for _, pat := range p.GET {
 		if !canonical(pat) {
 			return nil, fmt.Errorf("%w: GET pattern is not a canonical path", ErrInvalidPolicy)
@@ -161,6 +207,22 @@ func New(next http.RoundTripper, p Policy) (*Transport, error) {
 			return nil, fmt.Errorf("%w: empty query key", ErrInvalidPolicy)
 		}
 		t.query[k] = true
+	}
+	for _, r := range p.Routes {
+		if !canonical(r.Path) {
+			return nil, fmt.Errorf("%w: route is not a canonical path", ErrInvalidPolicy)
+		}
+		if _, dup := t.routes[r.Path]; dup {
+			return nil, fmt.Errorf("%w: duplicate route", ErrInvalidPolicy)
+		}
+		keys := map[string]bool{}
+		for _, q := range r.Query {
+			if q.Key == "" || q.Allow == nil || keys[q.Key] {
+				return nil, fmt.Errorf("%w: a route query rule needs a unique key and an Allow func", ErrInvalidPolicy)
+			}
+			keys[q.Key] = true
+		}
+		t.routes[r.Path] = route{query: append([]QueryRule{}, r.Query...), streamName: r.StreamName}
 	}
 	return t, nil
 }
@@ -265,7 +327,7 @@ func (t *Transport) check(req *http.Request) error {
 	// segment), and requiring canonical form means no "..", ".", "//"
 	// or trailing slash, so what is judged here is what is sent.
 	p := u.Path
-	if u.RawPath != "" || u.EscapedPath() != p || !canonical(p) {
+	if !wireExact(u) || !canonical(p) {
 		return ErrNonCanonicalPath
 	}
 	if hasUpgrade(req.Header) {
@@ -273,8 +335,10 @@ func (t *Transport) check(req *http.Request) error {
 	}
 	lower := strings.ToLower(p)
 	segs := strings.Split(lower, "/")
+	rt, isRoute := t.routes[p]
+	exempt := isRoute && rt.streamName && (req.Method == "" || req.Method == http.MethodGet)
 	for _, s := range segs {
-		if streamSegments[s] {
+		if streamSegments[s] && !exempt {
 			return ErrStreamSubresource
 		}
 	}
@@ -286,6 +350,9 @@ func (t *Transport) check(req *http.Request) error {
 	case "", http.MethodGet: // An empty method means GET in net/http.
 		if req.Body != nil && req.Body != http.NoBody && req.ContentLength != 0 {
 			return fmt.Errorf("%w (GET with a body)", ErrMethodNotAllowed)
+		}
+		if isRoute {
+			return checkRouteQuery(u, rt.query)
 		}
 		if !t.matchGET(strings.Split(p, "/")) {
 			return ErrPathNotAllowed
@@ -306,6 +373,57 @@ func (t *Transport) check(req *http.Request) error {
 	return nil
 }
 
+// wireExact reports whether the path sent on the wire is u.Path itself:
+// no percent-encoding at all, so %2F or %2e cannot hide a segment. The
+// one exception to Go's default escaping is "*", which a caller may send
+// literally by setting RawPath to Path (Go would otherwise send %2A).
+func wireExact(u *url.URL) bool {
+	p := u.Path
+	switch u.RawPath {
+	case "":
+		return u.EscapedPath() == p
+	case p:
+		// Path must differ from Go's escaping only by "*".
+		return strings.ReplaceAll((&url.URL{Path: p}).EscapedPath(), "%2A", "*") == p && u.EscapedPath() == p
+	}
+	return false
+}
+
+// checkRouteQuery judges the query of a request to an exact Route.
+func checkRouteQuery(u *url.URL, rules []QueryRule) error {
+	if u.ForceQuery && u.RawQuery == "" {
+		return ErrQueryNotAllowed
+	}
+	q := url.Values{}
+	if u.RawQuery != "" {
+		var err error
+		if q, err = url.ParseQuery(u.RawQuery); err != nil {
+			return ErrQueryNotAllowed
+		}
+	}
+	byKey := make(map[string]QueryRule, len(rules))
+	for _, r := range rules {
+		byKey[r.Key] = r
+	}
+	for k, vs := range q {
+		r, ok := byKey[k]
+		if !ok || len(vs) == 0 || (!r.Multi && len(vs) != 1) {
+			return ErrQueryNotAllowed
+		}
+		for _, v := range vs {
+			if !r.Allow(v) {
+				return ErrQueryNotAllowed
+			}
+		}
+	}
+	for _, r := range rules {
+		if r.Required && len(q[r.Key]) == 0 {
+			return ErrQueryNotAllowed
+		}
+	}
+	return nil
+}
+
 func (t *Transport) matchGET(segs []string) bool {
 	for _, pat := range t.get {
 		if len(pat) != len(segs) {
@@ -314,7 +432,9 @@ func (t *Transport) matchGET(segs []string) bool {
 		ok := true
 		for i := range pat {
 			if pat[i] == "*" {
-				if segs[i] == "" {
+				// A wildcard matches one non-empty segment, never a
+				// literal "*": only an exact Route admits that.
+				if segs[i] == "" || segs[i] == "*" {
 					ok = false
 					break
 				}

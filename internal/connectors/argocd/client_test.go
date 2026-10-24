@@ -384,8 +384,8 @@ func TestTransport_QueryKeyAllowlist(t *testing.T) {
 		t.Fatalf("appNamespace refused: %v", err)
 	}
 	_ = resp.Body.Close()
-	// userinfo takes no query in practice, but the policy is per client,
-	// so the same key set applies; refresh is refused there too.
+	// userinfo is an exact route with no query; refresh is refused
+	// there too.
 	req, _ = http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/api/v1/session/userinfo?refresh=hard", http.NoBody)
 	if resp, err := c.hc.Do(req); err == nil {
 		_ = resp.Body.Close()

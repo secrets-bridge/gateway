@@ -36,6 +36,10 @@ func newArgoFixture(t *testing.T) *argoFixture {
 	f := &argoFixture{}
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(r.URL.Path, "/api/v1/account/can-i/") {
+			_, _ = w.Write([]byte(`{"value":"no"}`))
+			return
+		}
 		switch r.URL.Path {
 		case "/api/v1/session/userinfo":
 			_, _ = w.Write([]byte(`{"loggedIn":true}`))

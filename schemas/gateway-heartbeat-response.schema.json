@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://secrets-bridge.io/schemas/gateway/v2/gateway-heartbeat-response.schema.json",
+  "title": "GatewayHeartbeatResponse",
+  "description": "The E2 200 body, contract 1 and 2 (docs/design/discovery-contract.md section 2.4). The control plane adds discovery_leases, snapshot_generations and bound_targets_version (and bound_targets when they changed) only when it answers contract_version 2, which it does only when the request listed 2. A contract 1 Gateway decodes this body leniently and ignores the extra fields. It carries ids, generations and times only.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "server_time", "next_heartbeat_seconds", "claim_poll_seconds", "contract_version", "catalog_version"],
+  "properties": {
+    "status": {"const": "ok"},
+    "server_time": {"type": "string", "format": "date-time"},
+    "next_heartbeat_seconds": {"type": "integer", "minimum": 1, "maximum": 3600},
+    "claim_poll_seconds": {"type": "integer", "minimum": 1, "maximum": 3600},
+    "contract_version": {"enum": ["1", "2"]},
+    "catalog_version": {"$ref": "#/$defs/optionalVersion"},
+    "discovery_leases": {
+      "type": "array",
+      "maxItems": 64,
+      "description": "Leases granted to this replica by this response, at most one per connector. A lease is never repeated in a later response; the replica keeps it until expires_at or until it uploads.",
+      "items": {"$ref": "#/$defs/lease"}
+    },
+    "snapshot_generations": {
+      "type": "array",
+      "maxItems": 64,
+      "description": "The latest accepted discovery generation per connector that has a stored snapshot. A replica whose highest opened generation is lower fetches the snapshot (E9).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["connector_id", "generation"],
+        "properties": {
+          "connector_id": {"$ref": "#/$defs/localId"},
+          "generation": {"$ref": "#/$defs/generation"}
+        }
+      }
+    },
+    "bound_targets_version": {"$ref": "#/$defs/optionalVersion"},
+    "bound_targets": {
+      "type": "array",
+      "maxItems": 64,
+      "description": "Sent only when bound_targets_version differs from the one in the request. Full replace: every Argo CD target, static or discovered, that has at least one binding that is not deleted, suspended or not. At most 4096 target ids across all connectors.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["connector_id", "target_ids"],
+        "properties": {
+          "connector_id": {"$ref": "#/$defs/localId"},
+          "target_ids": {
+            "type": "array",
+            "maxItems": 4096,
+            "uniqueItems": true,
+            "items": {"$ref": "#/$defs/localId"}
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"contract_version": {"const": "1"}}},
+      "then": {
+        "not": {"required": ["bound_targets_version"]}
+      },
+      "else": {"required": ["bound_targets_version"]}
+    },
+    {
+      "if": {"properties": {"contract_version": {"const": "1"}}},
+      "then": {"not": {"required": ["discovery_leases"]}}
+    },
+    {
+      "if": {"properties": {"contract_version": {"const": "1"}}},
+      "then": {"not": {"required": ["snapshot_generations"]}}
+    },
+    {
+      "if": {"not": {"required": ["bound_targets_version"]}},
+      "then": {"not": {"required": ["bound_targets"]}}
+    }
+  ],
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "localId": {
+      "type": "string",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    },
+    "optionalVersion": {
+      "type": "string",
+      "pattern": "^(sha256:[0-9a-f]{64})?$"
+    },
+    "generation": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "lease": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["connector_id", "lease_id", "generation", "expires_at"],
+      "properties": {
+        "connector_id": {"$ref": "#/$defs/localId"},
+        "lease_id": {"$ref": "#/$defs/uuid"},
+        "generation": {
+          "$ref": "#/$defs/generation",
+          "description": "Strictly greater than every generation granted before for this connector. Gaps are allowed (an expired lease burns its generation)."
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Control-plane clock. The lease holder must finish its upload before expires_at minus 15 seconds, measured with the Date header offset; otherwise it abandons the run."
+        }
+      }
+    }
+  }
+}

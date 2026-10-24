@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://secrets-bridge.io/schemas/gateway/v2/gateway-heartbeat.schema.json",
+  "title": "GatewayHeartbeat",
+  "description": "The E2 body of POST /api/v1/gateways/{id}/heartbeat, contract 1 and 2 (docs/design/discovery-contract.md section 2). A replica sends the contract 2 fields (bound_targets_version, and per Argo CD connector scope_digest, discovery_enabled and discovery_interval_seconds) only after the previous heartbeat response answered contract_version 2. It never carries a URL, a credential, an AppProject name, an Application name or a value derived from snapshot_key.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["replica_id", "gateway_version", "contract_versions", "status", "in_flight"],
+  "properties": {
+    "replica_id": {"$ref": "#/$defs/uuid"},
+    "gateway_version": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^v?[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]{1,32})?$"
+    },
+    "contract_versions": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[0-9]{1,4}$"}
+    },
+    "status": {"enum": ["ok", "degraded", "not_ready", "over_privileged", "shutting_down"]},
+    "in_flight": {"type": "integer", "minimum": 0, "maximum": 100000},
+    "catalog_version": {"$ref": "#/$defs/optionalVersion"},
+    "bound_targets_version": {
+      "$ref": "#/$defs/optionalVersion",
+      "description": "Contract 2. The bound_targets_version of the last heartbeat response this replica applied, or the empty string when it has none. The control plane sends bound_targets only when its current version differs."
+    },
+    "connectors": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {"$ref": "#/$defs/connector"}
+    }
+  },
+  "if": {"required": ["bound_targets_version"]},
+  "then": {
+    "properties": {"contract_versions": {"contains": {"const": "2"}}}
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "localId": {
+      "type": "string",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+    },
+    "optionalVersion": {
+      "type": "string",
+      "pattern": "^(sha256:[0-9a-f]{64})?$"
+    },
+    "connector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["connector_id", "kind", "status"],
+      "properties": {
+        "connector_id": {"$ref": "#/$defs/localId"},
+        "kind": {"enum": ["eso", "rollout", "argocd"]},
+        "status": {"enum": ["ok", "degraded", "unreachable", "unauthorized", "over_privileged"]},
+        "scope_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "description": "Contract 2, Argo CD connectors only, always sent. SHA-256 over the canonical scope input (ADR 0002 C6; discovery-contract.md section 2.2). The control plane compares it with the approved digest."
+        },
+        "discovery_enabled": {
+          "type": "boolean",
+          "description": "Contract 2, Argo CD connectors only, always sent. The local discovery.enabled switch. It is also inside scope_digest, so flipping it is a scope change."
+        },
+        "discovery_interval_seconds": {
+          "type": "integer",
+          "minimum": 60,
+          "maximum": 1800,
+          "description": "Contract 2. The local discovery.interval. Required when discovery_enabled is true, refused otherwise. The control plane grants a lease no sooner than this after the previous grant, and never below 60 seconds."
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"kind": {"const": "argocd"}}},
+          "else": {"not": {"required": ["scope_digest"]}}
+        },
+        {
+          "if": {"required": ["scope_digest"]},
+          "then": {"required": ["discovery_enabled"]}
+        },
+        {
+          "if": {"required": ["discovery_enabled"]},
+          "then": {"required": ["scope_digest"]}
+        },
+        {
+          "if": {
+            "required": ["discovery_enabled"],
+            "properties": {"discovery_enabled": {"const": true}}
+          },
+          "then": {"required": ["discovery_interval_seconds"]},
+          "else": {"not": {"required": ["discovery_interval_seconds"]}}
+        }
+      ]
+    }
+  }
+}

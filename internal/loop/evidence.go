@@ -152,7 +152,6 @@ func (l *Loop) toStage(ref contract.ConnectorRef, tg connectors.Target, obs conn
 		case timedOut || errors.Is(err, context.DeadlineExceeded):
 			code = contract.ErrorConnectorTimeout
 		}
-		s := errorStage(code)
 		if errors.Is(err, connectors.ErrTargetIdentityChanged) {
 			// Whatever the connector put in the observation, the
 			// replacement object is reported only as this typed error:

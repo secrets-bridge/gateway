@@ -12,7 +12,8 @@
 //     self-check, and the application list with projects (exactly one
 //     allowed AppProject) and fields (exactly the fixed projection) both
 //     required.
-//     Release 1 never sends the list. resource-tree, managed-resources,
+//     The list route exists only with discovery on, and only the
+//     discovery lease holder sends it. resource-tree, managed-resources,
 //     manifests and the refresh query are refused in the transport. No
 //     proxy is used.
 //   - Negative probe. The self-check asks can-i for every application

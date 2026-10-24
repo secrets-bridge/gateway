@@ -180,3 +180,32 @@ func zero(b []byte) {
 		b[i] = 0
 	}
 }
+
+// EnvSnapshotKeyForbidden is the environment variable snapshot_key must
+// never come from. The Gateway refuses to start with discovery on when
+// it is set: the key is mounted as a file from the identity Secret, so
+// it never shows up in the process environment, a pod spec or a crash
+// dump of the environment (ADR 0002 section 4.2, contract section 5.1).
+const EnvSnapshotKeyForbidden = "SB_GATEWAY_SNAPSHOT_KEY"
+
+// ErrSnapshotKeyFile: the snapshot_key file is missing, unreadable, has
+// a mode that is too open, or is too large. The text never quotes the
+// file's content.
+var ErrSnapshotKeyFile = errors.New("identity: snapshot_key_invalid: the snapshot_key file is missing, unreadable, too open or too large")
+
+// ReadSnapshotKeyFile reads the snapshot_key file (standard base64 of 32
+// bytes, a key of the Gateway identity Secret mounted as a file) with
+// the same mode rules as the identity file: no "other" bits, no group
+// write or execute. The caller decodes it and zeroes the returned bytes.
+func ReadSnapshotKeyFile(path string) ([]byte, error) {
+	if path == "" {
+		return nil, ErrSnapshotKeyFile
+	}
+	data, err := readCredentialFile(path)
+	if err != nil {
+		zero(data)
+		// The cause names the path and the mode, never the content.
+		return nil, fmt.Errorf("%w: %v", ErrSnapshotKeyFile, err)
+	}
+	return data, nil
+}

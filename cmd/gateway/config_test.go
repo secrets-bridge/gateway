@@ -20,11 +20,12 @@ func TestParseConfig_Defaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := Config{
-		CPEndpoint:    "https://cp.example.com",
-		IdentityFile:  defaultIdentityFile,
-		LocalAddr:     "127.0.0.1:8091",
-		LogLevel:      "info",
-		ShutdownGrace: defaultShutdownGrace,
+		CPEndpoint:      "https://cp.example.com",
+		IdentityFile:    defaultIdentityFile,
+		SnapshotKeyFile: "/etc/secrets-bridge/gateway/snapshot_key",
+		LocalAddr:       "127.0.0.1:8091",
+		LogLevel:        "info",
+		ShutdownGrace:   defaultShutdownGrace,
 
 		HeartbeatInterval: 30 * time.Second,
 		ClaimInterval:     5 * time.Second,

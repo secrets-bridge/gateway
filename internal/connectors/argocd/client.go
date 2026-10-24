@@ -202,8 +202,11 @@ func validBasePath(p string) bool {
 // sources, Helm values, health and operation messages are never decoded:
 // free text can carry anything a controller wrote, including credentials.
 type Application struct {
-	Name                string
-	Namespace           string
+	Name      string
+	Namespace string
+	// UID is metadata.uid. It is the Application's identity: a deleted
+	// and recreated Application keeps its name and gets a new uid.
+	UID                 string
 	Project             string
 	SyncStatus          string // Synced / OutOfSync / Unknown
 	SyncRevision        string
@@ -221,6 +224,7 @@ type rawApplication struct {
 	Metadata struct {
 		Name      string `json:"name"`
 		Namespace string `json:"namespace"`
+		UID       string `json:"uid"`
 	} `json:"metadata"`
 	Spec struct {
 		Project string     `json:"project"`
@@ -266,6 +270,7 @@ func appFromRaw(raw rawApplication) *Application {
 	a := &Application{
 		Name:         raw.Metadata.Name,
 		Namespace:    raw.Metadata.Namespace,
+		UID:          raw.Metadata.UID,
 		Project:      raw.Spec.Project,
 		SyncStatus:   raw.Status.Sync.Status,
 		SyncRevision: raw.Status.Sync.Revision,

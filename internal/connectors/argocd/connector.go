@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/secrets-bridge/gateway/internal/connectors"
@@ -28,6 +29,11 @@ type appClient interface {
 // part of the verification chain (ADR 0001 sections 2.2 and 2.3): the
 // outcome is at most observed, with confidence low, linkage none (set by
 // the loop) and the argocd_health_not_proof caveat.
+//
+// An Application's identity is its metadata.uid, not its name. The
+// connector records the uid of each configured target on the first
+// successful read and refuses any later answer with a different uid
+// (see Observe).
 type Connector struct {
 	name     string
 	client   appClient
@@ -35,6 +41,14 @@ type Connector struct {
 	apps     map[string]AppBinding
 	targets  []connectors.TargetInfo
 	now      func() time.Time
+
+	// pinned maps a target id to the uid recorded on its first
+	// successful read. It lives in process memory only: the Gateway is
+	// stateless, so a restart learns the uid again on the next read.
+	// Pinning the uid on the control-plane side, so that it survives a
+	// restart, is a later step of the ADR 0002 design.
+	mu     sync.Mutex
+	pinned map[string]string
 }
 
 var _ connectors.Connector = (*Connector)(nil)
@@ -76,6 +90,17 @@ func (c *Connector) Check(ctx context.Context) error {
 // failures become an error observation with a schema error code and a
 // nil error, so the control plane learns why and schedules another
 // pass. The error never carries connector text.
+//
+// The first successful read of a target records the Application's uid.
+// An answer with no valid uid is an internal error. A later answer with
+// a different uid means the configured Application was deleted and
+// another one now has its name: that object is not the configured
+// target, so Observe answers an error observation with
+// resource_not_found (the configured object no longer exists; the closed
+// error code set has no more specific code) and returns
+// connectors.ErrTargetIdentityChanged. It keeps doing so until the
+// integrator confirms the new object by restarting the Gateway, which
+// records the uid again.
 func (c *Connector) Observe(ctx context.Context, target connectors.Target) (connectors.Observation, error) {
 	obs := connectors.Observation{
 		Connector: c.name,
@@ -94,15 +119,38 @@ func (c *Connector) Observe(ctx context.Context, target connectors.Target) (conn
 	}
 	app, err := c.client.GetApplication(ctx, binding.Name, binding.AppNamespace)
 	obs.ObservedAt = c.now().UTC()
-	if err == nil && !sameApplication(app, binding) {
-		obs.Outcome = connectors.OutcomeError
-		obs.Evidence = contract.StageEvidence{ErrorCode: contract.ErrorInternal}
-		return obs, nil
+	if err == nil {
+		if !sameApplication(app, binding) || !contract.ValidUUID(app.UID) {
+			obs.Outcome = connectors.OutcomeError
+			obs.Evidence = contract.StageEvidence{ErrorCode: contract.ErrorInternal}
+			return obs, nil
+		}
+		if !c.pin(target.ID, app.UID) {
+			obs.Outcome = connectors.OutcomeError
+			obs.Evidence = contract.StageEvidence{ErrorCode: contract.ErrorResourceNotFound}
+			return obs, fmt.Errorf("argocd: target %q: %w", target.ID, connectors.ErrTargetIdentityChanged)
+		}
 	}
 	d := Decide(app, err, c.projects, target.NotBefore)
 	obs.Outcome = d.Outcome
 	obs.Evidence = d.Evidence
 	return obs, nil
+}
+
+// pin records uid for target id on its first successful read and
+// reports whether uid is the recorded one.
+func (c *Connector) pin(id, uid string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pinned == nil {
+		c.pinned = make(map[string]string, len(c.apps))
+	}
+	got, ok := c.pinned[id]
+	if !ok {
+		c.pinned[id] = uid
+		return true
+	}
+	return got == uid
 }
 
 // sameApplication guards against an ArgoCD answer for a different
@@ -146,8 +194,9 @@ type Decision struct {
 //     non-terminal: 404 is resource_not_found, 401 or a missing token
 //     connector_unauthorized, 403 connector_forbidden.
 //
-// Every non-error decision carries the resource identity, the facts,
-// and the argocd_health_not_proof caveat.
+// Every non-error decision carries the resource identity (with the uid
+// when it is a valid uuid), the facts, and the argocd_health_not_proof
+// caveat.
 func Decide(app *Application, fetchErr error, allowedProjects map[string]struct{}, notBefore time.Time) Decision {
 	if fetchErr != nil {
 		return errorDecision(errorCodeFor(fetchErr))
@@ -160,6 +209,9 @@ func Decide(app *Application, fetchErr error, allowedProjects map[string]struct{
 		Kind:       applicationKind,
 		Namespace:  app.Namespace,
 		Name:       app.Name,
+	}
+	if contract.ValidUUID(app.UID) {
+		res.UID = app.UID
 	}
 	caveats := []contract.Caveat{contract.CaveatArgoCDHealthNotProof}
 	if _, ok := allowedProjects[app.Project]; !ok {

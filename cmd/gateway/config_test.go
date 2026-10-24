@@ -33,6 +33,8 @@ func TestParseConfig_Defaults(t *testing.T) {
 		LeaseMargin:       3 * time.Second,
 		PassTimeout:       30 * time.Second,
 		UnreachableAfter:  2 * time.Minute,
+
+		PrivilegeRecheckInterval: 5 * time.Minute,
 	}
 	if cfg != want {
 		t.Fatalf("cfg = %+v\nwant  %+v", cfg, want)
@@ -125,5 +127,49 @@ func TestParseConfig_R2Switch(t *testing.T) {
 	}
 	if cfg, err = parseConfig([]string{"--enable-r2-connectors=false"}, envMap(on), io.Discard); err != nil || cfg.EnableR2Connectors {
 		t.Fatalf("flag override: enabled=%v err=%v, want off", cfg.EnableR2Connectors, err)
+	}
+}
+
+// The privilege recheck interval is configurable by env or flag, the
+// default stays 5m, and a value under 1m refuses the start.
+func TestParseConfig_PrivilegeRecheckInterval(t *testing.T) {
+	base := map[string]string{"SB_CP_ENDPOINT": "https://cp.example.com"}
+	with := func(kv ...string) func(string) (string, bool) {
+		m := map[string]string{}
+		for k, v := range base {
+			m[k] = v
+		}
+		for i := 0; i+1 < len(kv); i += 2 {
+			m[kv[i]] = kv[i+1]
+		}
+		return envMap(m)
+	}
+	cfg, err := parseConfig(nil, with(), io.Discard)
+	if err != nil || cfg.PrivilegeRecheckInterval != 5*time.Minute {
+		t.Fatalf("default: %v err %v", cfg.PrivilegeRecheckInterval, err)
+	}
+	cfg, err = parseConfig(nil, with("SB_GATEWAY_PRIVILEGE_RECHECK_INTERVAL", "2m"), io.Discard)
+	if err != nil || cfg.PrivilegeRecheckInterval != 2*time.Minute {
+		t.Fatalf("env: %v err %v", cfg.PrivilegeRecheckInterval, err)
+	}
+	cfg, err = parseConfig([]string{"--privilege-recheck-interval", "10m"}, with("SB_GATEWAY_PRIVILEGE_RECHECK_INTERVAL", "2m"), io.Discard)
+	if err != nil || cfg.PrivilegeRecheckInterval != 10*time.Minute {
+		t.Fatalf("flag: %v err %v", cfg.PrivilegeRecheckInterval, err)
+	}
+	cfg, err = parseConfig(nil, with("SB_GATEWAY_PRIVILEGE_RECHECK_INTERVAL", "1m"), io.Discard)
+	if err != nil || cfg.PrivilegeRecheckInterval != time.Minute {
+		t.Fatalf("floor: %v err %v", cfg.PrivilegeRecheckInterval, err)
+	}
+	for _, v := range []string{"59s", "30s", "0s", "-5m"} {
+		if _, err := parseConfig(nil, with("SB_GATEWAY_PRIVILEGE_RECHECK_INTERVAL", v), io.Discard); err == nil ||
+			!strings.Contains(err.Error(), "SB_GATEWAY_PRIVILEGE_RECHECK_INTERVAL must be at least 1m0s") {
+			t.Fatalf("%s: err = %v", v, err)
+		}
+		if _, err := parseConfig([]string{"--privilege-recheck-interval", v}, with(), io.Discard); err == nil {
+			t.Fatalf("flag %s accepted", v)
+		}
+	}
+	if _, err := parseConfig(nil, with("SB_GATEWAY_PRIVILEGE_RECHECK_INTERVAL", "often"), io.Discard); err == nil {
+		t.Fatal("malformed value accepted")
 	}
 }

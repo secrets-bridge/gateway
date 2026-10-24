@@ -47,7 +47,7 @@ func bootedRegistry(t *testing.T, g *fakeClient) (*connectors.Registry, *Connect
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Check(context.Background(), time.Second); err != nil || !r.Verified() {
+	if err := checkUnread(r, g); err != nil || !r.Verified() {
 		t.Fatalf("boot: err = %v verified = %v", err, r.Verified())
 	}
 	return r, c
@@ -236,7 +236,7 @@ func TestTargetProbe_ProjectChange(t *testing.T) {
 	c := newFakeConnector(g)
 	c.projects = map[string]struct{}{"tenant-a": {}, "tenant-b": {}}
 	r, _ := connectors.NewRegistry(c)
-	if err := r.Check(ctx, time.Second); err != nil {
+	if err := checkUnread(r, g); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := r.Observe(ctx, "argocd-main", argoTarget("payments")); err != nil {

@@ -136,6 +136,16 @@ func TargetProbes(project string, b AppBinding) []Probe {
 	return out
 }
 
+// ReadProbe is the read probe (ADR 0002 condition C2): may the token get
+// every Application in every AppProject? Its object is the literal
+// "*/*", sent as two "*" segments and admitted only as this exact
+// route. A yes is not over-privilege (the token only reads), but it
+// means the token can read Applications outside the allowlist, so the
+// connector reports degraded (connectors.ErrReadBeyondScope). The local
+// allowlist and the projects rule of the list still bound what the
+// Gateway reads.
+var ReadProbe = Probe{Resource: ResourceApplications, Action: "get", Object: "*/*"}
+
 // Errors returned by the client. None of them carries the base URL, the
 // request path or the token, so they are safe to classify and log.
 var (
@@ -156,8 +166,8 @@ var (
 	ErrInvalidName = errors.New("argocd: invalid application name")
 	// ErrProjectNotAllowed: a list request named an AppProject outside
 	// the local allowlist, or a can-i question is not one of the
-	// ProjectProbes of an allowed AppProject or the TargetProbes of a
-	// configured target in one. Nothing is sent.
+	// ProjectProbes of an allowed AppProject, the TargetProbes of a
+	// configured target in one, or ReadProbe. Nothing is sent.
 	ErrProjectNotAllowed = errors.New("argocd: AppProject or can-i question is not in the local allowlist")
 	// ErrTooManyApplications: a list response held more than
 	// MaxListApplications items.
@@ -192,6 +202,13 @@ type Config struct {
 	// can-i questions are admitted for each of them in each allowed
 	// AppProject, since the AppProject is known only after a read.
 	Applications []AppBinding
+
+	// discoveryList admits the application list route
+	// (GET <base>/api/v1/applications with projects and fields). ADR
+	// 0002 condition C1 admits it only while discovery is on, and there
+	// is no discovery setting yet, so nothing outside this package's
+	// tests sets it and the live policy has no list route.
+	discoveryList bool
 }
 
 // Client is the read-only ArgoCD HTTP client.
@@ -202,21 +219,25 @@ type Config struct {
 //   - <base>/api/v1/applications/<name>, whose only allowed query key is
 //     appNamespace;
 //   - <base>/api/v1/session/userinfo for the self-check, with no query;
-//   - <base>/api/v1/applications with projects required (exactly one
-//     value, in the local AppProject allowlist) and fields required
-//     (exactly one value, ListFields), and no other key;
 //   - <base>/api/v1/account/can-i/<resource>/<action>/<object> for each
-//     of the ProjectProbes of each allowed AppProject and the
-//     TargetProbes of each configured target in each allowed AppProject,
-//     with no query, for the negative probe.
+//     of the ProjectProbes of each allowed AppProject, the TargetProbes
+//     of each configured target in each allowed AppProject and
+//     ReadProbe, with no query, for the negative and read probes.
+//
+// The application list, <base>/api/v1/applications with projects
+// required (exactly one value, in the local AppProject allowlist) and
+// fields required (exactly one value, ListFields), is admitted only
+// while discovery is on (ADR 0002 condition C1). There is no discovery
+// setting yet, so a client built from settings has no list route.
 //
 // Every other method, path and query key is refused before the request
 // leaves the process. resource-tree, managed-resources and manifests are
 // refused because the last two can return rendered resource bodies. A
 // query key such as refresh is refused everywhere because GET
 // /api/v1/applications/<name>?refresh=hard makes ArgoCD patch the
-// Application. The list without projects would read every application
-// the token sees, so it is refused.
+// Application. The list is refused unless discovery is on, and without
+// projects it would read every application the token sees, so it is
+// refused then too.
 //
 // The transport is readonly.BaseTransport, so proxy environment
 // variables are ignored and the bearer token never goes to a proxy.
@@ -228,6 +249,8 @@ type Client struct {
 	projects map[string]struct{}
 	// canI holds the path of every admitted can-i question.
 	canI map[string]struct{}
+	// list is set when the policy admits the application list.
+	list bool
 }
 
 // Paths under the base URL. Only these are in the transport policy.
@@ -276,7 +299,7 @@ func New(cfg Config) (*Client, error) {
 	// Redirects are refused by readonly.NewClient: following one would
 	// re-send the bearer token to wherever Location points, including an
 	// http:// downgrade or another host. do() reports ErrRedirectRefused.
-	hc, err := readonly.NewClient(next, policyFor(base, projects, probes), timeout)
+	hc, err := readonly.NewClient(next, policyFor(base, projects, probes, cfg.discoveryList), timeout)
 	if err != nil {
 		return nil, errors.New("argocd: base URL path cannot form a request allowlist")
 	}
@@ -284,12 +307,13 @@ func New(cfg Config) (*Client, error) {
 	for _, p := range probes {
 		canI[canIPath(base, p)] = struct{}{}
 	}
-	return &Client{base: base, token: cfg.Token, hc: hc, tlsCfg: next.TLSClientConfig, projects: projects, canI: canI}, nil
+	return &Client{base: base, token: cfg.Token, hc: hc, tlsCfg: next.TLSClientConfig, projects: projects, canI: canI, list: cfg.discoveryList}, nil
 }
 
 // allowedProbes is every can-i question the client may send: the
-// ProjectProbes of each allowed AppProject and the TargetProbes of each
-// configured application in each allowed AppProject, without duplicates.
+// ProjectProbes of each allowed AppProject, the TargetProbes of each
+// configured application in each allowed AppProject and, with at least
+// one allowed AppProject, ReadProbe, without duplicates.
 func allowedProbes(projects map[string]struct{}, apps []AppBinding) []Probe {
 	seen := map[Probe]bool{}
 	var out []Probe
@@ -307,26 +331,32 @@ func allowedProbes(projects map[string]struct{}, apps []AppBinding) []Probe {
 			add(TargetProbes(p, b))
 		}
 	}
+	if len(projects) > 0 {
+		add([]Probe{ReadProbe})
+	}
 	return out
 }
 
 // policyFor is the read-only transport policy for a base URL: pinned to
 // its scheme and host, with GET allowed to the single-application path
-// (query key appNamespace) and, as exact routes, userinfo, the
-// application list (projects and fields both required, one value each,
-// judged by value) and one can-i path per admitted question. Without
-// projects there is no list and no can-i route.
-func policyFor(base *url.URL, projects map[string]struct{}, probes []Probe) readonly.Policy {
+// (query key appNamespace) and, as exact routes, userinfo, one can-i
+// path per admitted question and, only when list is set (discovery on,
+// ADR 0002 condition C1), the application list (projects and fields
+// both required, one value each, judged by value). Without projects
+// there is no list and no can-i route.
+func policyFor(base *url.URL, projects map[string]struct{}, probes []Probe, list bool) readonly.Policy {
 	routes := []readonly.Route{{Path: base.Path + userInfoPath}}
 	if len(projects) > 0 {
-		allowed := func(v string) bool { _, ok := projects[v]; return ok }
-		routes = append(routes, readonly.Route{
-			Path: base.Path + applicationsPath,
-			Query: []readonly.QueryRule{
-				{Key: ProjectsQueryKey, Required: true, Allow: allowed},
-				{Key: FieldsQueryKey, Required: true, Allow: func(v string) bool { return v == ListFields }},
-			},
-		})
+		if list {
+			allowed := func(v string) bool { _, ok := projects[v]; return ok }
+			routes = append(routes, readonly.Route{
+				Path: base.Path + applicationsPath,
+				Query: []readonly.QueryRule{
+					{Key: ProjectsQueryKey, Required: true, Allow: allowed},
+					{Key: FieldsQueryKey, Required: true, Allow: func(v string) bool { return v == ListFields }},
+				},
+			})
+		}
 		for _, p := range probes {
 			// The exec resource name is a plain path parameter here and
 			// opens no stream; only this exact route may carry it.
@@ -542,7 +572,9 @@ type rawSummary struct {
 // ListApplications lists the Applications of one allowed AppProject:
 // GET <base>/api/v1/applications?projects=<project>&fields=ListFields.
 // It is not called by Release 1; it exists for discovery (ADR 0002) and
-// its tests.
+// its tests. A client without the list route (every client built from
+// settings until discovery exists) refuses it with ErrRequestRefused
+// and sends nothing.
 //
 // The project must be in the local allowlist, or nothing is sent. The
 // response is read up to MaxListResponseBytes and decoded item by item
@@ -551,6 +583,9 @@ type rawSummary struct {
 // the requested project and its name, namespace and uid are valid, so
 // the result does not rely on the server's filter or projection.
 func (c *Client) ListApplications(ctx context.Context, project string) ([]AppSummary, error) {
+	if !c.list {
+		return nil, ErrRequestRefused
+	}
 	if _, ok := c.projects[project]; !ok {
 		return nil, ErrProjectNotAllowed
 	}
@@ -651,8 +686,8 @@ func summaryFrom(raw rawSummary, project string) (AppSummary, bool) {
 // <base>/api/v1/account/can-i/<resource>/<action>/<object>. The answer
 // is true for "yes" and false for "no"; anything else is ErrBadResponse,
 // and HTTP 400 is ErrBadRequest. The question must be one of the
-// ProjectProbes of an allowed AppProject or the TargetProbes of a
-// configured application in one, or nothing is sent.
+// ProjectProbes of an allowed AppProject, the TargetProbes of a
+// configured application in one, or ReadProbe, or nothing is sent.
 func (c *Client) CanI(ctx context.Context, p Probe) (bool, error) {
 	path := canIPath(c.base, p)
 	if _, ok := c.canI[path]; !ok {

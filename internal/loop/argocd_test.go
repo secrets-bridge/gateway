@@ -29,6 +29,8 @@ type argoFixture struct {
 	// recreateAfterFirstRead answers every read after the first with
 	// the same Application under a new uid.
 	recreateAfterFirstRead atomic.Bool
+	// readYes answers yes to the read probe (applications get */*).
+	readYes atomic.Bool
 }
 
 func newArgoFixture(t *testing.T) *argoFixture {
@@ -37,6 +39,10 @@ func newArgoFixture(t *testing.T) *argoFixture {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if strings.HasPrefix(r.URL.Path, "/api/v1/account/can-i/") {
+			if f.readYes.Load() && r.URL.EscapedPath() == "/api/v1/account/can-i/applications/get/*/*" {
+				_, _ = w.Write([]byte(`{"value":"yes"}`))
+				return
+			}
 			_, _ = w.Write([]byte(`{"value":"no"}`))
 			return
 		}

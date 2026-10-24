@@ -456,28 +456,13 @@ func (c *Client) Heartbeat(ctx context.Context, req HeartbeatRequest) (*Heartbea
 	return &out, nil
 }
 
-// CatalogTarget is one locally configured target, ids and display names
-// only.
-type CatalogTarget struct {
-	TargetID                string `json:"target_id"`
-	Namespace               string `json:"namespace,omitempty"`
-	Name                    string `json:"name,omitempty"`
-	RefreshIntervalSeconds  *int   `json:"refresh_interval_seconds,omitempty"`
-	ProgressDeadlineSeconds *int   `json:"progress_deadline_seconds,omitempty"`
-}
-
-// CatalogConnector is one locally configured connector. No URLs and no
-// credentials.
-type CatalogConnector struct {
-	ConnectorID string          `json:"connector_id"`
-	Kind        string          `json:"kind"`
-	Targets     []CatalogTarget `json:"targets"`
-}
-
-// Catalog is the E3 body.
-type Catalog struct {
-	Connectors []CatalogConnector `json:"connectors"`
-}
+// CatalogTarget, CatalogConnector and Catalog are the E3 body. They are
+// the closed contract types (schemas/gateway-catalog.schema.json).
+type (
+	CatalogTarget    = contract.CatalogTarget
+	CatalogConnector = contract.CatalogConnector
+	Catalog          = contract.Catalog
+)
 
 // CatalogResponse is the E3 200 body.
 type CatalogResponse struct {
@@ -491,6 +476,12 @@ type CatalogResponse struct {
 func (c *Client) PutCatalog(ctx context.Context, cat Catalog) (*CatalogResponse, error) {
 	if cat.Connectors == nil {
 		cat.Connectors = []CatalogConnector{}
+	}
+	// The contract is checked before anything is sent: an identity that
+	// is not a digest (a raw uid, say) or one on a Kubernetes connector
+	// never leaves the process.
+	if err := cat.Validate(); err != nil {
+		return nil, fmt.Errorf("client: catalog: %w: %w", ErrInvalidArgument, err)
 	}
 	var out CatalogResponse
 	if _, err := c.postJSON(ctx, call{op: "catalog", method: http.MethodPut, path: c.gatewayPath("catalog"), maxBody: maxLargeRequest, auth: true},

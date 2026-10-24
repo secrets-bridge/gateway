@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/secrets-bridge/gateway/internal/connectors"
@@ -54,6 +55,10 @@ type AppBinding struct {
 	// the boundary; evidence carries a digest of it.
 	UID string `json:"uid,omitempty"`
 }
+
+// ReservedTargetIDPrefix starts every discovered target id (ADR 0002
+// condition C3). A static target id may not start with it.
+const ReservedTargetIDPrefix = "d-"
 
 // maxCAFileSize caps the CA bundle.
 const maxCAFileSize = 1 << 20
@@ -148,6 +153,11 @@ func build(name string, s Settings, opts Options) (*Connector, error) {
 	for _, a := range s.Applications {
 		if !connectors.ValidName(a.ID) {
 			return nil, &connectors.SettingsError{Field: "applications.id", Reason: "must be a DNS label"}
+		}
+		if strings.HasPrefix(a.ID, ReservedTargetIDPrefix) {
+			// ADR 0002 condition C3: discovered target ids are d- and a
+			// digest, so a static id in that space could collide with one.
+			return nil, &connectors.SettingsError{Field: "applications.id", Reason: "must not start with \"d-\", which is reserved for discovered targets"}
 		}
 		if _, dup := apps[a.ID]; dup {
 			return nil, &connectors.SettingsError{Field: "applications.id", Reason: "is duplicated"}

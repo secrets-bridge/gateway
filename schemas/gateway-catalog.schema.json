@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://secrets-bridge.io/schemas/gateway/v1/gateway-catalog.schema.json",
+  "title": "GatewayCatalog",
+  "description": "The E3 body of PUT /api/v1/gateways/{id}/catalog: the connectors and targets bound in the Gateway's local configuration. Full replace. It carries ids, kinds, display names, intervals and, for Argo CD targets, an identity digest. It never carries a URL, credential, raw uid or secret value.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["connectors"],
+  "properties": {
+    "connectors": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {"$ref": "#/$defs/connector"}
+    }
+  },
+  "$defs": {
+    "localId": {
+      "type": "string",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$",
+      "description": "Lowercase DNS label. It cannot hold a URL, path, namespace separator or credential."
+    },
+    "interval": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1000000000
+    },
+    "identityDigest": {
+      "type": "string",
+      "pattern": "^d-[a-z2-7]{26}$",
+      "description": "Scoped identity digest (ADR 0002 condition C3): d- and the first 130 bits of SHA-256(\"sb-argocd-target/v1\" || uint32_be(len(connector_id)) || connector_id || metadata.uid) in lower-case base32. The same value as the evidence resource.identity_digest. One-way and scoped to the connector; the raw uid is never sent."
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_id"],
+      "properties": {
+        "target_id": {"$ref": "#/$defs/localId"},
+        "namespace": {
+          "$ref": "#/$defs/localId",
+          "description": "Display only (ADR 0001 section 11)."
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 253,
+          "pattern": "^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$",
+          "description": "Display only (ADR 0001 section 11)."
+        },
+        "refresh_interval_seconds": {"$ref": "#/$defs/interval"},
+        "progress_deadline_seconds": {"$ref": "#/$defs/interval"},
+        "identity": {
+          "$ref": "#/$defs/identityDigest",
+          "description": "Argo CD targets only. Present once the Gateway knows the Application's uid: from settings at startup, or after the first verified read (the uid check and the per-target can-i probe passed). The control plane pins the first identity it accepts for a target and treats a different one as identity_changed."
+        }
+      }
+    },
+    "connector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["connector_id", "kind", "targets"],
+      "properties": {
+        "connector_id": {"$ref": "#/$defs/localId"},
+        "kind": {"enum": ["eso", "rollout", "argocd"]},
+        "targets": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {"$ref": "#/$defs/target"}
+        }
+      },
+      "if": {
+        "properties": {"kind": {"const": "argocd"}}
+      },
+      "else": {
+        "properties": {
+          "targets": {
+            "items": {"not": {"required": ["identity"]}}
+          }
+        }
+      }
+    }
+  }
+}

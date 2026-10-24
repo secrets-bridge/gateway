@@ -35,6 +35,14 @@ type appClient interface {
 // An Application's identity is its metadata.uid, not its name.
 // A settings uid is enforced from the first read across replicas and
 // restarts. Without one, each process pins its first successful read.
+//
+// The catalog carries the scoped identity digest of each target whose
+// uid is known (ADR 0002 condition C3): from a settings uid at once,
+// otherwise once a verified read has pinned the uid and the target's
+// per-target probe has passed. The first Check after the project probe
+// passes makes that read for every target without a settings uid (the
+// startup read), so the control plane can pin the identity before the
+// first task.
 type Connector struct {
 	name     string
 	client   appClient
@@ -55,6 +63,13 @@ type Connector struct {
 	probed map[string]string
 	proven map[string]bool
 	over   bool
+	// known maps a target without a settings uid to the identity digest
+	// of its pinned uid, set once a verified read pinned it and its
+	// per-target probe passed. It never changes after that, since the
+	// pin does not.
+	known map[string]string
+	// startupRead is set once the startup read has been tried.
+	startupRead bool
 }
 
 var _ connectors.Connector = (*Connector)(nil)
@@ -67,9 +82,26 @@ func (c *Connector) Kind() connectors.Kind { return connectors.KindArgoCD }
 
 // Targets implements connectors.Connector. Namespace and Name are the
 // app namespace (when set) and the Application name, for admin display
-// in the catalog only.
+// in the catalog only. Identity is the target's scoped identity digest
+// once its uid is known, and empty before; it is never the raw uid.
 func (c *Connector) Targets() []connectors.TargetInfo {
-	return append([]connectors.TargetInfo(nil), c.targets...)
+	out := append([]connectors.TargetInfo(nil), c.targets...)
+	for i := range out {
+		out[i].Identity = c.identityOf(out[i].ID)
+	}
+	return out
+}
+
+// identityOf is the identity digest the catalog carries for target id:
+// the digest of the settings uid, or of the pinned uid once a verified
+// read and the per-target probe passed, or "" while unknown.
+func (c *Connector) identityOf(id string) string {
+	if b, ok := c.apps[id]; ok && b.UID != "" {
+		return contract.TargetIdentityDigest(c.name, b.UID)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.known[id]
 }
 
 // Check implements connectors.Connector (runtime design 3.5). It runs at
@@ -80,13 +112,27 @@ func (c *Connector) Targets() []connectors.TargetInfo {
 //     allowed AppProject (application actions, exec, logs and
 //     applicationsets on <project>/*, projects update and delete on
 //     <project>).
-//  3. The negative target probe: every TargetProbes question for each
+//  3. The read probe: ReadProbe (applications get on */*). A yes means
+//     the token can read Applications outside the allowlist. It is not
+//     a refusal: Check goes on, and returns connectors.ErrReadBeyondScope
+//     if nothing else failed, so the connector reports degraded while
+//     staying verified. A failed read probe fails closed like the
+//     others.
+//  4. The startup read, on the first Check only: one GET of each
+//     static target without a settings uid, the same request as an
+//     observation. A verified read (the Application named, a valid
+//     uid, now pinned, in an allowed AppProject) records the target's
+//     AppProject so step 5 probes it, and once that probe passes the
+//     catalog carries the target's identity. A read that fails or is
+//     not verified changes nothing and is not an error: the target is
+//     read again on its first task.
+//  5. The negative target probe: every TargetProbes question for each
 //     static target whose AppProject a verified read has told
 //     (<project>/<app>, and <project>/<app-namespace>/<app> for an
 //     Application outside the Argo CD namespace). A target not read yet
 //     is probed by Observe before its first observation is returned.
 //
-// Any yes wraps connectors.ErrOverPrivileged: the Gateway refuses to
+// Any yes in steps 2 or 5 wraps connectors.ErrOverPrivileged: the Gateway refuses to
 // start, and at runtime turns not ready and stops, the same as the
 // Kubernetes over-privilege rule. Once seen, it is kept for the life of
 // the process.
@@ -118,6 +164,12 @@ func (c *Connector) Check(ctx context.Context) error {
 			return err
 		}
 	}
+	wide, err := c.client.CanI(ctx, ReadProbe)
+	if err != nil {
+		return fmt.Errorf("argocd: can-i read probe for %s %s failed: %w: %w", ReadProbe.Resource, ReadProbe.Action,
+			&connectors.CheckFailure{Check: ReadProbe.Resource + " " + ReadProbe.Action, Kind: failureKind(err)}, connectors.ErrPrivilegeUnproven)
+	}
+	c.readAtStartup(ctx)
 	c.mu.Lock()
 	ids := make([]string, 0, len(c.probed))
 	for id := range c.probed {
@@ -130,7 +182,40 @@ func (c *Connector) Check(ctx context.Context) error {
 			return err
 		}
 	}
+	if wide {
+		return fmt.Errorf("argocd: the token may get applications outside the allowed AppProjects: %w", connectors.ErrReadBeyondScope)
+	}
 	return nil
+}
+
+// readAtStartup is step 4 of Check. It runs once per process, on the
+// first Check that gets this far; a boot Check that fails before it
+// stops the Gateway anyway.
+func (c *Connector) readAtStartup(ctx context.Context) {
+	c.mu.Lock()
+	done := c.startupRead
+	c.startupRead = true
+	c.mu.Unlock()
+	if done {
+		return
+	}
+	ids := make([]string, 0, len(c.apps))
+	for id, b := range c.apps {
+		if b.UID == "" {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		b := c.apps[id]
+		app, err := c.client.GetApplication(ctx, b.Name, b.AppNamespace)
+		if err != nil || !sameApplication(app, b) || !contract.ValidUUID(app.UID) || !c.pin(b, app.UID) {
+			continue
+		}
+		if _, ok := c.projects[app.Project]; ok {
+			c.recordProject(id, app.Project)
+		}
+	}
 }
 
 // ask sends each probe in order. It returns at the first yes
@@ -146,13 +231,15 @@ func (c *Connector) ask(ctx context.Context, probes []Probe, scope string) error
 				// enforced as sync, already asked and answered no.
 				continue
 			}
-			return fmt.Errorf("argocd: can-i probe for %s %s on %s failed: %w", p.Resource, p.Action, scope, connectors.ErrPrivilegeUnproven)
+			return fmt.Errorf("argocd: can-i probe for %s %s on %s failed: %w: %w", p.Resource, p.Action, scope,
+				&connectors.CheckFailure{Check: p.Resource + " " + p.Action, Kind: failureKind(err)}, connectors.ErrPrivilegeUnproven)
 		}
 		if yes {
 			c.mu.Lock()
 			c.over = true
 			c.mu.Unlock()
-			return fmt.Errorf("argocd: the token may %s %s on %s: %w", p.Action, p.Resource, scope, connectors.ErrOverPrivileged)
+			return fmt.Errorf("argocd: the token may %s %s on %s: %w: %w", p.Action, p.Resource, scope,
+				&connectors.CheckFailure{Check: p.Resource + " " + p.Action, Kind: connectors.FailureGrantedYes}, connectors.ErrOverPrivileged)
 		}
 	}
 	return nil
@@ -181,6 +268,14 @@ func (c *Connector) proveTarget(ctx context.Context, id string, force bool) erro
 	if c.probed[id] == project {
 		c.proven[id] = err == nil
 	}
+	if uid, pinned := c.pinned[id]; err == nil && pinned && c.known[id] == "" {
+		// The read that recorded project pinned uid, and the probe
+		// passed: the identity is known and goes into the catalog.
+		if c.known == nil {
+			c.known = make(map[string]string, len(c.apps))
+		}
+		c.known[id] = contract.TargetIdentityDigest(c.name, uid)
+	}
 	c.mu.Unlock()
 	return err
 }
@@ -203,18 +298,45 @@ func (c *Connector) recordProject(id, project string) {
 // checkToken is step 1 of Check.
 func (c *Connector) checkToken(ctx context.Context) error {
 	info, err := c.client.GetUserInfo(ctx)
+	failed := func(kind string) *connectors.CheckFailure {
+		return &connectors.CheckFailure{Check: "session userinfo", Kind: kind}
+	}
 	switch {
 	case errors.Is(err, ErrUnauthorized), errors.Is(err, ErrForbidden), errors.Is(err, ErrNoToken):
-		return fmt.Errorf("argocd: %w", connectors.ErrCheckUnauthorized)
+		return fmt.Errorf("argocd: %w: %w", failed(failureKind(err)), connectors.ErrCheckUnauthorized)
 	case errors.Is(err, ErrUnreachable), errors.Is(err, ErrTimeout), errors.Is(err, ErrTLS),
 		errors.Is(err, ErrRedirectRefused), errors.Is(err, ErrRateLimited):
-		return fmt.Errorf("argocd: %w", connectors.ErrCheckUnreachable)
+		return fmt.Errorf("argocd: %w: %w", failed(failureKind(err)), connectors.ErrCheckUnreachable)
 	case err != nil:
-		return errors.New("argocd: self-check failed")
+		return fmt.Errorf("argocd: self-check failed: %w", failed(failureKind(err)))
 	case !info.LoggedIn:
-		return fmt.Errorf("argocd: token is not logged in: %w", connectors.ErrCheckUnauthorized)
+		return fmt.Errorf("argocd: token is not logged in: %w: %w", failed(connectors.FailureNotLoggedIn), connectors.ErrCheckUnauthorized)
 	}
 	return nil
+}
+
+// failureKind maps a client error to a fixed CheckFailure kind. Only
+// the kind is kept; the client errors carry no URL or token anyway.
+func failureKind(err error) string {
+	switch {
+	case errors.Is(err, ErrUnauthorized), errors.Is(err, ErrNoToken):
+		return connectors.FailureUnauthorized
+	case errors.Is(err, ErrForbidden):
+		return connectors.FailureForbidden
+	case errors.Is(err, ErrTimeout):
+		return connectors.FailureTimeout
+	case errors.Is(err, ErrTLS):
+		return connectors.FailureTLS
+	case errors.Is(err, ErrUnreachable), errors.Is(err, ErrRedirectRefused), errors.Is(err, ErrRateLimited):
+		return connectors.FailureUnreachable
+	case errors.Is(err, ErrBadResponse), errors.Is(err, ErrResponseTooLarge):
+		return connectors.FailureMalformed
+	case errors.Is(err, ErrBadRequest):
+		return connectors.FailureBadRequest
+	case errors.Is(err, ErrRequestRefused), errors.Is(err, ErrProjectNotAllowed):
+		return connectors.FailureRefused
+	}
+	return connectors.FailureOther
 }
 
 // Observe reads one Application and maps it to an observation. Known

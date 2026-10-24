@@ -20,6 +20,7 @@ package loop
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -78,6 +79,11 @@ const (
 	// DefaultPrivilegeRecheckInterval is how often every connector's
 	// self-check, including the over-privilege check, is run again.
 	DefaultPrivilegeRecheckInterval = 5 * time.Minute
+	// MinPrivilegeRecheckInterval is the shortest recheck interval an
+	// operator may set (ADR 0002 decision D4). The loop itself accepts
+	// shorter values so tests can run fast; the configuration refuses
+	// them.
+	MinPrivilegeRecheckInterval = time.Minute
 
 	maxBackoff          = 60 * time.Second
 	minHeartbeatSeconds = 5
@@ -165,6 +171,13 @@ type Loop struct {
 	catalogVersion  atomic.Value // string, as the control plane returned it
 	catalogAccepted atomic.Bool
 	heartbeatFresh  atomic.Bool
+	// sentCatalog is the JSON of the last catalog the control plane
+	// accepted. When the current catalog differs (an Argo CD target's
+	// identity became known), the next heartbeat uploads it again.
+	sentCatalog atomic.Value // string
+	// wideWarned holds the connectors whose read-beyond-scope warning is
+	// logged; heartbeat goroutine only.
+	wideWarned map[string]bool
 }
 
 // errHalted: a call was not sent because the control plane has refused
@@ -225,13 +238,14 @@ func New(cfg Config) (*Loop, error) {
 		cfg.Jitter = uniformJitter
 	}
 	return &Loop{
-		cfg:       cfg,
-		log:       cfg.Logger,
-		m:         cfg.Metrics,
-		sem:       make(chan struct{}, cfg.Concurrency),
-		fatal:     make(chan error, 1),
-		halted:    make(chan struct{}),
-		claimGate: make(chan struct{}),
+		cfg:        cfg,
+		log:        cfg.Logger,
+		m:          cfg.Metrics,
+		sem:        make(chan struct{}, cfg.Concurrency),
+		fatal:      make(chan error, 1),
+		halted:     make(chan struct{}),
+		claimGate:  make(chan struct{}),
+		wideWarned: map[string]bool{},
 	}, nil
 }
 
@@ -397,7 +411,8 @@ func (l *Loop) heartbeatRequest(status string) client.HeartbeatRequest {
 }
 
 // connectorsHealthy reports whether every connector's last self-check
-// passed.
+// passed with status ok. It decides the replica status in the
+// heartbeat.
 func (l *Loop) connectorsHealthy() bool {
 	for _, h := range l.cfg.Connectors.Health() {
 		if h.Status != connectors.HealthOK {
@@ -407,11 +422,45 @@ func (l *Loop) connectorsHealthy() bool {
 	return true
 }
 
+// connectorsReady reports whether every connector's last self-check
+// passed. A connector degraded only because its credential can read
+// beyond the local allowlist passed: it is reported degraded and stays
+// ready.
+func (l *Loop) connectorsReady() bool {
+	for _, h := range l.cfg.Connectors.Health() {
+		if h.Status != connectors.HealthOK && (h.Status != connectors.HealthDegraded || !h.ReadBeyondScope) {
+			return false
+		}
+	}
+	return true
+}
+
+// warnReadBeyondScope logs, once per connector and again after it
+// clears, that a connector's credential can read beyond the local
+// allowlist. The line names the connector id only, never a URL or an
+// AppProject.
+func (l *Loop) warnReadBeyondScope() {
+	for _, h := range l.cfg.Connectors.Health() {
+		switch {
+		case h.ReadBeyondScope && !l.wideWarned[h.Connector]:
+			l.wideWarned[h.Connector] = true
+			l.log.Warn(ReadBeyondScopeWarning, "connector_id", h.Connector, "status", string(h.Status))
+		case !h.ReadBeyondScope && l.wideWarned[h.Connector]:
+			delete(l.wideWarned, h.Connector)
+		}
+	}
+}
+
+// ReadBeyondScopeWarning is the log message for a connector whose
+// credential can read beyond its local allowlist (ADR 0002 condition
+// C2).
+const ReadBeyondScopeWarning = "connector credential can read outside its allowed scope (argocd: applications get on */*); reported degraded, reads stay bounded by the local allowlist; narrow the token's role"
+
 // updateReady sets readiness from its parts (runtime design 7): a
 // heartbeat accepted recently, the catalog accepted, every connector
 // self-check passed, and the control plane not refusing this Gateway.
 func (l *Loop) updateReady() {
-	l.cfg.Ready.SetReady(l.heartbeatFresh.Load() && l.catalogAccepted.Load() && l.connectorsHealthy() && !l.isHalted())
+	l.cfg.Ready.SetReady(l.heartbeatFresh.Load() && l.catalogAccepted.Load() && l.connectorsReady() && !l.isHalted())
 }
 
 // claimBlocker says why no task may be claimed now, or "" when one may.
@@ -433,7 +482,8 @@ func (l *Loop) claimBlocker() string {
 }
 
 // CatalogFor builds the E3 body from the bound connectors: ids, kinds,
-// display names and intervals. No URLs and no credentials.
+// display names, intervals and, for argocd targets whose uid is known,
+// the identity digest. No URLs, no credentials and no raw uid.
 func CatalogFor(c Connectors) client.Catalog {
 	entries := c.Catalog()
 	cat := client.Catalog{Connectors: make([]client.CatalogConnector, 0, len(entries))}
@@ -443,6 +493,7 @@ func CatalogFor(c Connectors) client.Catalog {
 			cc.Targets = append(cc.Targets, client.CatalogTarget{
 				TargetID: t.ID, Namespace: t.Namespace, Name: t.Name,
 				RefreshIntervalSeconds: t.RefreshIntervalSeconds, ProgressDeadlineSeconds: t.ProgressDeadlineSeconds,
+				Identity: t.Identity,
 			})
 		}
 		cat.Connectors = append(cat.Connectors, cc)
@@ -457,7 +508,9 @@ func (l *Loop) uploadCatalog(ctx context.Context) error {
 	defer cancel()
 	var resp *client.CatalogResponse
 	var err error
-	if !l.unlessHalted(func() { resp, err = l.cfg.CP.PutCatalog(callCtx, CatalogFor(l.cfg.Connectors)) }) {
+	cat := CatalogFor(l.cfg.Connectors)
+	body := catalogKey(cat)
+	if !l.unlessHalted(func() { resp, err = l.cfg.CP.PutCatalog(callCtx, cat) }) {
 		return errHalted
 	}
 	if err != nil {
@@ -466,10 +519,27 @@ func (l *Loop) uploadCatalog(ctx context.Context) error {
 	}
 	l.m.catalog("ok")
 	l.catalogVersion.Store(resp.CatalogVersion)
+	l.sentCatalog.Store(body)
 	if !l.catalogAccepted.Swap(true) {
 		l.log.Info("catalog accepted", "connectors", len(l.cfg.Connectors.Catalog()))
 	}
 	return nil
+}
+
+// catalogKey is the JSON of cat, to tell whether the catalog changed.
+func catalogKey(cat client.Catalog) string {
+	b, err := json.Marshal(cat)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// catalogChanged reports whether the current catalog differs from the
+// last one the control plane accepted.
+func (l *Loop) catalogChanged() bool {
+	sent, _ := l.sentCatalog.Load().(string)
+	return sent != catalogKey(CatalogFor(l.cfg.Connectors))
 }
 
 func (l *Loop) catVersion() string {
@@ -502,6 +572,7 @@ func (l *Loop) heartbeatLoop(ctx context.Context) {
 			l.fail(err)
 			return
 		}
+		l.warnReadBeyondScope()
 		l.updateReady()
 		status := client.ReplicaOK
 		if !l.connectorsHealthy() {
@@ -527,7 +598,10 @@ func (l *Loop) heartbeatLoop(ctx context.Context) {
 				interval = time.Duration(min(max(s, minHeartbeatSeconds), maxHeartbeatSeconds)) * time.Second
 			}
 			wait = l.cfg.Jitter(interval, 0.9, 1.1)
-			if !l.catalogAccepted.Load() || resp.CatalogVersion != l.catVersion() {
+			// The catalog goes up again when the control plane's version
+			// differs or the local catalog changed since the last upload
+			// (an Argo CD target's identity became known).
+			if !l.catalogAccepted.Load() || resp.CatalogVersion != l.catVersion() || l.catalogChanged() {
 				if cerr := l.uploadCatalog(ctx); cerr != nil {
 					if errors.Is(cerr, errHalted) {
 						return

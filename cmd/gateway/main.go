@@ -42,6 +42,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -106,6 +107,8 @@ var newLoop = func(d loopDeps) cpLoop {
 		LeaseMargin:       d.Config.LeaseMargin,
 		PassTimeout:       d.Config.PassTimeout,
 		UnreachableAfter:  d.Config.UnreachableAfter,
+
+		PrivilegeRecheckInterval: d.Config.PrivilegeRecheckInterval,
 		// Shutdown: wait half the grace for passes, then release what is
 		// left; every call stays inside the remaining grace.
 		DrainTimeout: grace / 2,
@@ -171,6 +174,22 @@ const selfCheckTimeout = 10 * time.Second
 // maxCatalogBytes is the E3 body cap (runtime design 6.5). A local
 // configuration whose catalog does not fit refuses to start.
 const maxCatalogBytes = 64 << 10
+
+// worstCaseCatalog is the catalog with an identity on every argocd
+// target, the largest it can grow to once every uid is known.
+func worstCaseCatalog(r *connectors.Registry) client.Catalog {
+	cat := loop.CatalogFor(r)
+	worst := "d-" + strings.Repeat("a", 26)
+	for i := range cat.Connectors {
+		if cat.Connectors[i].Kind != string(connectors.KindArgoCD) {
+			continue
+		}
+		for j := range cat.Connectors[i].Targets {
+			cat.Connectors[i].Targets[j].Identity = worst
+		}
+	}
+	return cat
+}
 
 func main() {
 	if err := run(os.Args[1:], os.LookupEnv); err != nil {
@@ -267,11 +286,14 @@ func setup(cfg Config, getenv func(string) (string, bool), logger *slog.Logger, 
 		return nil, err
 	}
 	for _, h := range registry.Health() {
-		if h.Status != connectors.HealthOK {
+		switch {
+		case h.ReadBeyondScope:
+			logger.Warn(loop.ReadBeyondScopeWarning, "connector_id", h.Connector, "status", string(h.Status))
+		case h.Status != connectors.HealthOK:
 			logger.Warn("connector self-check did not pass; not ready until it does", "connector_id", h.Connector, "status", string(h.Status))
 		}
 	}
-	if b, err := json.Marshal(loop.CatalogFor(registry)); err != nil || len(b) > maxCatalogBytes {
+	if b, err := json.Marshal(worstCaseCatalog(registry)); err != nil || len(b) > maxCatalogBytes {
 		return nil, fmt.Errorf("connectors: the catalog of bound connectors and targets does not fit in %d bytes", maxCatalogBytes)
 	}
 

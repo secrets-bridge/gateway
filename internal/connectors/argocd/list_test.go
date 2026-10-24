@@ -29,7 +29,7 @@ func newListClient(t *testing.T, h http.HandlerFunc) (*Client, *httptest.Server)
 	t.Helper()
 	srv := httptest.NewTLSServer(h)
 	t.Cleanup(srv.Close)
-	c, err := New(Config{BaseURL: srv.URL, Token: staticToken(testToken), RootCAs: poolFor(srv), AllowedProjects: listProjects, Applications: listApps})
+	c, err := New(Config{BaseURL: srv.URL, Token: staticToken(testToken), RootCAs: poolFor(srv), AllowedProjects: listProjects, Applications: listApps, discoveryList: true})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -240,7 +240,7 @@ func TestTransport_NoProjectsNoListNoCanI(t *testing.T) {
 			t.Fatalf("%s was sent", u.Path)
 		}
 	}
-	if _, err := c.ListApplications(context.Background(), "tenant-a"); !errors.Is(err, ErrProjectNotAllowed) {
+	if _, err := c.ListApplications(context.Background(), "tenant-a"); !errors.Is(err, ErrRequestRefused) {
 		t.Fatalf("list: %v", err)
 	}
 	if _, err := c.CanI(context.Background(), Probe{ResourceApplications, "sync", "tenant-a/*"}); !errors.Is(err, ErrProjectNotAllowed) {

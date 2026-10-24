@@ -201,6 +201,8 @@ type fakeClient struct {
 	canIErr   error
 	errs      map[string]error
 	canICalls []string
+	// reads records the name of each GetApplication.
+	reads []string
 }
 
 // grant is one allow line of an Argo CD RBAC policy. Like Argo CD's
@@ -248,12 +250,31 @@ func (f *fakeClient) CanI(_ context.Context, p Probe) (bool, error) {
 
 func (f *fakeClient) GetApplication(_ context.Context, name, ns string) (*Application, error) {
 	f.calls.Add(1)
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.name, f.ns = name, ns
+	f.reads = append(f.reads, name)
 	return f.app, f.err
 }
 
 func (f *fakeClient) GetUserInfo(context.Context) (UserInfo, error) {
 	return UserInfo{LoggedIn: !f.loggedOut}, f.infoErr
+}
+
+// checkUnread runs the boot self-check with every Application read
+// failing (404), so the startup read learns nothing: the tests that use
+// it are about a target first read by a task. calls is reset after.
+func checkUnread(r *connectors.Registry, g *fakeClient) error {
+	g.mu.Lock()
+	saved := g.err
+	g.err = ErrNotFound
+	g.mu.Unlock()
+	err := r.Check(context.Background(), time.Second)
+	g.mu.Lock()
+	g.err = saved
+	g.mu.Unlock()
+	g.calls.Store(0)
+	return err
 }
 
 func newFakeConnector(g appClient) *Connector {
@@ -282,7 +303,7 @@ func TestObserve_ThroughRegistry(t *testing.T) {
 	t.Run("healthy is observed with low confidence and the health caveat", func(t *testing.T) {
 		g := &fakeClient{app: healthyApp()}
 		r, _ := connectors.NewRegistry(newFakeConnector(g))
-		_ = r.Check(ctx, time.Second)
+		_ = checkUnread(r, g)
 		obs, err := r.Observe(ctx, "argocd-main", target("payments"))
 		if err != nil {
 			t.Fatal(err)
@@ -309,7 +330,7 @@ func TestObserve_ThroughRegistry(t *testing.T) {
 	t.Run("target not in applications is refused without a read", func(t *testing.T) {
 		g := &fakeClient{app: healthyApp()}
 		r, _ := connectors.NewRegistry(newFakeConnector(g))
-		_ = r.Check(ctx, time.Second)
+		_ = checkUnread(r, g)
 		_, err := r.Observe(ctx, "argocd-main", target("orders"))
 		if !errors.Is(err, connectors.ErrUnboundTarget) || g.calls.Load() != 0 {
 			t.Fatalf("err = %v, calls = %d", err, g.calls.Load())
@@ -323,7 +344,7 @@ func TestObserve_ThroughRegistry(t *testing.T) {
 	t.Run("app namespace from settings", func(t *testing.T) {
 		g := &fakeClient{app: with(func(a *Application) { a.Name = "billing-api"; a.Namespace = "tenant-a-uat" })}
 		r, _ := connectors.NewRegistry(newFakeConnector(g))
-		_ = r.Check(ctx, time.Second)
+		_ = checkUnread(r, g)
 		obs, _ := r.Observe(ctx, "argocd-main", target("billing"))
 		if obs.Outcome != connectors.OutcomeObserved || g.ns != "tenant-a-uat" {
 			t.Fatalf("obs = %+v ns = %q", obs, g.ns)
@@ -337,7 +358,7 @@ func TestObserve_ThroughRegistry(t *testing.T) {
 		} {
 			g := &fakeClient{app: app}
 			r, _ := connectors.NewRegistry(newFakeConnector(g))
-			_ = r.Check(ctx, time.Second)
+			_ = checkUnread(r, g)
 			id := "payments"
 			if name == "other namespace" {
 				id = "billing"
@@ -359,7 +380,7 @@ func TestObserve_ThroughRegistry(t *testing.T) {
 		} {
 			g := &fakeClient{err: err}
 			r, _ := connectors.NewRegistry(newFakeConnector(g))
-			_ = r.Check(ctx, time.Second)
+			_ = checkUnread(r, g)
 			obs, oerr := r.Observe(ctx, "argocd-main", target("payments"))
 			if oerr != nil || obs.Outcome != connectors.OutcomeError || obs.Evidence.ErrorCode != code {
 				t.Fatalf("%v: obs = %+v err = %v", err, obs, oerr)
@@ -391,7 +412,7 @@ func TestObserve_UIDIsIdentity(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := r.Check(ctx, time.Second); err != nil {
+		if err := checkUnread(r, g); err != nil {
 			t.Fatal(err)
 		}
 		return g, c, r
@@ -462,7 +483,7 @@ func TestObserve_UIDIsIdentity(t *testing.T) {
 		// A new process (a fresh connector) learns the uid again: the
 		// auto pin is not a confirmation that survives a restart.
 		r2, _ := connectors.NewRegistry(newFakeConnector(g))
-		_ = r2.Check(ctx, time.Second)
+		_ = checkUnread(r2, g)
 		obs, err := r2.Observe(ctx, "argocd-main", target)
 		if err != nil || obs.Outcome != connectors.OutcomeObserved ||
 			obs.Evidence.Resource.IdentityDigest != contract.TargetIdentityDigest("argocd-main", recreateUID) {
@@ -601,6 +622,7 @@ func TestCheck_CanIProbe(t *testing.T) {
 				"projects delete "+p,
 			)
 		}
+		want = append(want, "applications get */*")
 		if got := g.calledProbes(); !slices.Equal(got, want) {
 			t.Fatalf("probes = %v, want %v", got, want)
 		}

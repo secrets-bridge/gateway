@@ -43,10 +43,17 @@ type Config struct {
 	LeaseMargin       time.Duration
 	PassTimeout       time.Duration
 	UnreachableAfter  time.Duration
+	// PrivilegeRecheckInterval is how often every connector's
+	// self-check, including the can-i probes, runs again. Default 5m,
+	// at least 1m (ADR 0002 decision D4).
+	PrivilegeRecheckInterval time.Duration
 }
 
 // envEnableR2Connectors turns on the Release 2 connector kinds.
 const envEnableR2Connectors = "SB_GATEWAY_ENABLE_R2_CONNECTORS"
+
+// envPrivilegeRecheckInterval sets the privilege recheck interval.
+const envPrivilegeRecheckInterval = "SB_GATEWAY_PRIVILEGE_RECHECK_INTERVAL"
 
 const (
 	defaultIdentityFile  = "/etc/secrets-bridge/gateway/identity.json"
@@ -78,6 +85,8 @@ func parseConfig(args []string, getenv func(string) (string, bool), stderr io.Wr
 		LeaseMargin:        e.duration("SB_GATEWAY_LEASE_MARGIN", loop.DefaultLeaseMargin),
 		PassTimeout:        e.duration("SB_GATEWAY_PASS_TIMEOUT", loop.DefaultPassTimeout),
 		UnreachableAfter:   e.duration("SB_GATEWAY_CP_UNREACHABLE_AFTER", loop.DefaultUnreachableAfter),
+
+		PrivilegeRecheckInterval: e.duration(envPrivilegeRecheckInterval, loop.DefaultPrivilegeRecheckInterval),
 	}
 	if e.err != nil {
 		return Config{}, e.err
@@ -102,6 +111,7 @@ func parseConfig(args []string, getenv func(string) (string, bool), stderr io.Wr
 	fs.DurationVar(&cfg.LeaseMargin, "lease-margin", cfg.LeaseMargin, "a pass stops this long before the lease expires so the result is sent in time (also SB_GATEWAY_LEASE_MARGIN)")
 	fs.DurationVar(&cfg.PassTimeout, "pass-timeout", cfg.PassTimeout, "upper bound for one observation pass (also SB_GATEWAY_PASS_TIMEOUT)")
 	fs.DurationVar(&cfg.UnreachableAfter, "cp-unreachable-after", cfg.UnreachableAfter, "turn not ready when no heartbeat is accepted for this long (also SB_GATEWAY_CP_UNREACHABLE_AFTER)")
+	fs.DurationVar(&cfg.PrivilegeRecheckInterval, "privilege-recheck-interval", cfg.PrivilegeRecheckInterval, "how often every connector self-check and can-i probe runs again, at least 1m (also "+envPrivilegeRecheckInterval+")")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
@@ -129,6 +139,9 @@ func parseConfig(args []string, getenv func(string) (string, bool), stderr io.Wr
 		if d.v <= 0 {
 			return Config{}, fmt.Errorf("%s must be positive", d.name)
 		}
+	}
+	if cfg.PrivilegeRecheckInterval < loop.MinPrivilegeRecheckInterval {
+		return Config{}, fmt.Errorf("%s must be at least %s", envPrivilegeRecheckInterval, loop.MinPrivilegeRecheckInterval)
 	}
 	if cfg.ClaimIdleMax < cfg.ClaimInterval {
 		return Config{}, errors.New("SB_GATEWAY_CLAIM_IDLE_MAX must not be shorter than SB_GATEWAY_CLAIM_INTERVAL")

@@ -24,6 +24,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/secrets-bridge/gateway/internal/connectors"
+	"github.com/secrets-bridge/gateway/internal/loop"
 	"github.com/secrets-bridge/gateway/internal/observability"
 )
 
@@ -465,9 +466,12 @@ func waitFor(t *testing.T, cond func() bool) {
 }
 
 // argoCheckCalls is the boot self-check of an argocd connector with one
-// allowed AppProject (tenant-a): userinfo, then the negative can-i probe
-// for each application write action, exec, logs, applicationsets and
-// projects. No per-target question is asked before a read.
+// allowed AppProject (tenant-a): userinfo, the negative can-i probe for
+// each application write action, exec, logs, applicationsets and
+// projects, the read probe (applications get */*), then the startup
+// read of the static target without a settings uid. That fake answers
+// it with no Application, so the read is not verified and no
+// per-target question follows.
 var argoCheckCalls = []string{
 	"GET /api/v1/session/userinfo",
 	"GET /api/v1/account/can-i/applications/sync/tenant-a/*",
@@ -485,6 +489,8 @@ var argoCheckCalls = []string{
 	"GET /api/v1/account/can-i/applicationsets/delete/tenant-a/*",
 	"GET /api/v1/account/can-i/projects/update/tenant-a",
 	"GET /api/v1/account/can-i/projects/delete/tenant-a",
+	"GET /api/v1/account/can-i/applications/get/*/*",
+	"GET /api/v1/applications/payments-api",
 }
 
 // argoBootFile writes a connectors file with one argocd connector bound
@@ -511,9 +517,9 @@ func argoBootFile(t *testing.T, h http.HandlerFunc) string {
 	return file
 }
 
-// TestSetup_BindsArgoCDConnector: the argocd kind is bound at boot, its
-// self-check reads only GET /api/v1/session/userinfo and the can-i
-// probe, and no Application is read before a task asks for one.
+// TestSetup_BindsArgoCDConnector: the argocd kind is bound at boot, and
+// its self-check sends only userinfo, the can-i probes and one startup
+// read per static target without a settings uid.
 func TestSetup_BindsArgoCDConnector(t *testing.T) {
 	var mu sync.Mutex
 	var calls []string
@@ -556,6 +562,9 @@ func TestSetup_ArgoCDCanIProbeRefusesBoot(t *testing.T) {
 		name   string
 		answer func(w http.ResponseWriter, r *http.Request)
 		want   error
+		// detail is what the refusal names: the failed check and how it
+		// failed.
+		detail string
 	}{
 		{"can-i yes for override", func(w http.ResponseWriter, r *http.Request) {
 			if strings.HasSuffix(r.URL.Path, "/override/tenant-a/*") {
@@ -563,41 +572,50 @@ func TestSetup_ArgoCDCanIProbeRefusesBoot(t *testing.T) {
 				return
 			}
 			_, _ = io.WriteString(w, `{"loggedIn":true,"value":"no"}`)
-		}, connectors.ErrOverPrivileged},
+		}, connectors.ErrOverPrivileged, "failed check applications override: can-i yes"},
 		{"can-i fails", func(w http.ResponseWriter, r *http.Request) {
 			if strings.Contains(r.URL.Path, "/can-i/") {
 				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
 			_, _ = io.WriteString(w, `{"loggedIn":true}`)
-		}, connectors.ErrPrivilegeUnproven},
+		}, connectors.ErrPrivilegeUnproven, "failed check applications sync: malformed"},
 		{"can-i answers neither yes nor no", func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = io.WriteString(w, `{"loggedIn":true,"value":"maybe"}`)
-		}, connectors.ErrPrivilegeUnproven},
+		}, connectors.ErrPrivilegeUnproven, "failed check applications sync: malformed"},
 		{"token refused so the probe cannot run", func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusUnauthorized)
-		}, connectors.ErrPrivilegeUnproven},
+		}, connectors.ErrPrivilegeUnproven, "failed check session userinfo: unauthorized"},
 		{"can-i yes for exec", func(w http.ResponseWriter, r *http.Request) {
 			if strings.HasSuffix(r.URL.Path, "/can-i/exec/create/tenant-a/*") {
 				_, _ = io.WriteString(w, `{"value":"yes"}`)
 				return
 			}
 			_, _ = io.WriteString(w, `{"loggedIn":true,"value":"no"}`)
-		}, connectors.ErrOverPrivileged},
+		}, connectors.ErrOverPrivileged, "failed check exec create: can-i yes"},
 		{"can-i yes for projects delete", func(w http.ResponseWriter, r *http.Request) {
 			if strings.HasSuffix(r.URL.Path, "/can-i/projects/delete/tenant-a") {
 				_, _ = io.WriteString(w, `{"value":"yes"}`)
 				return
 			}
 			_, _ = io.WriteString(w, `{"loggedIn":true,"value":"no"}`)
-		}, connectors.ErrOverPrivileged},
+		}, connectors.ErrOverPrivileged, "failed check projects delete: can-i yes"},
 		{"can-i 400 for exec", func(w http.ResponseWriter, r *http.Request) {
 			if strings.Contains(r.URL.Path, "/can-i/exec/") {
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
 			_, _ = io.WriteString(w, `{"loggedIn":true,"value":"no"}`)
-		}, connectors.ErrPrivilegeUnproven},
+		}, connectors.ErrPrivilegeUnproven, "failed check exec create: bad request"},
+		{"read probe unreachable", func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.EscapedPath(), "/can-i/applications/get/*/*") {
+				hj, _ := w.(http.Hijacker)
+				conn, _, _ := hj.Hijack()
+				_ = conn.Close()
+				return
+			}
+			_, _ = io.WriteString(w, `{"loggedIn":true,"value":"no"}`)
+		}, connectors.ErrPrivilegeUnproven, "failed check applications get: unreachable"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -609,6 +627,19 @@ func TestSetup_ArgoCDCanIProbeRefusesBoot(t *testing.T) {
 			}
 			if strings.Contains(err.Error(), "tenant-a") {
 				t.Fatalf("error names the AppProject: %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.detail) {
+				t.Fatalf("setup err = %v, want it to name %q", err, tc.detail)
+			}
+			// The refusal is what run logs. It names no Argo CD address
+			// and no token.
+			for _, leak := range []string{"127.0.0.1", "https://", "argocd-token"} {
+				if strings.Contains(err.Error(), leak) {
+					t.Fatalf("refusal carries %q: %v", leak, err)
+				}
+			}
+			if strings.Contains(f.logs.String(), "argocd-token") {
+				t.Fatal("logs carry the Argo CD token")
 			}
 		})
 	}
@@ -679,5 +710,45 @@ func TestSetup_ArgoCDOutageAtBoot(t *testing.T) {
 	}
 	if hits.Load() == 0 {
 		t.Fatal("Argo CD was never called")
+	}
+}
+
+// TestSetup_ArgoCDReadProbeYesIsDegraded: a token that may get every
+// Application (can-i applications get */* answers yes) does not refuse
+// the boot. The connector is degraded, verified and counts as ready,
+// and the warning names the connector id, never the Argo CD URL.
+func TestSetup_ArgoCDReadProbeYesIsDegraded(t *testing.T) {
+	var argoURL string
+	file := argoBootFile(t, func(w http.ResponseWriter, r *http.Request) {
+		argoURL = "https://" + r.Host
+		if strings.HasSuffix(r.URL.EscapedPath(), "/can-i/applications/get/*/*") {
+			_, _ = io.WriteString(w, `{"value":"yes"}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"loggedIn":true,"value":"no"}`)
+	})
+	f := newFixture(t)
+	f.cfg.ConnectorsFile = file
+	var deps loopDeps
+	orig := newLoop
+	newLoop = func(d loopDeps) cpLoop { deps = d; return &fakeLoop{stopCh: make(chan struct{})} }
+	t.Cleanup(func() { newLoop = orig })
+
+	if _, err := f.setup(); err != nil {
+		t.Fatalf("setup refused: %v", err)
+	}
+	h := deps.Registry.Health()[0]
+	if h.Status != connectors.HealthDegraded || !h.ReadBeyondScope || !deps.Registry.Verified() {
+		t.Fatalf("health = %+v verified = %v", h, deps.Registry.Verified())
+	}
+	logs := f.logs.String()
+	if !strings.Contains(logs, loop.ReadBeyondScopeWarning) || !strings.Contains(logs, `argocd-main`) {
+		t.Fatalf("no warning naming the connector: %s", logs)
+	}
+	if argoURL == "" || strings.Contains(logs, argoURL) || strings.Contains(logs, strings.TrimPrefix(argoURL, "https://")) {
+		t.Fatalf("logs carry the Argo CD URL: %s", logs)
+	}
+	if strings.Contains(logs, "did not pass") {
+		t.Fatalf("the warning was logged as a failed self-check: %s", logs)
 	}
 }

@@ -172,6 +172,11 @@ type TargetInfo struct {
 	RefreshIntervalSeconds *int
 	// ProgressDeadlineSeconds is set for rollout targets.
 	ProgressDeadlineSeconds *int
+	// Identity is set for argocd targets only, once the connector knows
+	// the Application's uid: the scoped identity digest
+	// (contract.TargetIdentityDigest), never the raw uid. The registry
+	// drops it from any other kind.
+	Identity string
 }
 
 // Observation is the metadata-only result of one Observe call. It has no
@@ -203,8 +208,10 @@ type Connector interface {
 	Name() string
 	// Kind is the connector type.
 	Kind() Kind
-	// Targets lists the locally configured targets. The list is fixed
-	// for the life of the process.
+	// Targets lists the locally configured targets. The ids and display
+	// names are fixed for the life of the process. An argocd target's
+	// Identity may appear once its uid is known, and then does not
+	// change: the catalog is uploaded again when it appears.
 	Targets() []TargetInfo
 	// Check is the self-check (runtime design 5.3 and 3.5). It returns
 	// nil when the connector can read what it needs and nothing more. It
@@ -263,7 +270,50 @@ var (
 	// with target_identity_changed and nothing about the new object,
 	// until the integrator confirms it locally.
 	ErrTargetIdentityChanged = errors.New("connectors: the object under the configured name has a different uid than the pinned one")
+	// ErrReadBeyondScope: the self-check passed, but the credential can
+	// read objects outside the connector's local allowlist (the Argo CD
+	// read probe, applications get on */*, answered yes). It is a
+	// warning, not a refusal: the connector reports degraded, stays
+	// verified and ready, and the local allowlist still bounds every
+	// read (ADR 0002 condition C2).
+	ErrReadBeyondScope = errors.New("connectors: credential can read outside the local allowlist")
 )
+
+// CheckFailure names, in fixed words only, which self-check question
+// failed and how. A connector wraps one in its Check error so the boot
+// refusal can say what failed. Check is a resource and action (for
+// example "applications sync" or "session userinfo"), never an object,
+// AppProject, URL or token. Kind is one of the Failure constants.
+type CheckFailure struct {
+	Check string
+	Kind  string
+}
+
+// CheckFailure kinds.
+const (
+	FailureGrantedYes   = "can-i yes"
+	FailureUnreachable  = "unreachable"
+	FailureUnauthorized = "unauthorized"
+	FailureForbidden    = "forbidden"
+	FailureTimeout      = "timeout"
+	FailureTLS          = "tls"
+	FailureMalformed    = "malformed"
+	FailureBadRequest   = "bad request"
+	FailureRefused      = "refused locally"
+	FailureNotLoggedIn  = "not logged in"
+	FailureOther        = "error"
+)
+
+func (f *CheckFailure) Error() string { return "failed check " + f.Check + ": " + f.Kind }
+
+// checkDetail is the CheckFailure of err as text, or "".
+func checkDetail(err error) string {
+	var f *CheckFailure
+	if errors.As(err, &f) && f != nil {
+		return "; " + f.Error()
+	}
+	return ""
+}
 
 // HealthStatus is a connector status in the heartbeat (control-plane
 // design 4.3). It is an enum; there is never a message.
@@ -289,6 +339,8 @@ func healthFor(err error) HealthStatus {
 		return HealthUnauthorized
 	case errors.Is(err, ErrCheckUnreachable):
 		return HealthUnreachable
+	case errors.Is(err, ErrReadBeyondScope):
+		return HealthDegraded
 	}
 	return HealthDegraded
 }
@@ -298,6 +350,12 @@ type Health struct {
 	Connector string
 	Kind      Kind
 	Status    HealthStatus
+	// ReadBeyondScope is set when Status is degraded only because the
+	// credential can read outside the local allowlist
+	// (ErrReadBeyondScope). Such a connector is verified and counts as
+	// ready; the status tells the control plane, and the Gateway logs a
+	// warning that names the connector.
+	ReadBeyondScope bool
 }
 
 // CatalogEntry is one connector as the catalog advertises it.
@@ -322,6 +380,9 @@ type Registry struct {
 	// the check returned neither ErrOverPrivileged nor
 	// ErrPrivilegeUnproven. It is false before the first check.
 	verified map[string]bool
+	// wide is true for a connector whose last check passed with
+	// ErrReadBeyondScope.
+	wide map[string]bool
 }
 
 // NewRegistry builds a registry. Names must be valid and unique, each
@@ -333,6 +394,7 @@ func NewRegistry(cs ...Connector) (*Registry, error) {
 		targets:  make(map[string]map[string]struct{}, len(cs)),
 		health:   make(map[string]HealthStatus, len(cs)),
 		verified: make(map[string]bool, len(cs)),
+		wide:     make(map[string]bool, len(cs)),
 		now:      time.Now,
 	}
 	for _, c := range cs {
@@ -351,6 +413,9 @@ func NewRegistry(cs ...Connector) (*Registry, error) {
 		}
 		ids := make(map[string]struct{})
 		for i, t := range c.Targets() {
+			if t.Identity != "" && c.Kind() != KindArgoCD {
+				return nil, fmt.Errorf("%w: connector %q target %d: only argocd targets carry an identity", ErrInvalidTarget, name, i)
+			}
 			if err := validTargetInfo(t); err != nil {
 				return nil, fmt.Errorf("%w: connector %q target %d: %s", ErrInvalidTarget, name, i, err)
 			}
@@ -378,6 +443,8 @@ func validTargetInfo(t TargetInfo) error {
 	case t.RefreshIntervalSeconds != nil && *t.RefreshIntervalSeconds < 0,
 		t.ProgressDeadlineSeconds != nil && *t.ProgressDeadlineSeconds < 0:
 		return errors.New("intervals must not be negative")
+	case t.Identity != "" && !contract.ValidTargetIdentityDigest(t.Identity):
+		return errors.New("identity must be an identity digest")
 	}
 	return nil
 }
@@ -420,12 +487,20 @@ func (r *Registry) HasTarget(name, targetID string) bool {
 }
 
 // Catalog returns every connector and its targets, sorted by name, for
-// the catalog upload. It holds ids, kinds and display names only.
+// the catalog upload. It holds ids, kinds, display names and, for argocd
+// targets, the identity digest once known. A target whose identity is
+// not a digest is sent without one, and a Kubernetes connector never
+// carries one.
 func (r *Registry) Catalog() []CatalogEntry {
 	out := make([]CatalogEntry, 0, len(r.byName))
 	for _, n := range r.Names() {
 		c := r.byName[n]
 		ts := append([]TargetInfo(nil), c.Targets()...)
+		for i := range ts {
+			if c.Kind() != KindArgoCD || !contract.ValidTargetIdentityDigest(ts[i].Identity) {
+				ts[i].Identity = ""
+			}
+		}
 		sort.Slice(ts, func(i, j int) bool { return ts[i].ID < ts[j].ID })
 		out = append(out, CatalogEntry{Connector: n, Kind: c.Kind(), Targets: ts})
 	}
@@ -441,7 +516,7 @@ func (r *Registry) Check(ctx context.Context, timeout time.Duration) error {
 }
 
 // Recheck runs the self-check again for connectors whose last check did
-// not pass, and returns ErrOverPrivileged if any of them now is.
+// not pass (a connector degraded only by ErrReadBeyondScope passed), and returns ErrOverPrivileged if any of them now is.
 func (r *Registry) Recheck(ctx context.Context, timeout time.Duration) error {
 	return r.check(ctx, timeout, checkFailed)
 }
@@ -468,9 +543,11 @@ func (r *Registry) check(ctx context.Context, timeout time.Duration, mode checkM
 	var over, unproven error
 	for _, n := range r.Names() {
 		r.mu.Lock()
-		last := r.health[n]
+		last, wide := r.health[n], r.wide[n]
 		r.mu.Unlock()
-		if mode == checkFailed && last == HealthOK {
+		if mode == checkFailed && (last == HealthOK || wide) {
+			// A connector degraded only by a wide read grant passed its
+			// check; it waits for the next full recheck like an ok one.
 			continue
 		}
 		if last == HealthOverPrivileged {
@@ -488,15 +565,16 @@ func (r *Registry) check(ctx context.Context, timeout time.Duration, mode checkM
 			// status is degraded, or the more specific not-ready status
 			// (unauthorized, unreachable) the error also names.
 			if unproven == nil {
-				unproven = fmt.Errorf("%w: connector %q", ErrPrivilegeUnproven, n)
+				unproven = fmt.Errorf("%w: connector %q%s", ErrPrivilegeUnproven, n, checkDetail(cerr))
 			}
 		}
 		r.mu.Lock()
 		r.health[n] = st
 		r.verified[n] = st != HealthOverPrivileged && !errors.Is(cerr, ErrPrivilegeUnproven)
+		r.wide[n] = r.verified[n] && st == HealthDegraded && errors.Is(cerr, ErrReadBeyondScope) && onlyReadBeyondScope(cerr)
 		r.mu.Unlock()
 		if st == HealthOverPrivileged {
-			over = fmt.Errorf("%w: connector %q", ErrOverPrivileged, n)
+			over = fmt.Errorf("%w: connector %q%s", ErrOverPrivileged, n, checkDetail(cerr))
 		}
 	}
 	if over != nil {
@@ -537,7 +615,7 @@ func (r *Registry) Health() []Health {
 	defer r.mu.Unlock()
 	out := make([]Health, 0, len(r.byName))
 	for _, n := range r.Names() {
-		out = append(out, Health{Connector: n, Kind: r.byName[n].Kind(), Status: r.health[n]})
+		out = append(out, Health{Connector: n, Kind: r.byName[n].Kind(), Status: r.health[n], ReadBeyondScope: r.wide[n] && r.health[n] == HealthDegraded})
 	}
 	return out
 }
@@ -605,13 +683,24 @@ func (r *Registry) demote(name string, err error) {
 	switch {
 	case errors.Is(err, ErrOverPrivileged):
 		r.mu.Lock()
-		r.health[name], r.verified[name] = HealthOverPrivileged, false
+		r.health[name], r.verified[name], r.wide[name] = HealthOverPrivileged, false, false
 		r.mu.Unlock()
 	case errors.Is(err, ErrPrivilegeUnproven):
 		r.mu.Lock()
-		r.health[name], r.verified[name] = healthFor(err), false
+		r.health[name], r.verified[name], r.wide[name] = healthFor(err), false, false
 		r.mu.Unlock()
 	}
+}
+
+// onlyReadBeyondScope reports whether err names no other check failure
+// than ErrReadBeyondScope.
+func onlyReadBeyondScope(err error) bool {
+	for _, other := range []error{ErrOverPrivileged, ErrPrivilegeUnproven, ErrCheckUnauthorized, ErrCheckUnreachable} {
+		if errors.Is(err, other) {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *Registry) errorObservation(c Connector, t Target, code contract.ErrorCode) Observation {

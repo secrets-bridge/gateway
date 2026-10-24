@@ -66,6 +66,7 @@ type fakeCP struct {
 
 	heartbeats []map[string]any
 	catalogs   []map[string]any
+	catalogRaw [][]byte // the bodies of catalogs, as sent
 	results    [][]byte
 	resultAt   []time.Time
 	renews     []map[string]any
@@ -152,6 +153,7 @@ func (f *fakeCP) serve(w http.ResponseWriter, r *http.Request) {
 			f.badPath = append(f.badPath, r.Method+" "+r.URL.Path)
 		}
 		f.catalogs = append(f.catalogs, m)
+		f.catalogRaw = append(f.catalogRaw, body)
 		if rp, ok := pop(&f.catReply); ok && rp.status != 0 {
 			write(w, rp)
 			return
@@ -207,6 +209,7 @@ func (f *fakeCP) snapshot() fakeCP {
 	return fakeCP{
 		heartbeats: append([]map[string]any(nil), f.heartbeats...),
 		catalogs:   append([]map[string]any(nil), f.catalogs...),
+		catalogRaw: append([][]byte(nil), f.catalogRaw...),
 		results:    append([][]byte(nil), f.results...),
 		resultAt:   append([]time.Time(nil), f.resultAt...),
 		renews:     append([]map[string]any(nil), f.renews...),

@@ -483,8 +483,9 @@ func (r *Registry) check(ctx context.Context, timeout time.Duration, mode checkM
 		st := healthFor(cerr)
 		cancel()
 		if st != HealthOverPrivileged && errors.Is(cerr, ErrPrivilegeUnproven) {
-			// Fail closed: not ready, and at boot not started.
-			st = HealthDegraded
+			// Fail closed: not ready, and at boot not started. The
+			// status is degraded, or the more specific not-ready status
+			// (unauthorized, unreachable) the error also names.
 			if unproven == nil {
 				unproven = fmt.Errorf("%w: connector %q", ErrPrivilegeUnproven, n)
 			}
@@ -568,6 +569,7 @@ func (r *Registry) Observe(ctx context.Context, name string, target Target) (Obs
 	}
 
 	obs, err := c.Observe(ctx, target)
+	r.demote(name, err)
 	if err != nil || obs.Outcome == OutcomeError {
 		// The code survives a bare error return; anything else the
 		// connector put next to the error is dropped.
@@ -590,6 +592,25 @@ func (r *Registry) Observe(ctx context.Context, name string, target Target) (Obs
 		return r.errorObservation(c, target, contract.ErrorInternal), verr
 	}
 	return obs, nil
+}
+
+// demote applies a privilege finding that Observe made (the Argo CD
+// per-target can-i probe): ErrOverPrivileged marks the connector
+// over_privileged, which is sticky and stops the Gateway at the next
+// recheck, and ErrPrivilegeUnproven marks it unverified and not ready
+// until a recheck passes. Either way Verified turns false at once, so
+// the loop claims nothing more.
+func (r *Registry) demote(name string, err error) {
+	switch {
+	case errors.Is(err, ErrOverPrivileged):
+		r.mu.Lock()
+		r.health[name], r.verified[name] = HealthOverPrivileged, false
+		r.mu.Unlock()
+	case errors.Is(err, ErrPrivilegeUnproven):
+		r.mu.Lock()
+		r.health[name], r.verified[name] = healthFor(err), false
+		r.mu.Unlock()
+	}
 }
 
 func (r *Registry) errorObservation(c Connector, t Target, code contract.ErrorCode) Observation {

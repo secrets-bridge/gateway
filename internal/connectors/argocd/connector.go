@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -22,6 +23,7 @@ const (
 type appClient interface {
 	GetApplication(ctx context.Context, name, appNamespace string) (*Application, error)
 	GetUserInfo(ctx context.Context) (UserInfo, error)
+	CanI(ctx context.Context, p Probe) (bool, error)
 }
 
 // Connector observes ArgoCD Application sync and health as context for
@@ -49,6 +51,14 @@ type Connector struct {
 	// restart, is a later step of the ADR 0002 design.
 	mu     sync.Mutex
 	pinned map[string]string
+	// probed maps a target id to the AppProject its last verified read
+	// named; Check asks the target's TargetProbes for it on every
+	// recheck. proven holds the targets whose TargetProbes for that
+	// AppProject last all answered no. over is set, for the life of the
+	// process, once any probe answered yes.
+	probed map[string]string
+	proven map[string]bool
+	over   bool
 }
 
 var _ connectors.Connector = (*Connector)(nil)
@@ -66,11 +76,136 @@ func (c *Connector) Targets() []connectors.TargetInfo {
 	return append([]connectors.TargetInfo(nil), c.targets...)
 }
 
-// Check implements connectors.Connector: GET /api/v1/session/userinfo
-// confirms the token works (runtime design 3.5). The optional can-i
-// negative probe is not implemented; its endpoint is not in the
-// transport allowlist.
+// Check implements connectors.Connector (runtime design 3.5). It runs at
+// boot and on every recheck:
+//
+//  1. GET /api/v1/session/userinfo confirms the token works.
+//  2. The negative project probe: every ProjectProbes question for each
+//     allowed AppProject (application actions, exec, logs and
+//     applicationsets on <project>/*, projects update and delete on
+//     <project>).
+//  3. The negative target probe: every TargetProbes question for each
+//     static target whose AppProject a verified read has told
+//     (<project>/<app>, and <project>/<app-namespace>/<app> for an
+//     Application outside the Argo CD namespace). A target not read yet
+//     is probed by Observe before its first observation is returned.
+//
+// Any yes wraps connectors.ErrOverPrivileged: the Gateway refuses to
+// start, and at runtime turns not ready and stops, the same as the
+// Kubernetes over-privilege rule. Once seen, it is kept for the life of
+// the process.
+//
+// The check fails closed. A probe that fails, answers neither yes nor
+// no, or cannot run because step 1 failed, wraps
+// connectors.ErrPrivilegeUnproven: at boot the Gateway refuses to start,
+// and later the connector stays unverified, so nothing is claimed or
+// read through it until a recheck passes. The one exception is
+// applications rollback answered with HTTP 400: Argo CD releases before
+// 3.6 have no rollback RBAC action, their can-i refuses it as unknown,
+// and their rollback endpoint enforces sync, which was asked on the same
+// object just before (AppActions puts sync first) and answered no.
+// Errors name the resource and action, never the AppProject or object.
 func (c *Connector) Check(ctx context.Context) error {
+	if c.isOver() {
+		return fmt.Errorf("argocd: a can-i probe found a write or danger grant earlier: %w", connectors.ErrOverPrivileged)
+	}
+	if err := c.checkToken(ctx); err != nil {
+		return fmt.Errorf("%w; can-i probe not run: %w", err, connectors.ErrPrivilegeUnproven)
+	}
+	projects := make([]string, 0, len(c.projects))
+	for p := range c.projects {
+		projects = append(projects, p)
+	}
+	sort.Strings(projects)
+	for _, p := range projects {
+		if err := c.ask(ctx, ProjectProbes(p), "an allowed AppProject"); err != nil {
+			return err
+		}
+	}
+	c.mu.Lock()
+	ids := make([]string, 0, len(c.probed))
+	for id := range c.probed {
+		ids = append(ids, id)
+	}
+	c.mu.Unlock()
+	sort.Strings(ids)
+	for _, id := range ids {
+		if err := c.proveTarget(ctx, id, true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ask sends each probe in order. It returns at the first yes
+// (ErrOverPrivileged, recorded as sticky) or the first failure
+// (ErrPrivilegeUnproven). scope says what was asked about, without
+// naming it.
+func (c *Connector) ask(ctx context.Context, probes []Probe, scope string) error {
+	for _, p := range probes {
+		yes, err := c.client.CanI(ctx, p)
+		if err != nil {
+			if p.Resource == ResourceApplications && p.Action == ActionRollback && errors.Is(err, ErrBadRequest) {
+				// No rollback action on this Argo CD: rollback is
+				// enforced as sync, already asked and answered no.
+				continue
+			}
+			return fmt.Errorf("argocd: can-i probe for %s %s on %s failed: %w", p.Resource, p.Action, scope, connectors.ErrPrivilegeUnproven)
+		}
+		if yes {
+			c.mu.Lock()
+			c.over = true
+			c.mu.Unlock()
+			return fmt.Errorf("argocd: the token may %s %s on %s: %w", p.Action, p.Resource, scope, connectors.ErrOverPrivileged)
+		}
+	}
+	return nil
+}
+
+func (c *Connector) isOver() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.over
+}
+
+// proveTarget asks the TargetProbes of target id for the AppProject its
+// last verified read recorded. Unless force is set, a target already
+// proven for that AppProject is not asked again (Check repeats it on
+// every recheck).
+func (c *Connector) proveTarget(ctx context.Context, id string, force bool) error {
+	c.mu.Lock()
+	project, ok := c.probed[id]
+	done := c.proven[id]
+	c.mu.Unlock()
+	if !ok || (done && !force) {
+		return nil
+	}
+	err := c.ask(ctx, TargetProbes(project, c.apps[id]), fmt.Sprintf("target %q", id))
+	c.mu.Lock()
+	if c.probed[id] == project {
+		c.proven[id] = err == nil
+	}
+	c.mu.Unlock()
+	return err
+}
+
+// recordProject records the AppProject a verified read of target id
+// named. A new AppProject makes the target unproven until asked.
+func (c *Connector) recordProject(id, project string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.probed == nil {
+		c.probed = make(map[string]string, len(c.apps))
+		c.proven = make(map[string]bool, len(c.apps))
+	}
+	if c.probed[id] != project {
+		c.probed[id] = project
+		c.proven[id] = false
+	}
+}
+
+// checkToken is step 1 of Check.
+func (c *Connector) checkToken(ctx context.Context) error {
 	info, err := c.client.GetUserInfo(ctx)
 	switch {
 	case errors.Is(err, ErrUnauthorized), errors.Is(err, ErrForbidden), errors.Is(err, ErrNoToken):
@@ -90,6 +225,15 @@ func (c *Connector) Check(ctx context.Context) error {
 // failures become an error observation with a schema error code and a
 // nil error, so the control plane learns why and schedules another
 // pass. The error never carries connector text.
+//
+// A verified read in an allowed AppProject runs the target's
+// TargetProbes before the first observation of that target in that
+// AppProject is returned (Check repeats them on every recheck). A yes
+// returns connectors.ErrOverPrivileged and a failed probe
+// connectors.ErrPrivilegeUnproven, each with an internal error
+// observation that carries nothing read; the registry then marks the
+// connector over_privileged or unverified. After a yes, Observe reads
+// nothing more.
 //
 // The first successful read of a target records the Application's uid.
 // An answer with no valid uid is an internal error. A later answer with
@@ -117,6 +261,10 @@ func (c *Connector) Observe(ctx context.Context, target connectors.Target) (conn
 		// the second wall, and nothing is read.
 		return obs, connectors.ErrUnboundTarget
 	}
+	if c.isOver() {
+		// Sticky: nothing more is read through an over-privileged token.
+		return obs, fmt.Errorf("argocd: target %q: %w", target.ID, connectors.ErrOverPrivileged)
+	}
 	app, err := c.client.GetApplication(ctx, binding.Name, binding.AppNamespace)
 	obs.ObservedAt = c.now().UTC()
 	if err == nil {
@@ -129,6 +277,17 @@ func (c *Connector) Observe(ctx context.Context, target connectors.Target) (conn
 			obs.Outcome = connectors.OutcomeError
 			obs.Evidence = contract.StageEvidence{ErrorCode: contract.ErrorResourceNotFound}
 			return obs, fmt.Errorf("argocd: target %q: %w", target.ID, connectors.ErrTargetIdentityChanged)
+		}
+		if _, ok := c.projects[app.Project]; ok {
+			// The per-target probe: before the first observation of a
+			// target in an AppProject, ask its TargetProbes. A yes or a
+			// failed probe returns no observation of the target.
+			c.recordProject(target.ID, app.Project)
+			if perr := c.proveTarget(ctx, target.ID, false); perr != nil {
+				obs.Outcome = connectors.OutcomeError
+				obs.Evidence = contract.StageEvidence{ErrorCode: contract.ErrorInternal}
+				return obs, perr
+			}
 		}
 	}
 	d := Decide(app, err, c.projects, target.NotBefore)
@@ -274,7 +433,7 @@ func errorCodeFor(err error) contract.ErrorCode {
 		return contract.ErrorConnectorTimeout
 	case errors.Is(err, ErrTLS):
 		return contract.ErrorTLSVerificationFailed
-	case errors.Is(err, ErrResponseTooLarge):
+	case errors.Is(err, ErrResponseTooLarge), errors.Is(err, ErrTooManyApplications):
 		return contract.ErrorResponseTooLarge
 	case errors.Is(err, ErrRateLimited):
 		return contract.ErrorRateLimited

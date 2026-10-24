@@ -34,7 +34,8 @@ func argoOnlyFile(t *testing.T) (string, func() []string) {
 		mu.Lock()
 		calls = append(calls, r.Method+" "+r.URL.Path)
 		mu.Unlock()
-		_, _ = io.WriteString(w, `{"loggedIn":true}`)
+		// One body answers both the userinfo and the can-i decode.
+		_, _ = io.WriteString(w, `{"loggedIn":true,"value":"no"}`)
 	}))
 	t.Cleanup(argo.Close)
 	dir := t.TempDir()
@@ -152,7 +153,7 @@ func TestBoot_ArgoCDOnlyNeedsNoKubernetes(t *testing.T) {
 				t.Fatalf("argocd-only boot sent %d request(s) to the Kubernetes address", n)
 			}
 			for _, c := range argoCalls() {
-				if c != "GET /api/v1/session/userinfo" {
+				if c != "GET /api/v1/session/userinfo" && !slices.Contains(argoCheckCalls[1:], c) {
 					t.Fatalf("unexpected ArgoCD request %q", c)
 				}
 			}

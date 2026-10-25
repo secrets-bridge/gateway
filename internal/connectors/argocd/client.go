@@ -781,6 +781,12 @@ func summaryFrom(raw rawSummary, project string) (AppSummary, bool) {
 	if raw.Spec.Project != project || !validAppName(m.Name) || !validNamespace(m.Namespace) || !validUID(m.UID) {
 		return AppSummary{}, false
 	}
+	// A name or namespace the transport refuses as a stream segment
+	// (exec, attach, portforward, proxy, log) can be neither probed nor
+	// read, so its per-target probe would fail the whole run.
+	if readonly.IsStreamSegment(m.Name) || readonly.IsStreamSegment(m.Namespace) {
+		return AppSummary{}, false
+	}
 	return AppSummary{Name: m.Name, Namespace: m.Namespace, UID: m.UID, Project: project}, true
 }
 

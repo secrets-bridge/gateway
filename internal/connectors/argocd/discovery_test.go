@@ -14,6 +14,7 @@ import (
 	"github.com/secrets-bridge/gateway/internal/connectors"
 	"github.com/secrets-bridge/gateway/internal/connectors/argocd/argotest"
 	"github.com/secrets-bridge/gateway/internal/contract"
+	"github.com/secrets-bridge/gateway/internal/readonly"
 )
 
 // Tests for discovery (ADR 0002 slice S3) against a fake Argo CD that
@@ -258,6 +259,49 @@ func TestDiscover_SanitizesAndCounts(t *testing.T) {
 	}
 	if lists != len(discProjects) {
 		t.Fatalf("%d list reads, want one per allowed AppProject", lists)
+	}
+}
+
+// An Application named like a transport stream segment, or living in a
+// namespace named like one, is dropped and counted instead of failing
+// the run: its per-target probe would be refused locally, which made the
+// connector unproven and stopped every claim on the Gateway. Nothing is
+// asked about it.
+func TestDiscover_StreamSegmentNamesAreRejected(t *testing.T) {
+	a := argotest.New(t)
+	a.SetApps(
+		argotest.App{Name: "payments-api", Namespace: "argocd", UID: dUID(1), Project: "team-a-apps"},
+		argotest.App{Name: "log", Namespace: "argocd", UID: dUID(2), Project: "team-a-apps"},
+		argotest.App{Name: "proxy", Namespace: "argocd", UID: dUID(3), Project: "team-a-apps"},
+		argotest.App{Name: "exec", Namespace: "argocd", UID: dUID(4), Project: "team-a-apps"},
+		argotest.App{Name: "attach", Namespace: "argocd", UID: dUID(5), Project: "team-a-apps"},
+		argotest.App{Name: "portforward", Namespace: "argocd", UID: dUID(6), Project: "team-b-apps"},
+		argotest.App{Name: "payments-web", Namespace: "proxy", UID: dUID(7), Project: "team-b-apps"},
+	)
+	c := discConnector(t, a, nil, nil)
+	r := registryOf(t, c)
+	run, err := r.Discover(context.Background(), "argocd-main", farFuture())
+	if err != nil {
+		t.Fatalf("Discover with stream-segment names = %v; want the run to succeed", err)
+	}
+	if len(run.Targets) != 1 || run.Targets[0].Name != "payments-api" || run.Rejected != 6 {
+		t.Fatalf("run = %+v; want payments-api only and 6 rejected", run)
+	}
+	// The object of a can-i question (after resource and action) carries
+	// the AppProject, namespace and name; none may be a stream segment.
+	lines, _ := a.Requests()
+	for _, l := range lines {
+		path, ok := strings.CutPrefix(l, "GET /api/v1/account/can-i/")
+		if !ok {
+			continue
+		}
+		path, _, _ = strings.Cut(path, "?")
+		segs := strings.Split(path, "/")
+		for _, seg := range segs[min(2, len(segs)):] {
+			if readonly.IsStreamSegment(seg) {
+				t.Fatalf("asked about a stream-segment name: %s", l)
+			}
+		}
 	}
 }
 

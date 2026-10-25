@@ -202,9 +202,11 @@ func (c *Connector) SnapshotMaxAge() time.Duration { return c.disc.maxAge }
 //     the byte cap or an item over the count cap fails the whole run
 //     with connectors.ErrCatalogTooLarge: nothing is returned.
 //  2. Each item is kept only with a valid name, namespace, uid and an
-//     AppProject equal to the one asked for (C3, C5). Every other item
-//     is dropped and counted in Rejected. A uid seen twice is dropped
-//     every time it appears, and counted.
+//     AppProject equal to the one asked for (C3, C5), and a name and
+//     namespace that are not transport stream segments (exec, attach,
+//     portforward, proxy, log): those can be neither probed nor read.
+//     Every other item is dropped and counted in Rejected. A uid seen
+//     twice is dropped every time it appears, and counted.
 //  3. The target id is derived from the uid (C3).
 //  4. Every new target (not in the installed snapshot under the same
 //     AppProject, namespace and name, and not probed since under them)

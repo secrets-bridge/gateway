@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://secrets-bridge.io/schemas/gateway/v2/gateway-project-teams.schema.json",
+  "title": "GatewayProjectTeams",
+  "description": "The body of PUT /api/v1/admin/gateways/{id}/connectors/{cid}/project-teams and the 200 body of the matching GET (ADR 0002 C4; docs/design/discovery-contract.md section 8.3). Full replace of a connector's AppProject to team mapping. Platform admins only.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["mappings"],
+  "properties": {
+    "mappings": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["app_project", "team_ids"],
+        "properties": {
+          "app_project": {
+            "type": "string",
+            "maxLength": 253,
+            "pattern": "^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$"
+          },
+          "team_ids": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 16,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            }
+          }
+        }
+      }
+    },
+    "allowed_projects": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "description": "GET only: the allowed AppProjects from the latest accepted discovery upload, so the console can show which have no mapping.",
+      "items": {
+        "type": "string",
+        "maxLength": 253,
+        "pattern": "^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$"
+      }
+    },
+    "complete": {
+      "type": "boolean",
+      "description": "GET only: every allowed AppProject has at least one team."
+    }
+  }
+}

@@ -70,6 +70,9 @@ type discCP struct {
 	grantTo string
 	floor   time.Duration
 	ttl     time.Duration
+	// runSpacing is the replicas' DiscoveryRunSpacing (zero: the
+	// connector's discovery interval).
+	runSpacing time.Duration
 
 	lease       *cpLease
 	gen         int64
@@ -375,7 +378,7 @@ func newReplicaOn(t *testing.T, cp *discCP, id string, key *snapshot.Key, a *arg
 		LeaseMargin: 500 * time.Millisecond, MinStageBudget: 50 * time.Millisecond, DrainTimeout: 2 * time.Second,
 		CallTimeout: 2 * time.Second, ResultRetry: []time.Duration{20 * time.Millisecond},
 		Jitter:      func(time.Duration, float64, float64) time.Duration { return 10 * time.Millisecond },
-		SnapshotKey: key,
+		SnapshotKey: key, DiscoveryRunSpacing: cp.runSpacing,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -852,7 +855,7 @@ func sha256Of(s string) []byte {
 // in the next upload; the old one is gone.
 func TestDiscovery_RecreateGivesNewTargetID(t *testing.T) {
 	cp := newDiscCP(t)
-	cp.floor = 0
+	cp.floor, cp.runSpacing = 0, time.Millisecond
 	cp.grantTo = replicaA
 	key, _ := testKey(t)
 	r := newReplica(t, cp, replicaA, key, defaultApps()[:1], nil)
@@ -871,6 +874,49 @@ func TestDiscovery_RecreateGivesNewTargetID(t *testing.T) {
 	waitFor(t, "the holder's new snapshot", func() bool {
 		return r.reg.TargetStatus(testDiscConn, newID) == connectors.TargetBound && r.reg.TargetStatus(testDiscConn, payID()) == connectors.TargetUnbound
 	})
+}
+
+// The Gateway keeps its own run spacing (ADR 0002 C9): a control plane
+// that grants a new lease as soon as the last upload is accepted gets
+// one run per discovery interval, not one per heartbeat. The early lease
+// is ignored and left to expire.
+func TestDiscovery_GatewayKeepsTheRunSpacing(t *testing.T) {
+	cp := newDiscCP(t)
+	cp.floor, cp.ttl, cp.grantTo = 0, 20*time.Second, replicaA
+	key, _ := testKey(t)
+	r := newReplica(t, cp, replicaA, key, defaultApps(), nil)
+	r.start(t)
+	waitFor(t, "a first upload", func() bool { _, acc, _, _, _, _ := cp.snap(); return acc != nil })
+	waitFor(t, "an early lease ignored", func() bool { return r.counter(t, "sb_gateway_discovery_runs_total", "too_soon") >= 1 })
+	uploads, _, _, _, _, _ := cp.snap()
+	if len(uploads) != 1 {
+		t.Fatalf("%d uploads; want 1, the second lease came before the discovery interval", len(uploads))
+	}
+	if lists, _, _ := r.argo.Counts(); lists != len(discProjects) {
+		t.Fatalf("%d list reads; want %d, one run", lists, len(discProjects))
+	}
+}
+
+// A run never holds on past the longest lease the contract allows,
+// whatever expires_at says.
+func TestRunDeadline(t *testing.T) {
+	now := time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC)
+	margin := time.Second + leaseUploadMargin
+	for _, tc := range []struct {
+		expires time.Time
+		offset  time.Duration
+		want    time.Time
+	}{
+		{now.Add(5 * time.Minute), 0, now.Add(5*time.Minute - margin)},
+		{now.Add(5 * time.Minute), 2 * time.Second, now.Add(5*time.Minute + 2*time.Second - margin)},
+		{now.Add(15 * time.Minute), 0, now.Add(15*time.Minute - margin)},
+		{now.Add(24 * time.Hour), 0, now.Add(maxLeaseTTL - margin)},
+		{now.Add(10000 * time.Hour), time.Hour, now.Add(maxLeaseTTL - margin)},
+	} {
+		if got := runDeadline(now, tc.expires, tc.offset); !got.Equal(tc.want) {
+			t.Errorf("runDeadline(expires %s, offset %s) = %s; want %s", tc.expires.Sub(now), tc.offset, got.Sub(now), tc.want.Sub(now))
+		}
+	}
 }
 
 // Discovery off: no new request at all, and the heartbeat carries no

@@ -242,7 +242,7 @@ Negotiation: every heartbeat lists contracts `1` and `2`. The first heartbeat af
 
 Scope digest (C6): `scope_digest` is SHA-256 over the canonical JSON of the kind, `endpoint_digest`, the sorted allowed AppProjects, the discovery switch and the identity mode. `endpoint_digest` is SHA-256 over a label, the Gateway id, the connector id (both length-prefixed) and the normalized base URL. The URL itself is never sent.
 
-Run, by the lease holder only: a heartbeat response grants a lease to at most one replica per connector. The holder:
+Run, by the lease holder only: a heartbeat response grants a lease to at most one replica per connector. A replica starts at most one run per connector per discovery `interval` (60 seconds or more), whatever leases the control plane sends: a lease that comes earlier is ignored and left to expire, and counted as `too_soon` (C9). A run never holds on past 15 minutes from its start, the longest lease the contract allows, whatever `expires_at` says. The holder:
 
 1. takes `discovered_at` (Gateway clock, whole seconds) and must have its upload answered before `expires_at` minus 15 seconds, read on the local clock through the `Date` offset;
 2. lists each allowed AppProject once through the C1 route, carrying the count cap across them; a body or count over a cap refuses the whole run with `catalog_too_large`;

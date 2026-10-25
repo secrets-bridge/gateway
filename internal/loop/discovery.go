@@ -29,6 +29,9 @@ const (
 	// minFetchSpacing bounds how often a replica fetches the snapshot of
 	// one connector.
 	minFetchSpacing = 30 * time.Second
+	// maxLeaseTTL is the longest lease the contract allows (decision
+	// E-3). A run never holds on past it, whatever expires_at says.
+	maxLeaseTTL = 15 * time.Minute
 )
 
 // Discovery log messages and reasons, fixed text only.
@@ -54,6 +57,9 @@ type discovery struct {
 type discConn struct {
 	running  bool
 	fetching bool
+	// lastRun is when the last discovery run of the connector started
+	// on this replica.
+	lastRun time.Time
 	// highest is the highest generation this process has opened or had
 	// accepted (section 5.5 rule 4).
 	highest   int64
@@ -209,14 +215,26 @@ func (l *Loop) applyBound(version string, list []client.BoundTargets) {
 }
 
 // startRun starts the discovery run of one lease, unless one is already
-// running for the connector.
+// running for the connector or the last one started less than the run
+// spacing ago. The spacing holds on the Gateway side whatever leases the
+// control plane sends (ADR 0002 C9): a lease that comes too early is
+// left to expire, and the control plane burns its generation.
 func (l *Loop) startRun(ctx context.Context, ls client.DiscoveryLease, offset time.Duration) {
+	spacing := l.runSpacing(ls.ConnectorID)
+	now := l.cfg.Now()
 	l.disc.mu.Lock()
 	dc := l.disc.conn(ls.ConnectorID)
 	if dc.running {
 		l.disc.mu.Unlock()
 		return
 	}
+	if !dc.lastRun.IsZero() && now.Sub(dc.lastRun) < spacing {
+		l.disc.mu.Unlock()
+		l.m.discoveryRun("too_soon")
+		l.log.Info("discovery lease ignored: the last run of the connector started less than its interval ago", "connector_id", ls.ConnectorID)
+		return
+	}
+	dc.lastRun = now
 	dc.running = true
 	l.disc.wg.Add(1)
 	l.disc.mu.Unlock()
@@ -236,6 +254,32 @@ func (l *Loop) startRun(ctx context.Context, ls client.DiscoveryLease, offset ti
 	}()
 }
 
+// runSpacing is the shortest time between two discovery runs of the
+// connector: the configured spacing, or the connector's discovery
+// interval (60s or more by its settings).
+func (l *Loop) runSpacing(connectorID string) time.Duration {
+	if l.cfg.DiscoveryRunSpacing > 0 {
+		return l.cfg.DiscoveryRunSpacing
+	}
+	d, ok := l.cfg.Connectors.Discoverer(connectorID)
+	if !ok {
+		return time.Minute
+	}
+	return max(time.Minute, time.Duration(d.Scope(l.cfg.GatewayID).IntervalSeconds)*time.Second)
+}
+
+// runDeadline is when a run of a lease must stop: the lease expiry on
+// the local clock, read a second early because Date has one-second
+// resolution, minus the upload margin, and never later than the longest
+// lease the contract allows from now.
+func runDeadline(now, expiresAt time.Time, offset time.Duration) time.Time {
+	end := expiresAt.Add(offset)
+	if limit := now.Add(maxLeaseTTL); end.After(limit) {
+		end = limit
+	}
+	return end.Add(-time.Second - leaseUploadMargin)
+}
+
 // runDiscovery is one discovery run of the lease holder (sequence 9.1).
 // It never publishes a partial catalog: a cap, a failed probe or a
 // failed seal ends the run with nothing sent, and the replica keeps its
@@ -248,9 +292,7 @@ func (l *Loop) runDiscovery(ctx context.Context, ls client.DiscoveryLease, offse
 		return
 	}
 	now := l.cfg.Now()
-	// The lease expiry on the local clock, read a second early because
-	// Date has one-second resolution, minus the upload margin.
-	deadline := ls.ExpiresAt.Add(offset - time.Second - leaseUploadMargin)
+	deadline := runDeadline(now, ls.ExpiresAt, offset)
 	if !now.Before(deadline) {
 		l.m.discoveryRun("abandoned")
 		log.Info("discovery lease too short; run abandoned")

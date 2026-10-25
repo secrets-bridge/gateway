@@ -41,7 +41,7 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		}, []string{"outcome"}),
 		discovery: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "sb_gateway_discovery_runs_total",
-			Help: "Discovery runs by outcome (accepted, duplicate, catalog_too_large, lease_not_held, discovery_generation_stale, scope_digest_mismatch, schema_violation, connector_not_found, invalid_request, over_privileged, abandoned, error).",
+			Help: "Discovery runs by outcome (accepted, duplicate, catalog_too_large, lease_not_held, discovery_generation_stale, scope_digest_mismatch, schema_violation, connector_not_found, invalid_request, over_privileged, abandoned, too_soon, error).",
 		}, []string{"outcome"}),
 		fetches: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "sb_gateway_snapshot_fetches_total",

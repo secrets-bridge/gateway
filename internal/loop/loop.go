@@ -143,6 +143,12 @@ type Config struct {
 	// SnapshotKey seals and opens discovery snapshots. It is required
 	// when any connector has discovery on, and never leaves the process.
 	SnapshotKey *snapshot.Key
+	// DiscoveryRunSpacing is the shortest time between the starts of two
+	// discovery runs of one connector on this replica, whatever leases
+	// the control plane sends. Zero means the connector's discovery
+	// interval, which its settings keep at 60s or more (ADR 0002 C9).
+	// Tests set it lower.
+	DiscoveryRunSpacing time.Duration
 
 	// Now and Jitter are for tests.
 	Now    func() time.Time

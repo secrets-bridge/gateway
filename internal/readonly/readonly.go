@@ -81,6 +81,12 @@ var streamSegments = map[string]bool{
 	"log":         true,
 }
 
+// IsStreamSegment reports whether s, compared in lower case, is one of
+// the stream segments the transport refuses outside an exact stream
+// route. A name that is one cannot be read or asked about through the
+// transport, so callers that take names from outside drop it.
+func IsStreamSegment(s string) bool { return streamSegments[strings.ToLower(s)] }
+
 // Errors returned by the transport. None of them repeats any part of the
 // request URL.
 var (

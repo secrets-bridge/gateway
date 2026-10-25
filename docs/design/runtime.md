@@ -246,7 +246,7 @@ Run, by the lease holder only: a heartbeat response grants a lease to at most on
 
 1. takes `discovered_at` (Gateway clock, whole seconds) and must have its upload answered before `expires_at` minus 15 seconds, read on the local clock through the `Date` offset;
 2. lists each allowed AppProject once through the C1 route, carrying the count cap across them; a body or count over a cap refuses the whole run with `catalog_too_large`;
-3. keeps an item only with a valid name, namespace and uid in the AppProject it asked for (C3, C5), and drops and counts every other one in `entries_rejected`; a uid seen twice is dropped each time;
+3. keeps an item only with a valid name, namespace and uid in the AppProject it asked for (C3, C5), and a name and namespace that are not a transport stream segment (`exec`, `attach`, `portforward`, `proxy`, `log`, which can be neither probed nor read), and drops and counts every other one in `entries_rejected`; a uid seen twice is dropped each time;
 4. derives each target id from the uid, `d-` and 26 base32 characters (C3), so a deleted and recreated Application is a new target and a rename or project move keeps its id;
 5. runs the per-target probe of every new target before it can enter the snapshot (C2). Targets the probe cannot reach before the deadline are left out and counted in `entries_deferred`, and are probed first next run. A `yes` stops the replica `over_privileged`; a failed probe leaves the connector unverified (decision D10). Either way nothing is uploaded;
 6. seals the targets (id, AppProject, namespace, name, uid) with AES-256-GCM under the seal key and a fresh nonce, with associated data that binds the Gateway id, the connector id, the generation and `discovered_at`;

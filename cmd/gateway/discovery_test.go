@@ -33,6 +33,12 @@ func writeKey(t *testing.T, content string, mode os.FileMode) string {
 	if err := os.WriteFile(p, []byte(content), mode); err != nil {
 		t.Fatal(err)
 	}
+	// WriteFile applies the process umask, so set the mode the case
+	// asks for explicitly. Under umask 077 a 0o644 key would otherwise
+	// land as 0o600 and the world-readable case would pass the check.
+	if err := os.Chmod(p, mode); err != nil {
+		t.Fatal(err)
+	}
 	return p
 }
 

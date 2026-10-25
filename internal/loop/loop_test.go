@@ -811,6 +811,11 @@ func TestLoop_UnverifiedConnectorStopsWork(t *testing.T) {
 
 	unproven.Store(true)
 	waitFor(t, "not ready after a failing recheck", func() bool { return !h.ready.ready.Load() })
+	// Readiness drops in the heartbeat loop, but a claim that passed
+	// claimBlocker just before the recheck can still be in flight and
+	// would take a task queued now. The single claim goroutine logs the
+	// pause only after that call returned, so queue the task after it.
+	waitFor(t, "claiming paused", func() bool { return strings.Contains(h.logs.String(), "claiming paused") })
 	before := h.cp.snapshot().claimCalls
 	// A task queued now must not be claimed while the connector is
 	// unverified.
@@ -819,8 +824,7 @@ func TestLoop_UnverifiedConnectorStopsWork(t *testing.T) {
 	}}))
 	time.Sleep(300 * time.Millisecond)
 	after := h.cp.snapshot()
-	// One claim may have been in flight when readiness dropped.
-	if after.claimCalls > before+1 {
+	if after.claimCalls != before {
 		t.Fatalf("claiming continued while unverified: %d -> %d claim calls", before, after.claimCalls)
 	}
 	if len(after.results) != 0 {
@@ -837,9 +841,6 @@ func TestLoop_UnverifiedConnectorStopsWork(t *testing.T) {
 	}
 	if rollout.calls.Load() != calls {
 		t.Fatal("the unverified connector was read")
-	}
-	if !strings.Contains(h.logs.String(), "claiming paused") {
-		t.Fatal("pause not logged")
 	}
 
 	unproven.Store(false)

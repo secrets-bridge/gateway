@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/secrets-bridge/gateway/internal/connectors"
@@ -29,20 +30,31 @@ const (
 	// status.resources lists can exceed small caps; the body is decoded
 	// into a struct holding only the fields the connector uses.
 	MaxResponseBytes = 2 << 20
-	// MaxListResponseBytes caps one application list response. The list
-	// is read with the fields projection, but a server that ignores it
-	// returns whole Applications, so the cap is what bounds the read.
-	MaxListResponseBytes = 8 << 20
-	// MaxListApplications caps the number of items in one list response.
-	// More is refused with ErrTooManyApplications, never truncated.
-	MaxListApplications = 1000
+	// DefaultListResponseBytes is the default cap on one application list
+	// response (discovery.max_response_bytes, ADR 0002 C1 and decision
+	// D3). The list is read with the fields projection, but a server that
+	// ignores it returns whole Applications, so the cap is what bounds
+	// the read. A larger body fails the whole discovery run.
+	DefaultListResponseBytes = 16 << 20
+	// MaxListResponseBytes is the hard maximum settings may ask for.
+	MaxListResponseBytes = 64 << 20
+	// MinListResponseBytes is the smallest cap settings may ask for.
+	MinListResponseBytes = 1 << 10
+	// DefaultMaxApplications is the default cap on the Applications one
+	// discovery run decodes across all allowed AppProjects
+	// (discovery.max_applications). One more fails the run.
+	DefaultMaxApplications = 2000
+	// MaxApplications is the hard maximum settings may ask for.
+	MaxApplications = 10000
 )
 
 // ListFields is the only value the transport admits for the fields query
-// key of the application list: the projection of the decoded fields.
-// The decode does not rely on the server honouring it.
-const ListFields = "items.metadata.name,items.metadata.namespace,items.metadata.uid," +
-	"items.metadata.creationTimestamp,items.spec.project"
+// key of the application list: the projection of the decoded fields
+// (ADR 0002 C1). It carries no creationTimestamp (decision D3): first
+// seen comes from the control-plane clock. The decode does not rely on
+// the server honouring it.
+const ListFields = "metadata.resourceVersion,items.metadata.name,items.metadata.namespace," +
+	"items.metadata.uid,items.spec.project"
 
 // Query keys the transport admits.
 const (
@@ -169,8 +181,8 @@ var (
 	// ProjectProbes of an allowed AppProject, the TargetProbes of a
 	// configured target in one, or ReadProbe. Nothing is sent.
 	ErrProjectNotAllowed = errors.New("argocd: AppProject or can-i question is not in the local allowlist")
-	// ErrTooManyApplications: a list response held more than
-	// MaxListApplications items.
+	// ErrTooManyApplications: the list responses of one discovery run
+	// held more items than its count cap.
 	ErrTooManyApplications = errors.New("argocd: application list exceeds the item cap")
 	// ErrRequestRefused: the read-only transport refused the request
 	// (method or path) before it left the process.
@@ -205,10 +217,13 @@ type Config struct {
 
 	// discoveryList admits the application list route
 	// (GET <base>/api/v1/applications with projects and fields). ADR
-	// 0002 condition C1 admits it only while discovery is on, and there
-	// is no discovery setting yet, so nothing outside this package's
-	// tests sets it and the live policy has no list route.
+	// 0002 condition C1 admits it only while discovery is on: build sets
+	// it from discovery.enabled, and without it the policy has no list
+	// route.
 	discoveryList bool
+	// listMaxBytes caps one list response (discovery.max_response_bytes).
+	// Zero means DefaultListResponseBytes.
+	listMaxBytes int64
 }
 
 // Client is the read-only ArgoCD HTTP client.
@@ -227,8 +242,8 @@ type Config struct {
 // The application list, <base>/api/v1/applications with projects
 // required (exactly one value, in the local AppProject allowlist) and
 // fields required (exactly one value, ListFields), is admitted only
-// while discovery is on (ADR 0002 condition C1). There is no discovery
-// setting yet, so a client built from settings has no list route.
+// while discovery is on (ADR 0002 condition C1); a client built from
+// settings with discovery off has no list route.
 //
 // Every other method, path and query key is refused before the request
 // leaves the process. resource-tree, managed-resources and manifests are
@@ -251,6 +266,17 @@ type Client struct {
 	canI map[string]struct{}
 	// list is set when the policy admits the application list.
 	list bool
+	// listMaxBytes caps one list response.
+	listMaxBytes int64
+
+	// dmu guards discovered: the can-i path of every per-target question
+	// admitted for a discovered Application (ADR 0002 C2: an exact path
+	// built from the fixed actions, an allowed AppProject and an
+	// Application name in the current validated snapshot or the
+	// candidates of the run in progress). It is replaced, never widened
+	// by a pattern.
+	dmu        sync.RWMutex
+	discovered map[string]bool
 }
 
 // Paths under the base URL. Only these are in the transport policy.
@@ -299,7 +325,19 @@ func New(cfg Config) (*Client, error) {
 	// Redirects are refused by readonly.NewClient: following one would
 	// re-send the bearer token to wherever Location points, including an
 	// http:// downgrade or another host. do() reports ErrRedirectRefused.
-	hc, err := readonly.NewClient(next, policyFor(base, projects, probes, cfg.discoveryList), timeout)
+	listMax := cfg.listMaxBytes
+	if listMax == 0 {
+		listMax = DefaultListResponseBytes
+	}
+	if listMax < MinListResponseBytes || listMax > MaxListResponseBytes {
+		return nil, errors.New("argocd: list response cap is out of range")
+	}
+	c := &Client{base: base, token: cfg.Token, projects: projects, list: cfg.discoveryList, listMaxBytes: listMax}
+	pol := policyFor(base, projects, probes, cfg.discoveryList)
+	if cfg.discoveryList {
+		pol.Exact = c.discoveredRoute
+	}
+	hc, err := readonly.NewClient(next, pol, timeout)
 	if err != nil {
 		return nil, errors.New("argocd: base URL path cannot form a request allowlist")
 	}
@@ -307,7 +345,69 @@ func New(cfg Config) (*Client, error) {
 	for _, p := range probes {
 		canI[canIPath(base, p)] = struct{}{}
 	}
-	return &Client{base: base, token: cfg.Token, hc: hc, tlsCfg: next.TLSClientConfig, projects: projects, canI: canI, list: cfg.discoveryList}, nil
+	c.hc, c.tlsCfg, c.canI = hc, next.TLSClientConfig, canI
+	return c, nil
+}
+
+// DiscoveredApp names one discovered Application for its per-target
+// can-i questions.
+type DiscoveredApp struct {
+	Project   string
+	Namespace string
+	Name      string
+}
+
+// SetDiscoveredProbes replaces the per-target can-i questions admitted
+// for discovered Applications with the DiscoveredProbes of apps. An app
+// whose AppProject is not allowed or whose names are not valid admits
+// nothing. A client without the list route (discovery off) admits none.
+func (c *Client) SetDiscoveredProbes(apps []DiscoveredApp) {
+	if !c.list {
+		return
+	}
+	set := make(map[string]bool, len(apps)*2*(len(AppActions)+2))
+	for _, a := range apps {
+		if _, ok := c.projects[a.Project]; !ok || !validAppName(a.Name) || !connectors.ValidName(a.Namespace) {
+			continue
+		}
+		for _, p := range DiscoveredProbes(a) {
+			set[canIPath(c.base, p)] = true
+		}
+	}
+	c.dmu.Lock()
+	c.discovered = set
+	c.dmu.Unlock()
+}
+
+// discoveredRoute is the transport's Exact hook: an exact can-i path of
+// a currently admitted discovered Application. The exec resource name is
+// a plain path parameter there, as for the static routes.
+func (c *Client) discoveredRoute(path string) (ok, streamName bool) {
+	c.dmu.RLock()
+	defer c.dmu.RUnlock()
+	if !c.discovered[path] {
+		return false, false
+	}
+	return true, strings.HasPrefix(path, c.base.Path+canIBasePath+"/"+ResourceExec+"/")
+}
+
+func (c *Client) admitted(path string) bool {
+	if _, ok := c.canI[path]; ok {
+		return true
+	}
+	c.dmu.RLock()
+	defer c.dmu.RUnlock()
+	return c.discovered[path]
+}
+
+// DiscoveredProbes are the per-target questions of one discovered
+// Application: each application action, exec create and logs get on
+// <project>/<app> and on <project>/<namespace>/<app>. Both object forms
+// are asked for every discovered Application, because the Gateway does
+// not know which namespace is the Argo CD control-plane namespace, and
+// only Argo CD 3.4 and later normalize the second form on can-i.
+func DiscoveredProbes(a DiscoveredApp) []Probe {
+	return TargetProbes(a.Project, AppBinding{Name: a.Name, AppNamespace: a.Namespace})
 }
 
 // allowedProbes is every can-i question the client may send: the
@@ -545,24 +645,22 @@ func validAppName(s string) bool {
 }
 
 // AppSummary is one item of the application list: the identity and
-// AppProject of an Application, nothing else. It feeds a future catalog
-// only; it is never evidence.
+// AppProject of an Application, nothing else. It feeds the discovery
+// catalog and snapshot only; it is never evidence (ADR 0002 C7).
 type AppSummary struct {
 	Name      string
 	Namespace string
 	UID       string
 	Project   string
-	CreatedAt time.Time
 }
 
 // rawSummary mirrors only the list item fields AppSummary keeps. Every
 // other field the server sends, projected or not, is skipped.
 type rawSummary struct {
 	Metadata struct {
-		Name              string `json:"name"`
-		Namespace         string `json:"namespace"`
-		UID               string `json:"uid"`
-		CreationTimestamp string `json:"creationTimestamp"`
+		Name      string `json:"name"`
+		Namespace string `json:"namespace"`
+		UID       string `json:"uid"`
 	} `json:"metadata"`
 	Spec struct {
 		Project string `json:"project"`
@@ -571,45 +669,49 @@ type rawSummary struct {
 
 // ListApplications lists the Applications of one allowed AppProject:
 // GET <base>/api/v1/applications?projects=<project>&fields=ListFields.
-// It is not called by Release 1; it exists for discovery (ADR 0002) and
-// its tests. A client without the list route (every client built from
-// settings until discovery exists) refuses it with ErrRequestRefused
-// and sends nothing.
+// Only discovery calls it. A client without the list route (discovery
+// off) refuses it with ErrRequestRefused and sends nothing.
 //
 // The project must be in the local allowlist, or nothing is sent. The
-// response is read up to MaxListResponseBytes and decoded item by item
-// into rawSummary; more than MaxListApplications items is
-// ErrTooManyApplications. An item is kept only when its spec.project is
-// the requested project and its name, namespace and uid are valid, so
-// the result does not rely on the server's filter or projection.
-func (c *Client) ListApplications(ctx context.Context, project string) ([]AppSummary, error) {
+// response is read up to the client's list byte cap
+// (discovery.max_response_bytes; more is ErrResponseTooLarge) and
+// decoded item by item into rawSummary, so the decoder keeps nothing but
+// name, namespace, uid and project whether or not the server honoured
+// fields. More than maxItems items is ErrTooManyApplications: the caller
+// passes what is left of the run's count cap. An item is kept only when
+// its spec.project is the requested project and its name, namespace and
+// uid are valid (ADR 0002 C3, C5); every other item is dropped and
+// counted in rejected, so the result does not rely on the server's
+// filter or projection.
+func (c *Client) ListApplications(ctx context.Context, project string, maxItems int) (apps []AppSummary, rejected int, err error) {
 	if !c.list {
-		return nil, ErrRequestRefused
+		return nil, 0, ErrRequestRefused
 	}
 	if _, ok := c.projects[project]; !ok {
-		return nil, ErrProjectNotAllowed
+		return nil, 0, ErrProjectNotAllowed
 	}
 	u := *c.base
 	u.Path = c.base.Path + applicationsPath
 	u.RawQuery = url.Values{ProjectsQueryKey: {project}, FieldsQueryKey: {ListFields}}.Encode()
 	var out []AppSummary
-	err := c.doStream(ctx, &u, MaxListResponseBytes, func(dec *json.Decoder) error {
-		return decodeList(dec, func(raw rawSummary) {
+	err = c.doStream(ctx, &u, c.listMaxBytes, func(dec *json.Decoder) error {
+		return decodeList(dec, maxItems, func(raw rawSummary) {
 			if s, ok := summaryFrom(raw, project); ok {
 				out = append(out, s)
+			} else {
+				rejected++
 			}
 		})
 	})
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return out, nil
+	return out, rejected, nil
 }
 
 // decodeList walks {"items":[...], ...} and hands each item to add,
-// refusing more than MaxListApplications items. Other top-level keys are
-// skipped.
-func decodeList(dec *json.Decoder, add func(rawSummary)) error {
+// refusing more than maxItems items. Other top-level keys are skipped.
+func decodeList(dec *json.Decoder, maxItems int, add func(rawSummary)) error {
 	if err := expectDelim(dec, '{'); err != nil {
 		return err
 	}
@@ -637,7 +739,7 @@ func decodeList(dec *json.Decoder, add func(rawSummary)) error {
 			return ErrBadResponse
 		}
 		for dec.More() {
-			if n++; n > MaxListApplications {
+			if n++; n > maxItems {
 				return ErrTooManyApplications
 			}
 			var raw rawSummary
@@ -679,7 +781,7 @@ func summaryFrom(raw rawSummary, project string) (AppSummary, bool) {
 	if raw.Spec.Project != project || !validAppName(m.Name) || !validNamespace(m.Namespace) || !validUID(m.UID) {
 		return AppSummary{}, false
 	}
-	return AppSummary{Name: m.Name, Namespace: m.Namespace, UID: m.UID, Project: project, CreatedAt: parseTime(m.CreationTimestamp)}, true
+	return AppSummary{Name: m.Name, Namespace: m.Namespace, UID: m.UID, Project: project}, true
 }
 
 // CanI asks Argo CD one negative question: GET
@@ -687,10 +789,12 @@ func summaryFrom(raw rawSummary, project string) (AppSummary, bool) {
 // is true for "yes" and false for "no"; anything else is ErrBadResponse,
 // and HTTP 400 is ErrBadRequest. The question must be one of the
 // ProjectProbes of an allowed AppProject, the TargetProbes of a
-// configured application in one, or ReadProbe, or nothing is sent.
+// configured application in one, the DiscoveredProbes of a discovered
+// Application currently admitted (SetDiscoveredProbes), or ReadProbe,
+// or nothing is sent.
 func (c *Client) CanI(ctx context.Context, p Probe) (bool, error) {
 	path := canIPath(c.base, p)
-	if _, ok := c.canI[path]; !ok {
+	if !c.admitted(path) {
 		return false, ErrProjectNotAllowed
 	}
 	u := *c.base

@@ -66,7 +66,8 @@
         "scope_mismatch",
         "schema_violation",
         "unsupported_schema_version",
-        "deadline_passed"
+        "deadline_passed",
+        "target_snapshot_stale"
       ]
     },
     "stages": {

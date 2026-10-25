@@ -24,6 +24,12 @@ type Config struct {
 	// unset. The id and secret themselves are read by internal/identity
 	// and never stored here.
 	IdentityFile string
+	// SnapshotKeyFile is the snapshot_key file: a key of the Gateway
+	// identity Secret mounted as a file, standard base64 of 32 bytes. It
+	// is read only when a connector has discovery on, and never from an
+	// environment variable (ADR 0002 section 4.2). Only the path is
+	// configuration.
+	SnapshotKeyFile string
 
 	LocalAddr      string
 	ConnectorsFile string
@@ -52,14 +58,20 @@ type Config struct {
 // envEnableR2Connectors turns on the Release 2 connector kinds.
 const envEnableR2Connectors = "SB_GATEWAY_ENABLE_R2_CONNECTORS"
 
+// envSnapshotKeyFile sets the path of the snapshot_key file.
+const envSnapshotKeyFile = "SB_GATEWAY_SNAPSHOT_KEY_FILE"
+
 // envPrivilegeRecheckInterval sets the privilege recheck interval.
 const envPrivilegeRecheckInterval = "SB_GATEWAY_PRIVILEGE_RECHECK_INTERVAL"
 
 const (
-	defaultIdentityFile  = "/etc/secrets-bridge/gateway/identity.json"
-	defaultLocalAddr     = "127.0.0.1:8091"
-	defaultShutdownGrace = 15 * time.Second
-	maxClaimConcurrency  = 16
+	defaultIdentityFile = "/etc/secrets-bridge/gateway/identity.json"
+	// defaultSnapshotKeyFile sits next to the identity file: both are
+	// keys of the identity Secret.
+	defaultSnapshotKeyFile = "/etc/secrets-bridge/gateway/snapshot_key"
+	defaultLocalAddr       = "127.0.0.1:8091"
+	defaultShutdownGrace   = 15 * time.Second
+	maxClaimConcurrency    = 16
 )
 
 // parseConfig reads env vars through getenv, then flags from args. A
@@ -73,6 +85,7 @@ func parseConfig(args []string, getenv func(string) (string, bool), stderr io.Wr
 		CAFile:             e.str("SB_CP_CA_FILE", ""),
 		TLSServerName:      e.str("SB_CP_TLS_SERVER_NAME", ""),
 		IdentityFile:       e.str("SB_GATEWAY_IDENTITY_FILE", defaultIdentityFile),
+		SnapshotKeyFile:    e.str(envSnapshotKeyFile, defaultSnapshotKeyFile),
 		LocalAddr:          e.str("SB_GATEWAY_LOCAL_ADDR", defaultLocalAddr),
 		ConnectorsFile:     e.str("SB_GATEWAY_CONNECTORS_FILE", ""),
 		EnableR2Connectors: e.boolean(envEnableR2Connectors, false),
@@ -99,6 +112,7 @@ func parseConfig(args []string, getenv func(string) (string, bool), stderr io.Wr
 	fs.StringVar(&cfg.CAFile, "cp-ca-file", cfg.CAFile, "PEM bundle that replaces the system roots for the control plane (also SB_CP_CA_FILE)")
 	fs.StringVar(&cfg.TLSServerName, "cp-tls-server-name", cfg.TLSServerName, "TLS server name override for the control plane (also SB_CP_TLS_SERVER_NAME)")
 	fs.StringVar(&cfg.IdentityFile, "identity-file", cfg.IdentityFile, "JSON {gateway_id, gateway_secret}, mode 0400, 0600 or 0440 (no other bits, no group write); ignored when SB_GATEWAY_ID and SB_GATEWAY_SECRET are set (also SB_GATEWAY_IDENTITY_FILE)")
+	fs.StringVar(&cfg.SnapshotKeyFile, "snapshot-key-file", cfg.SnapshotKeyFile, "snapshot_key file from the identity Secret (base64 of 32 bytes, mode 0400, 0600 or 0440); read only when a connector has discovery on (also "+envSnapshotKeyFile+")")
 	fs.StringVar(&cfg.LocalAddr, "local-addr", cfg.LocalAddr, "loopback address for /healthz /readyz /metrics (also SB_GATEWAY_LOCAL_ADDR)")
 	fs.StringVar(&cfg.ConnectorsFile, "connectors-file", cfg.ConnectorsFile, "JSON list of locally bound connectors; empty binds none (also SB_GATEWAY_CONNECTORS_FILE)")
 	fs.BoolVar(&cfg.EnableR2Connectors, "enable-r2-connectors", cfg.EnableR2Connectors, "bind the Release 2 eso and rollout connector kinds, NOT SUPPORTED FOR PRODUCTION (also "+envEnableR2Connectors+")")

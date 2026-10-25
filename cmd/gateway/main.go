@@ -59,6 +59,7 @@ import (
 	"github.com/secrets-bridge/gateway/internal/local"
 	"github.com/secrets-bridge/gateway/internal/loop"
 	"github.com/secrets-bridge/gateway/internal/observability"
+	"github.com/secrets-bridge/gateway/internal/snapshot"
 )
 
 // buildVersion is set at link time.
@@ -86,6 +87,8 @@ type loopDeps struct {
 	Config     Config
 	ReplicaID  string
 	Version    string
+	// SnapshotKey is set when a connector has discovery on.
+	SnapshotKey *snapshot.Key
 }
 
 // newLoop builds the control-plane loop. Tests replace it.
@@ -109,6 +112,7 @@ var newLoop = func(d loopDeps) cpLoop {
 		UnreachableAfter:  d.Config.UnreachableAfter,
 
 		PrivilegeRecheckInterval: d.Config.PrivilegeRecheckInterval,
+		SnapshotKey:              d.SnapshotKey,
 		// Shutdown: wait half the grace for passes, then release what is
 		// left; every call stays inside the remaining grace.
 		DrainTimeout: grace / 2,
@@ -140,7 +144,7 @@ func gatewayVersion() string {
 // unless cfg.EnableR2Connectors is set (see releaseFactories).
 var connectorFactories = func(cfg Config, getenv func(string) (string, bool), logger *slog.Logger) connectors.Factories {
 	f := connectors.Factories{
-		connectors.KindArgoCD: argocd.NewFactory(argocd.Options{AllowInsecureHTTP: cfg.InsecureTransport}),
+		connectors.KindArgoCD: argocd.NewFactory(argocd.Options{AllowInsecureHTTP: cfg.InsecureTransport, RecheckInterval: cfg.PrivilegeRecheckInterval}),
 	}
 	if cfg.EnableR2Connectors {
 		kopts := kubeconn.Options{InsecureTransport: cfg.InsecureTransport, Getenv: getenv, Logger: logger}
@@ -272,6 +276,18 @@ func setup(cfg Config, getenv func(string) (string, bool), logger *slog.Logger, 
 	}
 	logger.Info("connectors bound", "count", registry.Len(), "names", registry.Names())
 
+	// Discovery needs snapshot_key (ADR 0002 section 4.2): without it, or
+	// with one that is not 32 bytes, the Gateway refuses to start. It is
+	// read before the self-check so a bad key fails fast.
+	var snapKey *snapshot.Key
+	if names := registry.DiscoveryConnectors(); len(names) > 0 {
+		snapKey, err = loadSnapshotKey(cfg, getenv)
+		if err != nil {
+			return nil, fmt.Errorf("refusing to start: %w; discovery is on for %d connector(s) and needs snapshot_key from the identity Secret, mounted as a file", err, len(names))
+		}
+		logger.Info("discovery enabled", "connectors", names)
+	}
+
 	// Self-checks (runtime design 5.3). Over-privilege refuses the boot,
 	// with no override (ADR 0001 section 11). Any other failure leaves
 	// the replica not ready and is retried before each heartbeat.
@@ -327,6 +343,8 @@ func setup(cfg Config, getenv func(string) (string, bool), logger *slog.Logger, 
 		Config:     cfg,
 		ReplicaID:  replicaID,
 		Version:    version,
+
+		SnapshotKey: snapKey,
 	})
 	return &app{cfg: cfg, logger: logger, local: srv, loop: cpl}, nil
 }
@@ -381,4 +399,22 @@ func (a *app) serve(ctx context.Context) error {
 	}
 	a.logger.Info("shutdown complete")
 	return nil
+}
+
+// errSnapshotKeyInEnv: snapshot_key was offered through the environment.
+var errSnapshotKeyInEnv = errors.New("snapshot_key_invalid: " + identity.EnvSnapshotKeyForbidden +
+	" is set; snapshot_key is never read from an environment variable, mount it as a file")
+
+// loadSnapshotKey reads and decodes snapshot_key from its file. Every
+// failure is snapshot_key_invalid, and no error carries key material.
+func loadSnapshotKey(cfg Config, getenv func(string) (string, bool)) (*snapshot.Key, error) {
+	if v, ok := getenv(identity.EnvSnapshotKeyForbidden); ok && v != "" {
+		return nil, errSnapshotKeyInEnv
+	}
+	raw, err := identity.ReadSnapshotKeyFile(cfg.SnapshotKeyFile)
+	if err != nil {
+		return nil, err
+	}
+	// ParseKey zeroes raw.
+	return snapshot.ParseKey(raw)
 }

@@ -23,13 +23,21 @@ var listProjects = []string{"tenant-a", "tenant-b"}
 // namespace and one outside it.
 var listApps = []AppBinding{{ID: "payments", Name: "payments-api"}, {ID: "billing", Name: "billing-api", AppNamespace: "tenant-a-uat"}}
 
+// testListMaxBytes is the list byte cap of the list client: small, so
+// the cap tests stay fast.
+const testListMaxBytes = 256 << 10
+
+// testListMaxItems is the count cap the list tests pass.
+const testListMaxItems = 50
+
 // newListClient is newTestClient with an AppProject allowlist, so the
 // list and can-i routes exist.
 func newListClient(t *testing.T, h http.HandlerFunc) (*Client, *httptest.Server) {
 	t.Helper()
 	srv := httptest.NewTLSServer(h)
 	t.Cleanup(srv.Close)
-	c, err := New(Config{BaseURL: srv.URL, Token: staticToken(testToken), RootCAs: poolFor(srv), AllowedProjects: listProjects, Applications: listApps, discoveryList: true})
+	c, err := New(Config{BaseURL: srv.URL, Token: staticToken(testToken), RootCAs: poolFor(srv), AllowedProjects: listProjects, Applications: listApps,
+		discoveryList: true, listMaxBytes: testListMaxBytes})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -38,7 +46,7 @@ func newListClient(t *testing.T, h http.HandlerFunc) (*Client, *httptest.Server)
 
 func listItem(name, ns, uid, project string) map[string]any {
 	return map[string]any{
-		"metadata": map[string]any{"name": name, "namespace": ns, "uid": uid, "creationTimestamp": "2026-10-01T10:00:00Z"},
+		"metadata": map[string]any{"name": name, "namespace": ns, "uid": uid},
 		"spec":     map[string]any{"project": project},
 	}
 }
@@ -240,7 +248,7 @@ func TestTransport_NoProjectsNoListNoCanI(t *testing.T) {
 			t.Fatalf("%s was sent", u.Path)
 		}
 	}
-	if _, err := c.ListApplications(context.Background(), "tenant-a"); !errors.Is(err, ErrRequestRefused) {
+	if _, _, err := c.ListApplications(context.Background(), "tenant-a", testListMaxItems); !errors.Is(err, ErrRequestRefused) {
 		t.Fatalf("list: %v", err)
 	}
 	if _, err := c.CanI(context.Background(), Probe{ResourceApplications, "sync", "tenant-a/*"}); !errors.Is(err, ErrProjectNotAllowed) {
@@ -271,9 +279,9 @@ func TestListApplications(t *testing.T) {
 			full["status"] = map[string]any{"health": map[string]any{"status": "Healthy", "message": "token=abc"}}
 			appJSON(w, map[string]any{"metadata": map[string]any{"resourceVersion": "9"}, "items": []any{full}})
 		})
-		apps, err := c.ListApplications(context.Background(), "tenant-a")
-		if err != nil {
-			t.Fatal(err)
+		apps, rejected, err := c.ListApplications(context.Background(), "tenant-a", testListMaxItems)
+		if err != nil || rejected != 0 {
+			t.Fatal(err, rejected)
 		}
 		want := "GET /api/v1/applications?" + url.Values{"projects": {"tenant-a"}, "fields": {ListFields}}.Encode()
 		if got.Load() != want {
@@ -283,7 +291,7 @@ func TestListApplications(t *testing.T) {
 			t.Fatalf("apps = %+v", apps)
 		}
 		a := apps[0]
-		if a.Name != "payments-api" || a.Namespace != "argocd" || a.UID != uidN(1) || a.Project != "tenant-a" || a.CreatedAt.IsZero() {
+		if a.Name != "payments-api" || a.Namespace != "argocd" || a.UID != uidN(1) || a.Project != "tenant-a" {
 			t.Fatalf("summary = %+v", a)
 		}
 		if dump := fmt.Sprintf("%+v", apps); strings.Contains(dump, "hunter2") || strings.Contains(dump, "abc") {
@@ -295,7 +303,7 @@ func TestListApplications(t *testing.T) {
 		var hits atomic.Int32
 		c, _ := newListClient(t, func(http.ResponseWriter, *http.Request) { hits.Add(1) })
 		for _, p := range []string{"tenant-c", "", "*", "tenant-a&refresh=hard"} {
-			if _, err := c.ListApplications(context.Background(), p); !errors.Is(err, ErrProjectNotAllowed) {
+			if _, _, err := c.ListApplications(context.Background(), p, testListMaxItems); !errors.Is(err, ErrProjectNotAllowed) {
 				t.Fatalf("%q: err = %v", p, err)
 			}
 		}
@@ -317,14 +325,18 @@ func TestListApplications(t *testing.T) {
 				listItem("x/manifests", "argocd", uidN(6), "tenant-a"),
 			}})
 		})
-		apps, err := c.ListApplications(context.Background(), "tenant-a")
+		apps, rejected, err := c.ListApplications(context.Background(), "tenant-a", testListMaxItems)
 		if err != nil || len(apps) != 1 || apps[0].Name != "keep" {
 			t.Fatalf("apps = %+v err = %v", apps, err)
+		}
+		// C5: every dropped item is counted, none forwarded.
+		if rejected != 7 {
+			t.Fatalf("rejected = %d, want 7", rejected)
 		}
 	})
 
 	t.Run("item cap", func(t *testing.T) {
-		for _, n := range []int{MaxListApplications, MaxListApplications + 1} {
+		for _, n := range []int{testListMaxItems, testListMaxItems + 1} {
 			c, _ := newListClient(t, func(w http.ResponseWriter, _ *http.Request) {
 				items := make([]any, n)
 				for i := range items {
@@ -332,11 +344,11 @@ func TestListApplications(t *testing.T) {
 				}
 				appJSON(w, map[string]any{"items": items})
 			})
-			apps, err := c.ListApplications(context.Background(), "tenant-a")
+			apps, _, err := c.ListApplications(context.Background(), "tenant-a", testListMaxItems)
 			switch {
-			case n == MaxListApplications && (err != nil || len(apps) != n):
+			case n == testListMaxItems && (err != nil || len(apps) != n):
 				t.Fatalf("%d items: len = %d err = %v", n, len(apps), err)
-			case n > MaxListApplications && (!errors.Is(err, ErrTooManyApplications) || apps != nil):
+			case n > testListMaxItems && (!errors.Is(err, ErrTooManyApplications) || apps != nil):
 				t.Fatalf("%d items: len = %d err = %v, want ErrTooManyApplications and nothing", n, len(apps), err)
 			}
 		}
@@ -346,7 +358,7 @@ func TestListApplications(t *testing.T) {
 	})
 
 	t.Run("byte cap", func(t *testing.T) {
-		big := strings.Repeat("x", MaxListResponseBytes)
+		big := strings.Repeat("x", testListMaxBytes)
 		for name, withLength := range map[string]bool{"with content length": true, "chunked": false} {
 			t.Run(name, func(t *testing.T) {
 				c, _ := newListClient(t, func(w http.ResponseWriter, _ *http.Request) {
@@ -355,7 +367,7 @@ func TestListApplications(t *testing.T) {
 					}
 					_, _ = w.Write([]byte(`{"items":[{"metadata":{"name":"a","x":"` + big + `"}}]}`))
 				})
-				if _, err := c.ListApplications(context.Background(), "tenant-a"); !errors.Is(err, ErrResponseTooLarge) {
+				if _, _, err := c.ListApplications(context.Background(), "tenant-a", testListMaxItems); !errors.Is(err, ErrResponseTooLarge) {
 					t.Fatalf("err = %v, want ErrResponseTooLarge", err)
 				}
 			})
@@ -363,9 +375,9 @@ func TestListApplications(t *testing.T) {
 		// Just under the cap is read.
 		c, _ := newListClient(t, func(w http.ResponseWriter, _ *http.Request) {
 			head, tail := `{"items":[],"pad":"`, `"}`
-			_, _ = w.Write([]byte(head + strings.Repeat("x", MaxListResponseBytes-len(head)-len(tail)) + tail))
+			_, _ = w.Write([]byte(head + strings.Repeat("x", testListMaxBytes-len(head)-len(tail)) + tail))
 		})
-		if apps, err := c.ListApplications(context.Background(), "tenant-a"); err != nil || len(apps) != 0 {
+		if apps, _, err := c.ListApplications(context.Background(), "tenant-a", testListMaxItems); err != nil || len(apps) != 0 {
 			t.Fatalf("body at the cap: apps = %v err = %v", apps, err)
 		}
 	})
@@ -382,7 +394,7 @@ func TestListApplications(t *testing.T) {
 			`{"items":[] `:                          ErrBadResponse,
 		} {
 			c, _ := newListClient(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(body)) })
-			apps, err := c.ListApplications(context.Background(), "tenant-a")
+			apps, _, err := c.ListApplications(context.Background(), "tenant-a", testListMaxItems)
 			if !errors.Is(err, wantErr) || (wantErr == nil && len(apps) != 0) {
 				t.Fatalf("%s: apps = %v err = %v, want %v", body, apps, err, wantErr)
 			}
@@ -398,7 +410,7 @@ func TestListApplications(t *testing.T) {
 			http.StatusTooManyRequests: ErrRateLimited, http.StatusFound: ErrRedirectRefused,
 		} {
 			c, _ := newListClient(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(code) })
-			if _, err := c.ListApplications(context.Background(), "tenant-a"); !errors.Is(err, want) {
+			if _, _, err := c.ListApplications(context.Background(), "tenant-a", testListMaxItems); !errors.Is(err, want) {
 				t.Fatalf("%d: err = %v, want %v", code, err, want)
 			}
 		}

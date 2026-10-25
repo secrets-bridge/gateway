@@ -44,6 +44,15 @@ var (
 	ErrGatewayAlreadyEnrolled     = errors.New("client: gateway already enrolled")
 	ErrClusterNameMismatch        = errors.New("client: cluster name mismatch")
 	ErrEnrollmentNotConfigured    = errors.New("client: enrollment not configured")
+
+	// Discovery codes (E2, E8, E9; discovery-contract.md section 7.1).
+	ErrInvalidRequest           = errors.New("client: invalid request")
+	ErrConnectorNotFound        = errors.New("client: connector not found")
+	ErrSnapshotNotFound         = errors.New("client: snapshot not found")
+	ErrDiscoveryGenerationStale = errors.New("client: discovery generation stale")
+	ErrLeaseNotHeld             = errors.New("client: discovery lease not held")
+	ErrScopeDigestMismatch      = errors.New("client: scope digest mismatch")
+	ErrCatalogTooLarge          = errors.New("client: catalog too large")
 )
 
 // Local errors.
@@ -80,6 +89,13 @@ var codeSentinels = map[string]error{
 	"gateway_already_enrolled":          ErrGatewayAlreadyEnrolled,
 	"cluster_name_mismatch":             ErrClusterNameMismatch,
 	"enrollment_not_configured":         ErrEnrollmentNotConfigured,
+	"invalid_request":                   ErrInvalidRequest,
+	"connector_not_found":               ErrConnectorNotFound,
+	"snapshot_not_found":                ErrSnapshotNotFound,
+	"discovery_generation_stale":        ErrDiscoveryGenerationStale,
+	"lease_not_held":                    ErrLeaseNotHeld,
+	"scope_digest_mismatch":             ErrScopeDigestMismatch,
+	"catalog_too_large":                 ErrCatalogTooLarge,
 }
 
 func statusSentinel(status int) error {

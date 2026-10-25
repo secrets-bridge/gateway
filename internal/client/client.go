@@ -8,10 +8,13 @@
 //	E5 POST /api/v1/gateways/{id}/tasks/{task_id}/lease      (RenewLease)
 //	E6 POST /api/v1/gateways/{id}/tasks/{task_id}/release    (Release)
 //	E7 POST /api/v1/gateways/{id}/tasks/{task_id}/result     (SubmitResult)
+//	E8 PUT  /api/v1/gateways/{id}/connectors/{cid}/discovery (PutDiscovery)
+//	E9 GET  /api/v1/gateways/{id}/connectors/{cid}/snapshot  (GetSnapshot)
 //
 // It is the only part of the Gateway that writes anything, and it only
 // writes to these endpoints on the control plane: every request is
-// checked against that list before it is sent. It depends on stdlib
+// checked against that list before it is sent. Its one GET is E9, which
+// carries no body. It depends on stdlib
 // net/http only, never follows redirects, caps every response body, and
 // never puts response text in an error.
 package client
@@ -43,18 +46,30 @@ const (
 	maxClaimResponse int64 = contract.MaxTaskBytes
 	maxSmallResponse int64 = 16 << 10
 	maxDrain         int64 = 64 << 10
+	// maxHeartbeatResponse is the E2 response cap. The Gateway always
+	// lists contract 2, so a contract 2 api may answer any heartbeat with
+	// bound_targets: the cap is the contract 2 one (512 KiB) for every
+	// heartbeat (discovery-contract.md section 2.1 rule 5).
+	maxHeartbeatResponse int64 = contract.MaxHeartbeatResponseBytes
+	// maxSnapshotResponse is the E9 response cap (3 MiB).
+	maxSnapshotResponse int64 = contract.MaxSnapshotResponseBytes
 
-	maxLargeRequest = 64 << 10 // E2, E3, E7
-	maxSmallRequest = 4 << 10  // E1, E4, E5, E6
+	maxLargeRequest     = 64 << 10                       // E2, E3, E7
+	maxSmallRequest     = 4 << 10                        // E1, E4, E5, E6
+	maxDiscoveryRequest = contract.MaxDiscoveryBodyBytes // E8
 
 	maxRetryAfter = time.Hour
 )
 
 const apiPrefix = "/api/v1/gateways/"
 
-// allowedPath is every path this client may call, relative to the base
-// path. ids are UUIDs, so the pattern cannot be widened by an id.
-var allowedPath = regexp.MustCompile(`^/api/v1/gateways/(enroll|[0-9a-f-]{36}/(heartbeat|catalog|tasks/claim|tasks/[0-9a-f-]{36}/(lease|release|result)))$`)
+// allowedPath is every path this client may POST or PUT to, relative to
+// the base path. ids are UUIDs and connector ids DNS labels, so the
+// pattern cannot be widened by an id.
+var allowedPath = regexp.MustCompile(`^/api/v1/gateways/(enroll|[0-9a-f-]{36}/(heartbeat|catalog|tasks/claim|tasks/[0-9a-f-]{36}/(lease|release|result)|connectors/[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?/discovery))$`)
+
+// allowedGetPath is the one path this client may GET: E9.
+var allowedGetPath = regexp.MustCompile(`^/api/v1/gateways/[0-9a-f-]{36}/connectors/[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?/snapshot$`)
 
 // Client calls the gateway endpoints as one Gateway identity. Safe for
 // concurrent use.
@@ -163,10 +178,21 @@ type response struct {
 }
 
 func (c *Client) do(ctx context.Context, cl call) (*response, error) {
-	if cl.method != http.MethodPost && cl.method != http.MethodPut {
-		return nil, ErrCallNotAllowed
-	}
-	if !allowedPath.MatchString(cl.path) {
+	switch cl.method {
+	case http.MethodPost, http.MethodPut:
+		if !allowedPath.MatchString(cl.path) {
+			return nil, ErrCallNotAllowed
+		}
+		if strings.HasSuffix(cl.path, "/discovery") && cl.method != http.MethodPut {
+			// E8 is a PUT only.
+			return nil, ErrCallNotAllowed
+		}
+	case http.MethodGet:
+		// E9 only, with no body.
+		if !allowedGetPath.MatchString(cl.path) || len(cl.body) != 0 {
+			return nil, ErrCallNotAllowed
+		}
+	default:
 		return nil, ErrCallNotAllowed
 	}
 	if len(cl.body) > cl.maxBody {
@@ -174,11 +200,17 @@ func (c *Client) do(ctx context.Context, cl call) (*response, error) {
 	}
 	u := *c.base
 	u.Path = c.base.Path + cl.path
-	req, err := http.NewRequestWithContext(ctx, cl.method, u.String(), bytes.NewReader(cl.body))
+	var body io.Reader = http.NoBody
+	if cl.method != http.MethodGet {
+		body = bytes.NewReader(cl.body)
+	}
+	req, err := http.NewRequestWithContext(ctx, cl.method, u.String(), body)
 	if err != nil {
 		return nil, fmt.Errorf("client: %s: build request", cl.op)
 	}
-	req.Header.Set("Content-Type", "application/json")
+	if cl.method != http.MethodGet {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", c.userAgent)
 	if cl.auth {
@@ -285,6 +317,11 @@ func (c *Client) taskPath(taskID, action string) (string, error) {
 // postJSON sends v and decodes a 200 or 201 body into out (when out is
 // non-nil). Any other status is an *APIError.
 func (c *Client) postJSON(ctx context.Context, cl call, v, out any, okStatus ...int) (*response, error) {
+	return c.postJSONLimit(ctx, cl, v, out, maxSmallResponse, okStatus...)
+}
+
+// postJSONLimit is postJSON with a response cap other than 16 KiB.
+func (c *Client) postJSONLimit(ctx context.Context, cl call, v, out any, limit int64, okStatus ...int) (*response, error) {
 	body, err := json.Marshal(v)
 	if err != nil {
 		return nil, fmt.Errorf("client: %s: marshal request", cl.op)
@@ -300,7 +337,7 @@ func (c *Client) postJSON(ctx context.Context, cl call, v, out any, okStatus ...
 		}
 		defer drainAndClose(r.Body)
 		if out != nil {
-			if err := decodeJSON(r.Body, maxSmallResponse, out); err != nil {
+			if err := decodeJSON(r.Body, limit, out); err != nil {
 				return nil, fmt.Errorf("client: %s: %w", cl.op, err)
 			}
 		}
@@ -402,11 +439,19 @@ func Enroll(ctx context.Context, base *url.URL, hc *http.Client, req EnrollReque
 }
 
 // ConnectorHealth is one connector's state in a heartbeat. Status is an
-// enum; there are no URLs or messages.
+// enum; there are no URLs or messages. The contract 2 fields are set
+// only in a contract 2 shaped heartbeat, and only on Argo CD connectors.
 type ConnectorHealth struct {
 	ConnectorID string `json:"connector_id"`
 	Kind        string `json:"kind"`
 	Status      string `json:"status"`
+	// ScopeDigest is the C6 scope digest (contract 2, argocd only).
+	ScopeDigest string `json:"scope_digest,omitempty"`
+	// DiscoveryEnabled is sent with ScopeDigest (contract 2, argocd
+	// only).
+	DiscoveryEnabled *bool `json:"discovery_enabled,omitempty"`
+	// DiscoveryIntervalSeconds is sent when DiscoveryEnabled is true.
+	DiscoveryIntervalSeconds int `json:"discovery_interval_seconds,omitempty"`
 }
 
 // Replica statuses for HeartbeatRequest.Status.
@@ -420,13 +465,38 @@ const (
 
 // HeartbeatRequest is the E2 body.
 type HeartbeatRequest struct {
-	ReplicaID        string            `json:"replica_id"`
-	GatewayVersion   string            `json:"gateway_version"`
-	ContractVersions []string          `json:"contract_versions"`
-	Status           string            `json:"status"`
-	InFlight         int               `json:"in_flight"`
-	CatalogVersion   string            `json:"catalog_version,omitempty"`
-	Connectors       []ConnectorHealth `json:"connectors,omitempty"`
+	ReplicaID        string   `json:"replica_id"`
+	GatewayVersion   string   `json:"gateway_version"`
+	ContractVersions []string `json:"contract_versions"`
+	Status           string   `json:"status"`
+	InFlight         int      `json:"in_flight"`
+	CatalogVersion   string   `json:"catalog_version,omitempty"`
+	// BoundTargetsVersion is sent in every contract 2 shaped heartbeat
+	// (the empty string when none is known) and never in a contract 1
+	// one, so it is a pointer.
+	BoundTargetsVersion *string           `json:"bound_targets_version,omitempty"`
+	Connectors          []ConnectorHealth `json:"connectors,omitempty"`
+}
+
+// DiscoveryLease is one discovery lease granted by an E2 response.
+type DiscoveryLease struct {
+	ConnectorID string    `json:"connector_id"`
+	LeaseID     string    `json:"lease_id"`
+	Generation  int64     `json:"generation"`
+	ExpiresAt   time.Time `json:"expires_at"`
+}
+
+// SnapshotGeneration is the latest accepted generation of a connector
+// that has a stored snapshot.
+type SnapshotGeneration struct {
+	ConnectorID string `json:"connector_id"`
+	Generation  int64  `json:"generation"`
+}
+
+// BoundTargets are the bound target ids of one connector.
+type BoundTargets struct {
+	ConnectorID string   `json:"connector_id"`
+	TargetIDs   []string `json:"target_ids"`
 }
 
 // HeartbeatResponse is the E2 200 body plus the measured clock offset.
@@ -438,6 +508,14 @@ type HeartbeatResponse struct {
 	ContractVersion      string    `json:"contract_version"`
 	CatalogVersion       string    `json:"catalog_version"`
 
+	// Contract 2 only. The loop ignores them in a contract 1 response.
+	DiscoveryLeases     []DiscoveryLease     `json:"discovery_leases,omitempty"`
+	SnapshotGenerations []SnapshotGeneration `json:"snapshot_generations,omitempty"`
+	BoundTargetsVersion *string              `json:"bound_targets_version,omitempty"`
+	// BoundTargets is nil when absent (no change) and non-nil, possibly
+	// empty, when sent (full replace).
+	BoundTargets []BoundTargets `json:"bound_targets,omitempty"`
+
 	// ClockOffset is Gateway clock minus control-plane clock, from the
 	// Date header, when OffsetKnown.
 	ClockOffset time.Duration `json:"-"`
@@ -447,8 +525,8 @@ type HeartbeatResponse struct {
 // Heartbeat reports liveness (E2).
 func (c *Client) Heartbeat(ctx context.Context, req HeartbeatRequest) (*HeartbeatResponse, error) {
 	var out HeartbeatResponse
-	r, err := c.postJSON(ctx, call{op: "heartbeat", method: http.MethodPost, path: c.gatewayPath("heartbeat"), maxBody: maxLargeRequest, auth: true},
-		req, &out, http.StatusOK)
+	r, err := c.postJSONLimit(ctx, call{op: "heartbeat", method: http.MethodPost, path: c.gatewayPath("heartbeat"), maxBody: maxLargeRequest, auth: true},
+		req, &out, maxHeartbeatResponse, http.StatusOK)
 	if err != nil {
 		return nil, err
 	}
@@ -663,4 +741,98 @@ func (c *Client) SubmitResult(ctx context.Context, res *contract.EvidenceResult)
 		return nil, fmt.Errorf("client: result: %w", ErrInvalidResponse)
 	}
 	return &out, nil
+}
+
+// connectorPath is the E8 or E9 path of a local connector.
+func (c *Client) connectorPath(connectorID, action string) (string, error) {
+	if !contract.ValidLocalID(connectorID) {
+		return "", fmt.Errorf("%w: connector id must be a local id", ErrInvalidArgument)
+	}
+	return c.gatewayPath("connectors/" + connectorID + "/" + action), nil
+}
+
+// MarshalDiscovery validates an E8 body and marshals it once. The bytes
+// are what PutDiscovery sends, so a retry sends the same body (the
+// control plane answers a repeat with status duplicate).
+func MarshalDiscovery(cat contract.DiscoveryCatalog) ([]byte, error) {
+	if err := cat.Validate(); err != nil {
+		return nil, fmt.Errorf("client: discovery: %w: %w", ErrInvalidArgument, err)
+	}
+	b, err := json.Marshal(cat)
+	if err != nil {
+		return nil, fmt.Errorf("client: discovery: marshal request")
+	}
+	if len(b) > maxDiscoveryRequest {
+		return nil, ErrRequestTooLarge
+	}
+	return b, nil
+}
+
+// PutDiscovery uploads the discovery catalog and sealed snapshot of one
+// connector (E8). body comes from MarshalDiscovery; it is checked again
+// here, so nothing that breaks the contract or the 2 MiB cap is sent.
+// A typed error code wraps its sentinel (ErrLeaseNotHeld,
+// ErrDiscoveryGenerationStale, ErrScopeDigestMismatch,
+// ErrCatalogTooLarge, ErrSchemaViolation, ErrConnectorNotFound).
+func (c *Client) PutDiscovery(ctx context.Context, connectorID string, body []byte) (*contract.DiscoveryResult, error) {
+	path, err := c.connectorPath(connectorID, "discovery")
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxDiscoveryRequest {
+		return nil, ErrRequestTooLarge
+	}
+	var cat contract.DiscoveryCatalog
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cat); err != nil || dec.More() {
+		return nil, fmt.Errorf("client: discovery: %w", ErrInvalidArgument)
+	}
+	if err := cat.Validate(); err != nil {
+		return nil, fmt.Errorf("client: discovery: %w: %w", ErrInvalidArgument, err)
+	}
+	r, err := c.do(ctx, call{op: "discovery", method: http.MethodPut, path: path, body: body, maxBody: maxDiscoveryRequest, auth: true})
+	if err != nil {
+		return nil, err
+	}
+	if r.StatusCode != http.StatusOK {
+		return nil, apiError("discovery", r)
+	}
+	defer drainAndClose(r.Body)
+	var out contract.DiscoveryResult
+	if err := decodeJSON(r.Body, maxSmallResponse, &out); err != nil {
+		return nil, fmt.Errorf("client: discovery: %w", err)
+	}
+	if err := out.Validate(); err != nil {
+		return nil, fmt.Errorf("client: discovery: %w", ErrInvalidResponse)
+	}
+	return &out, nil
+}
+
+// GetSnapshot fetches the latest sealed snapshot of one connector (E9).
+// The body is read up to 3 MiB and decoded strictly. A 404 wraps
+// ErrSnapshotNotFound. The blob is returned sealed; only the caller can
+// open it.
+func (c *Client) GetSnapshot(ctx context.Context, connectorID string) (*contract.DiscoverySnapshot, error) {
+	path, err := c.connectorPath(connectorID, "snapshot")
+	if err != nil {
+		return nil, err
+	}
+	r, err := c.do(ctx, call{op: "snapshot", method: http.MethodGet, path: path, auth: true})
+	if err != nil {
+		return nil, err
+	}
+	if r.StatusCode != http.StatusOK {
+		return nil, apiError("snapshot", r)
+	}
+	defer drainAndClose(r.Body)
+	data, err := readLimited(r.Body, maxSnapshotResponse)
+	if err != nil {
+		return nil, fmt.Errorf("client: snapshot: %w", err)
+	}
+	snap, err := contract.DecodeDiscoverySnapshot(data)
+	if err != nil {
+		return nil, fmt.Errorf("client: snapshot: %w", ErrInvalidResponse)
+	}
+	return snap, nil
 }

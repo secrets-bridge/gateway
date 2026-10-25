@@ -13,6 +13,8 @@ type Metrics struct {
 	results    *prometheus.CounterVec
 	heartbeats *prometheus.CounterVec
 	catalogs   *prometheus.CounterVec
+	discovery  *prometheus.CounterVec
+	fetches    *prometheus.CounterVec
 	inFlight   prometheus.Gauge
 }
 
@@ -37,6 +39,14 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "sb_gateway_catalog_uploads_total",
 			Help: "Catalog uploads by outcome (ok, error).",
 		}, []string{"outcome"}),
+		discovery: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sb_gateway_discovery_runs_total",
+			Help: "Discovery runs by outcome (accepted, duplicate, catalog_too_large, lease_not_held, discovery_generation_stale, scope_digest_mismatch, schema_violation, connector_not_found, invalid_request, over_privileged, abandoned, error).",
+		}, []string{"outcome"}),
+		fetches: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "sb_gateway_snapshot_fetches_total",
+			Help: "Discovery snapshot fetches by outcome (opened, not_found, refused, error).",
+		}, []string{"outcome"}),
 		inFlight: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "sb_gateway_tasks_inflight",
 			Help: "Observation passes in flight on this replica.",
@@ -47,6 +57,8 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		m.results = register(reg, m.results)
 		m.heartbeats = register(reg, m.heartbeats)
 		m.catalogs = register(reg, m.catalogs)
+		m.discovery = register(reg, m.discovery)
+		m.fetches = register(reg, m.fetches)
 		m.inFlight = register(reg, m.inFlight)
 	}
 	return m
@@ -64,7 +76,9 @@ func register[C prometheus.Collector](reg prometheus.Registerer, c C) C {
 	return c
 }
 
-func (m *Metrics) claim(outcome string)     { m.claims.WithLabelValues(outcome).Inc() }
-func (m *Metrics) result(outcome string)    { m.results.WithLabelValues(outcome).Inc() }
-func (m *Metrics) heartbeat(outcome string) { m.heartbeats.WithLabelValues(outcome).Inc() }
-func (m *Metrics) catalog(outcome string)   { m.catalogs.WithLabelValues(outcome).Inc() }
+func (m *Metrics) claim(outcome string)        { m.claims.WithLabelValues(outcome).Inc() }
+func (m *Metrics) result(outcome string)       { m.results.WithLabelValues(outcome).Inc() }
+func (m *Metrics) heartbeat(outcome string)    { m.heartbeats.WithLabelValues(outcome).Inc() }
+func (m *Metrics) catalog(outcome string)      { m.catalogs.WithLabelValues(outcome).Inc() }
+func (m *Metrics) discoveryRun(outcome string) { m.discovery.WithLabelValues(outcome).Inc() }
+func (m *Metrics) fetch(outcome string)        { m.fetches.WithLabelValues(outcome).Inc() }

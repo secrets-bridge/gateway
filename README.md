@@ -79,7 +79,7 @@ Runtime behaviour:
 - The read probe asks can-i `applications get */*`. A `yes` means the token can read Applications outside `allowed_projects`. It does not stop the Gateway: the connector is reported `degraded` in the heartbeat, stays verified and ready, and every read is still bounded by the local allowlist. The Gateway logs a warning that names the connector id, never the Argo CD URL. Narrow the token's role to clear it; the next full recheck reports `ok` again. A read probe that fails is handled like any other failed can-i call.
 - Startup read: once the can-i checks pass at boot, the Gateway reads each configured Application that has no `uid` in settings, once, with the same `GET /api/v1/applications/<name>` an observation sends. A read that names the right Application, returns a valid uid in an allowed AppProject and passes the per-target can-i probe pins the uid for this process. A read that fails (for example a 404 for an Application not created yet) is not an error; the target is read on its first task instead. There is one read per target per process start, and none at later rechecks.
 - The catalog carries an `identity` for each Argo CD target once its uid is known: from `uid` in settings at boot, or after the first verified read (the startup read or the first task). It is the scoped identity digest `d-` plus 26 base32 characters, the same value as the evidence `identity_digest`, never the raw uid. When an identity becomes known, the next heartbeat uploads the catalog again. The control plane pins the first identity it accepts for a target and treats a different one, for example after the Application was recreated and the Gateway restarted, as an identity change. Kubernetes connectors never carry `identity`.
-- The application list (`GET /api/v1/applications`) is not in the Argo CD transport policy. It will be admitted only while discovery is on (ADR 0002), and there is no discovery setting yet, so the transport refuses the request before it leaves the process.
+- The application list (`GET /api/v1/applications`) is in the Argo CD transport policy only for a connector with discovery on, one allowed AppProject per request with the fixed `fields` value, and only the discovery lease holder sends it. With discovery off the transport refuses it before it leaves the process. See [Discovery](#discovery-adr-0002) below.
 - **Release 1 behaviour change: an Argo CD outage at boot is a crash loop.** If Argo CD cannot be reached, refuses the token, or a can-i call fails while the Gateway starts, the Gateway refuses to start and exits, so Kubernetes restarts the pod with its usual back-off (`CrashLoopBackOff`). Before, the process stayed up and not ready. Nothing is claimed or observed either way. Recovery needs no action on the Gateway: once Argo CD answers and the token works, the next restart passes the self-check and the replica turns ready. To start sooner after fixing the cause, delete the pod or run `kubectl rollout restart` on the Deployment. The refusal names the connector, the failed check and how it failed, for example `failed check applications sync: can-i yes`, `failed check session userinfo: unauthorized` or `failed check exec create: unreachable`. The failure kinds are `can-i yes`, `unreachable`, `unauthorized`, `forbidden`, `timeout`, `tls`, `malformed`, `bad request`, `refused locally`, `not logged in` and `error`. It never names the AppProject, the Argo CD URL or the token. An outage that starts after boot does not restart the pod: the replica turns not ready, stops claiming, and recovers on a later recheck.
 - The rest of this list applies to the Release 2 Kubernetes connectors only. At boot each Kubernetes connector runs a self-check in every allowed namespace: a SelfSubjectRulesReview, a SelfSubjectAccessReview for `get`, `list` and `watch` on `secrets` (for every verb, `create`, `update`, `patch`, `delete`, `deletecollection` and `*` included, when the rules review is incomplete), and a SelfSubjectAccessReview for each verb the connector needs. If any `secrets` verb is allowed, or a review call fails, the Gateway refuses to start, and no setting overrides that. A failed review call includes a 401 on the pod's service account token: unlike a 401 from the control plane, it makes the pod restart-loop by design, with the reason in the log, because the Gateway must not run without proving it cannot read Secrets.
 - The self-check of every connector, the Argo CD can-i probes included, runs again every `SB_GATEWAY_PRIVILEGE_RECHECK_INTERVAL` (default 5 minutes). A `secrets` grant added after start makes the replica not ready, stops claiming, logs the reason and stops the Gateway. A missing required verb keeps the replica not ready. These two review creations are the only non-GET Kubernetes requests the transport lets through.
@@ -94,6 +94,7 @@ Runtime behaviour:
 | `SB_CP_TLS_SERVER_NAME` | empty | TLS server name override |
 | `SB_GATEWAY_ID`, `SB_GATEWAY_SECRET` | empty | Credential pair. The id is the UUID the control plane issued. When unset, `SB_GATEWAY_IDENTITY_FILE` is read |
 | `SB_GATEWAY_IDENTITY_FILE` | `/etc/secrets-bridge/gateway/identity.json` | `{"gateway_id": "...", "gateway_secret": "..."}`, mode 0400, 0600, or 0440 as a Secret volume with `fsGroup` produces. Any other bit, or group write, is refused |
+| `SB_GATEWAY_SNAPSHOT_KEY_FILE` | `/etc/secrets-bridge/gateway/snapshot_key` | `snapshot_key`, standard base64 of 32 bytes, a key of the identity Secret mounted as a file, same mode rules as the identity file. Read only when a connector has discovery on; then a missing or malformed key refuses the start with `snapshot_key_invalid`. Never set the key itself in an environment variable: `SB_GATEWAY_SNAPSHOT_KEY` refuses the start |
 | `SB_GATEWAY_LOCAL_ADDR` | `127.0.0.1:8091` | Must be a literal loopback IP; `localhost` is refused |
 | `SB_GATEWAY_CONNECTORS_FILE` | empty | JSON list of bound connectors, see below. Empty binds none |
 | `SB_GATEWAY_ENABLE_R2_CONNECTORS` | `false` | Binds the Release 2 `eso` and `rollout` kinds. **Not supported for production**: when it is on, the Gateway logs a WARN at boot saying so. When it is off, a connectors file that names either kind is refused at load |
@@ -141,6 +142,36 @@ What the `argocd` connector proposes for stage `argocd_context` (the control pla
 - `observed`, confidence `low`, when the Application is `Healthy` and `Synced` with no operation or a `Succeeded` one, and was reconciled after the change. This is the strongest outcome, and it never counts toward a verdict.
 - `not_observed` for anything else, including `Progressing`, `Degraded`, `OutOfSync`, a failed operation (caveat `argocd_operation_unrelated`) and state reconciled at or before the change (caveat `observed_before_not_before`). `Degraded` is context, not a failure of the secret change.
 - `unverifiable` for an Application outside the allowed AppProjects, and `error` with a fixed code when Argo CD cannot be read.
+
+### Discovery (ADR 0002)
+
+An `argocd` connector can discover the Applications of its allowed AppProjects instead of listing them by hand. It is off by default; with it off, nothing changes.
+
+```json
+"settings": {
+  "base_url": "https://argocd.example.com",
+  "token_file": "/etc/secrets-bridge/gateway/argocd/argocd-main/token",
+  "allowed_projects": ["team-a-apps", "team-b-apps"],
+  "discovery": {
+    "enabled": true,
+    "interval": "5m",
+    "snapshot_max_age": "15m",
+    "max_applications": 2000,
+    "max_response_bytes": 16777216,
+    "identity_mode": "names"
+  }
+}
+```
+
+- `applications` may be empty. Static targets keep working next to discovered ones, and their ids still may not start with `d-`.
+- `interval` is whole seconds, `60s` to `30m`. `snapshot_max_age` is at least twice `interval` and at most `1h`. `max_applications` (1 to 10000) caps the Applications one run decodes across its AppProjects, and `max_response_bytes` (1 KiB to 64 MiB) caps each list response. At most 64 allowed AppProjects. Only `names` mode is supported for now.
+- Discovery needs `snapshot_key` (`openssl rand -base64 32` at enroll) in the identity Secret, mounted at `SB_GATEWAY_SNAPSHOT_KEY_FILE`. It never leaves the pod. Rotating it makes the stored snapshots unreadable, so tasks for discovered targets are refused until the next run rebuilds one.
+- The control plane grants a discovery lease to one replica at a time. That replica lists each allowed AppProject once, keeps only valid names with a uid, derives each target id from the uid (`d-` and 26 base32 characters), runs the per-target can-i probe on every new target, and uploads the catalog (target id, AppProject, namespace, name) with a snapshot sealed under `snapshot_key`. A cap refuses the whole run with `catalog_too_large`; nothing partial is ever sent. Every other replica fetches the sealed snapshot and opens it, failing closed.
+- Data that leaves the boundary: with discovery on, the AppProject, namespace and name of every discovered Application in an allowed AppProject go to the control plane, not only those of bound targets. The raw uid never does.
+- A task for a discovered target is resolved through the snapshot only. With no usable snapshot, or one older than `snapshot_max_age`, it is refused with `target_snapshot_stale` before any read; an id that is not in the snapshot is `unbound_target`. Otherwise it is the same single GET of one Application as for a static target, with the uid and AppProject checked.
+- Against a control plane that does not speak contract 2 yet, a discovery connector serves its static targets only and reports `degraded`.
+
+Details, including every check and limit, are in [runtime design section 3.6](docs/design/runtime.md#36-discovery-adr-0002-s3) and the [discovery wire contract](docs/design/discovery-contract.md).
 
 ### Release 2 connectors (not for production)
 

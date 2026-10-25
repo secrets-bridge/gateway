@@ -148,3 +148,44 @@ func TestRoutes_StreamName(t *testing.T) {
 	// The exemption is for GET only.
 	mustRefuse(t, tr, next, post, ErrStreamSubresource)
 }
+
+// Exact admits run-time exact paths only: what it reports ok for, with
+// no query at all, a stream segment only when it says so, and never a
+// pattern. A path it does not know stays refused.
+func TestRoutes_Exact(t *testing.T) {
+	admitted := map[string]bool{
+		"/api/v1/account/can-i/applications/sync/team-a/payments-api":        false,
+		"/api/v1/account/can-i/exec/create/team-a/payments-api":              true,
+		"/api/v1/account/can-i/applications/delete/team-a/argocd/payments-a": false,
+	}
+	p := routePolicy
+	p.Exact = func(path string) (bool, bool) {
+		stream, ok := admitted[path]
+		return ok, stream
+	}
+	next := &countingRT{}
+	tr := newT(t, next, p)
+	for path := range admitted {
+		if _, err := tr.RoundTrip(literal(argo + path)); err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+	}
+	for name, raw := range map[string]string{
+		"unknown app":        "/api/v1/account/can-i/applications/sync/team-a/other",
+		"with a query":       "/api/v1/account/can-i/applications/sync/team-a/payments-api?x=1",
+		"glob, not literal":  "/api/v1/account/can-i/applications/sync/team-a/payments-*",
+		"exec not admitted":  "/api/v1/account/can-i/exec/create/team-a/other",
+		"non canonical":      "/api/v1/account/can-i/applications/sync/team-a/./payments-api",
+		"stream without bit": "/api/v1/account/can-i/applications/sync/team-a/exec",
+	} {
+		before := next.calls.Load()
+		if _, err := tr.RoundTrip(literal(argo + raw)); err == nil || next.calls.Load() != before {
+			t.Fatalf("%s: admitted", name)
+		}
+	}
+	req := httptest.NewRequest(http.MethodPost, argo+"/api/v1/account/can-i/applications/sync/team-a/payments-api", strings.NewReader("{}"))
+	req.Header.Set("Content-Type", "application/json")
+	if _, err := tr.RoundTrip(req); !errors.Is(err, ErrMethodNotAllowed) {
+		t.Fatalf("POST to an exact path: %v", err)
+	}
+}

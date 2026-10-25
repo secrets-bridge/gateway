@@ -413,7 +413,8 @@ func TestResponseLimits_AndNoBodyEcho(t *testing.T) {
 	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		switch mode.Load() {
 		case 0: // oversize 200
-			_, _ = io.WriteString(w, `{"status":"ok","pad":"`+strings.Repeat("x", int(maxSmallResponse))+`"}`)
+			// The heartbeat cap is the contract 2 one (512 KiB).
+			_, _ = io.WriteString(w, `{"status":"ok","pad":"`+strings.Repeat("x", int(maxHeartbeatResponse))+`"}`)
 		case 1: // free-text error body
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = io.WriteString(w, `{"error":"`+leakMarker+` with spaces"}`)

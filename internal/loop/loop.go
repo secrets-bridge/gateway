@@ -33,6 +33,7 @@ import (
 	"github.com/secrets-bridge/gateway/internal/client"
 	"github.com/secrets-bridge/gateway/internal/connectors"
 	"github.com/secrets-bridge/gateway/internal/contract"
+	"github.com/secrets-bridge/gateway/internal/snapshot"
 )
 
 // ControlPlane is the part of *client.Client the loop uses.
@@ -43,6 +44,8 @@ type ControlPlane interface {
 	RenewLease(ctx context.Context, taskID string, req client.LeaseRequest) (time.Time, error)
 	Release(ctx context.Context, taskID string, req client.ReleaseRequest) error
 	SubmitResult(ctx context.Context, res *contract.EvidenceResult) (*client.ResultResponse, error)
+	PutDiscovery(ctx context.Context, connectorID string, body []byte) (*contract.DiscoveryResult, error)
+	GetSnapshot(ctx context.Context, connectorID string) (*contract.DiscoverySnapshot, error)
 }
 
 // Connectors is the part of *connectors.Registry the loop uses.
@@ -57,6 +60,11 @@ type Connectors interface {
 	// Verified reports whether every connector's last self-check proved
 	// that its credential cannot read Secrets.
 	Verified() bool
+	// Discovery (ADR 0002 S3).
+	TargetStatus(name, targetID string) connectors.TargetStatus
+	Discoverer(name string) (connectors.Discoverer, bool)
+	DiscoveryConnectors() []string
+	Discover(ctx context.Context, name string, probeBy time.Time) (connectors.DiscoveryRun, error)
 }
 
 // Readiness is the readiness gate (*local.Probes).
@@ -129,8 +137,12 @@ type Config struct {
 	// whose last check failed are rechecked before every heartbeat.
 	PrivilegeRecheckInterval time.Duration
 	// ResultRetry is the wait before each retry of a result post after a
-	// network error or a 5xx. Default 1s, 2s, 4s.
+	// network error or a 5xx. Default 1s, 2s, 4s. Discovery uploads use
+	// the same waits.
 	ResultRetry []time.Duration
+	// SnapshotKey seals and opens discovery snapshots. It is required
+	// when any connector has discovery on, and never leaves the process.
+	SnapshotKey *snapshot.Key
 
 	// Now and Jitter are for tests.
 	Now    func() time.Time
@@ -178,6 +190,12 @@ type Loop struct {
 	// wideWarned holds the connectors whose read-beyond-scope warning is
 	// logged; heartbeat goroutine only.
 	wideWarned map[string]bool
+
+	// disc is the discovery state (discovery.go).
+	disc discovery
+	// runCtx is the context of the heartbeat and claim loops, which
+	// discovery runs and snapshot fetches also use.
+	runCtx context.Context
 }
 
 // errHalted: a call was not sent because the control plane has refused
@@ -200,6 +218,8 @@ func New(cfg Config) (*Loop, error) {
 		return nil, fmt.Errorf("%w: gateway version must be a semantic version", ErrInvalidConfig)
 	case cfg.Concurrency < 0:
 		return nil, fmt.Errorf("%w: concurrency must not be negative", ErrInvalidConfig)
+	case cfg.SnapshotKey == nil && len(cfg.Connectors.DiscoveryConnectors()) > 0:
+		return nil, fmt.Errorf("%w: snapshot_key_invalid: a connector has discovery on and there is no snapshot_key", ErrInvalidConfig)
 	}
 	def := func(d *time.Duration, v time.Duration) {
 		if *d <= 0 {
@@ -278,6 +298,7 @@ func (l *Loop) Run(ctx context.Context) error {
 	defer cancelWork()
 	runCtx, stopRun := context.WithCancel(ctx)
 	defer stopRun()
+	l.runCtx = runCtx
 
 	var loops sync.WaitGroup
 	loops.Add(2)
@@ -304,6 +325,8 @@ func (l *Loop) Run(ctx context.Context) error {
 	l.cfg.Ready.SetReady(false)
 	stopRun()
 	loops.Wait()
+	// Discovery runs and fetches use runCtx; wait for them to stop.
+	l.disc.wg.Wait()
 	// A heartbeat that was in flight may have set ready again.
 	l.cfg.Ready.SetReady(false)
 
@@ -393,21 +416,42 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
+// heartbeatRequest builds the E2 body. It always lists contracts 1 and
+// 2, and is contract 2 shaped (scope digests, discovery switch and
+// interval per Argo CD connector, bound_targets_version) only after the
+// previous response answered "2" (discovery-contract.md section 2.1).
+// While the control plane answers "1", a discovery connector reports
+// degraded: it serves its static targets only.
 func (l *Loop) heartbeatRequest(status string) client.HeartbeatRequest {
+	v2 := l.disc.shapeV2()
 	health := l.cfg.Connectors.Health()
 	hs := make([]client.ConnectorHealth, 0, len(health))
+	degraded := false
 	for _, h := range health {
-		hs = append(hs, client.ConnectorHealth{ConnectorID: h.Connector, Kind: string(h.Kind), Status: string(h.Status)})
+		ch := client.ConnectorHealth{ConnectorID: h.Connector, Kind: string(h.Kind), Status: string(h.Status)}
+		if l.argocdScope(&ch, v2) && ch.Status == string(connectors.HealthOK) {
+			ch.Status = string(connectors.HealthDegraded)
+			degraded = true
+		}
+		hs = append(hs, ch)
 	}
-	return client.HeartbeatRequest{
+	if degraded && status == client.ReplicaOK {
+		status = client.ReplicaDegraded
+	}
+	req := client.HeartbeatRequest{
 		ReplicaID:        l.cfg.ReplicaID,
 		GatewayVersion:   l.cfg.GatewayVersion,
-		ContractVersions: []string{contract.ContractVersion},
+		ContractVersions: []string{contract.ContractVersion, contract.ContractVersion2},
 		Status:           status,
 		InFlight:         int(l.inFlight.Load()),
 		CatalogVersion:   l.catVersion(),
 		Connectors:       hs,
 	}
+	if v2 {
+		bv := l.disc.bound()
+		req.BoundTargetsVersion = &bv
+	}
+	return req
 }
 
 // connectorsHealthy reports whether every connector's last self-check
@@ -565,11 +609,7 @@ func (l *Loop) heartbeatLoop(ctx context.Context) {
 		}
 		err := recheck(ctx, l.cfg.CallTimeout)
 		if errors.Is(err, connectors.ErrOverPrivileged) {
-			l.cfg.Ready.SetReady(false)
-			l.log.Error("connector self-check found an over-privileged credential; not ready, claiming stopped, gateway stopping",
-				"error", err)
-			l.reportOverPrivileged()
-			l.fail(err)
+			l.overPrivileged(err)
 			return
 		}
 		l.warnReadBeyondScope()
@@ -583,7 +623,8 @@ func (l *Loop) heartbeatLoop(ctx context.Context) {
 		// plane never takes an ok heartbeat after shutting_down.
 		callCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), l.cfg.CallTimeout)
 		var resp *client.HeartbeatResponse
-		sent := l.unlessHalted(func() { resp, err = l.cfg.CP.Heartbeat(callCtx, l.heartbeatRequest(status)) })
+		req := l.heartbeatRequest(status)
+		sent := l.unlessHalted(func() { resp, err = l.cfg.CP.Heartbeat(callCtx, req) })
 		cancel()
 		if !sent {
 			return
@@ -598,6 +639,7 @@ func (l *Loop) heartbeatLoop(ctx context.Context) {
 				interval = time.Duration(min(max(s, minHeartbeatSeconds), maxHeartbeatSeconds)) * time.Second
 			}
 			wait = l.cfg.Jitter(interval, 0.9, 1.1)
+			l.onHeartbeat(ctx, resp)
 			// The catalog goes up again when the control plane's version
 			// differs or the local catalog changed since the last upload
 			// (an Argo CD target's identity became known).
@@ -634,6 +676,12 @@ func (l *Loop) heartbeatLoop(ctx context.Context) {
 			l.halt(haltUnauthorized)
 			return
 		default:
+			if req.BoundTargetsVersion != nil && errors.Is(err, client.ErrBadRequest) {
+				// An old api replica refuses the contract 2 fields (rolling
+				// deploy): the next heartbeat is contract 1 shaped again,
+				// until a response answers "2" (section 2.1 rule 3).
+				l.disc.setContract(contract.ContractVersion)
+			}
 			l.m.heartbeat("error")
 			l.log.Warn("heartbeat failed", "error", err)
 			l.checkUnreachable()
@@ -853,10 +901,18 @@ func (l *Loop) precheck(t *contract.ObservationTask, offset time.Duration, now t
 		if stage, _ := connectors.StageFor(c.Kind()); stage != ref.Stage {
 			return contract.RefusalStageNotSupported
 		}
-		if !l.cfg.Connectors.HasTarget(ref.ConnectorID, ref.TargetID) {
-			// The target id is not configured in that connector. Refused
-			// before any read; nothing about the local targets is
-			// reported.
+		switch l.cfg.Connectors.TargetStatus(ref.ConnectorID, ref.TargetID) {
+		case connectors.TargetBound:
+		case connectors.TargetSnapshotStale:
+			// A discovered target while this replica has no usable
+			// snapshot (ADR 0002 C7, contract S-10): refused before any
+			// read, and one fetch is tried for the next task.
+			l.startFetch(l.runCtx, ref.ConnectorID, true)
+			return contract.RefusalTargetSnapshotStale
+		default:
+			// The target id is not configured in that connector, or a
+			// discovered id is not in the usable snapshot. Refused before
+			// any read; nothing about the local targets is reported.
 			return contract.RefusalUnboundTarget
 		}
 	}

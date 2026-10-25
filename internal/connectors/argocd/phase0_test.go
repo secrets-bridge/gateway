@@ -57,7 +57,7 @@ func TestLivePolicy_ListRouteAbsent(t *testing.T) {
 			t.Fatalf("list %q: err = %v, want a read-only refusal", q, err)
 		}
 	}
-	if _, err := cl.ListApplications(context.Background(), "tenant-a"); !errors.Is(err, ErrRequestRefused) {
+	if _, _, err := cl.ListApplications(context.Background(), "tenant-a", testListMaxItems); !errors.Is(err, ErrRequestRefused) {
 		t.Fatalf("ListApplications: %v", err)
 	}
 	if srv.hits.Load() != 0 {
@@ -66,7 +66,7 @@ func TestLivePolicy_ListRouteAbsent(t *testing.T) {
 	// The same request through a policy built with the list route is
 	// admitted, so the refusal above is the policy, not the URL.
 	lc, lsrv := newListClient(t, func(w http.ResponseWriter, _ *http.Request) { appJSON(w, map[string]any{"items": []any{}}) })
-	if _, err := lc.ListApplications(context.Background(), "tenant-a"); err != nil {
+	if _, _, err := lc.ListApplications(context.Background(), "tenant-a", testListMaxItems); err != nil {
 		t.Fatalf("list through the discovery policy: %v (%s)", err, lsrv.URL)
 	}
 }
